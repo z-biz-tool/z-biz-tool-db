@@ -15,7 +15,6 @@
     "fs:allow-read",
     "fs:allow-write",
     "shell:default",
-    "shell:allow-open",
     "clipboard-manager:default"
   ]
 }
