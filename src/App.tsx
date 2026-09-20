@@ -50,6 +50,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { AgentPanel } from './agent/AgentPanel';
 import { useAgentStore } from './agent/AgentManager';
 
+// 渐变色主题常量
+const brandGradient = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
+const cardBgGradient = "linear-gradient(135deg, rgba(102,126,234,0.04) 0%, rgba(118,75,162,0.04) 100%)";
+
 const { Header, Sider, Content } = Layout;
 const { TextArea } = Input;
 const { Text } = Typography;
@@ -715,12 +719,21 @@ function App() {
       }}
     >
       <Layout style={{ height: "100vh" }}>
-        <Sider width={280} theme={darkMode ? "dark" : "light"} style={{ borderRight: "1px solid #f0f0f0" }}>
-          <div style={{ padding: "16px", borderBottom: "1px solid #f0f0f0" }}>
-            <Space>
-              <DatabaseOutlined style={{ fontSize: "20px" }} />
-              <strong>数据库连接</strong>
-            </Space>
+        <Sider width={280} theme={darkMode ? "dark" : "light"} style={{ 
+          background: cardBgGradient,
+          borderRight: `1px solid var(--ant-color-border-secondary)`,
+        }}>
+          <div 
+            style={{ 
+              padding: "16px", 
+              borderBottom: `1px solid var(--ant-color-border-secondary)`,
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+            }}
+          >
+            <DatabaseOutlined style={{ fontSize: "20px", background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }} />
+            <strong style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>数据库连接</strong>
           </div>
           <div style={{ padding: "8px" }}>
             <Space direction="vertical" style={{ width: "100%" }}>
@@ -733,6 +746,11 @@ function App() {
                   form.resetFields();
                   setShowConnectionModal(true);
                 }}
+                style={{ 
+                  borderRadius: 8,
+                  background: brandGradient,
+                  boxShadow: "0 4px 12px rgba(102,126,234,0.3)",
+                }}
               >
                 新建连接
               </Button>
@@ -741,6 +759,7 @@ function App() {
                 block
                 onClick={handleExport}
                 disabled={connections.length === 0}
+                style={{ borderRadius: 8 }}
               >
                 导出配置
               </Button>
@@ -749,7 +768,10 @@ function App() {
           <Menu
             mode="inline"
             theme={darkMode ? "dark" : "light"}
-            style={{ borderRight: 0 }}
+            style={{ 
+              borderRight: 0,
+              background: 'transparent',
+            }}
             items={connections.map((conn) => ({
               key: conn.id,
               icon: <DatabaseOutlined />,
@@ -787,7 +809,7 @@ function App() {
             style={{
               background: darkMode ? "#141414" : "#fff",
               padding: "0 24px",
-              borderBottom: "1px solid #f0f0f0",
+              borderBottom: `1px solid var(--ant-color-border-secondary)`,
               display: "flex",
               justifyContent: "space-between",
               alignItems: "center",
@@ -835,7 +857,15 @@ function App() {
             {isConnected ? (
               <>
                 {/* 多标签页 */}
-                <div style={{ padding: "8px 16px 0", borderBottom: "1px solid #f0f0f0" }}>
+                <div 
+                  style={{ 
+                    padding: "8px 16px 0", 
+                    borderBottom: `1px solid var(--ant-color-border-secondary)`,
+                    background: cardBgGradient,
+                    borderRadius: 16,
+                    marginBottom: 12,
+                  }}
+                >
                   <Tabs
                     type="editable-card"
                     activeKey={activeTabId}
@@ -855,7 +885,7 @@ function App() {
                 {/* 主体三栏布局 */}
                 <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
                   {/* 左：表结构 */}
-                  <div style={{ width: "240px", borderRight: "1px solid #f0f0f0", overflow: "auto", padding: 8 }}>
+                  <div style={{ width: "240px", borderRight: `1px solid var(--ant-color-border-secondary)`, overflow: "auto", padding: 8 }}>
                     <Card
                       size="small"
                       title={<Space><TableOutlined />表结构{tables.length > 0 && ` (${tables.length})`}</Space>}
@@ -864,6 +894,10 @@ function App() {
                           <Button size="small" type="text" icon={<SyncOutlined />} onClick={refreshTables} />
                         </Tooltip>
                       }
+                      style={{
+                        borderRadius: 12,
+                        background: cardBgGradient,
+                      }}
                     >
                       {tables.map((t) => (
                         <div
@@ -872,8 +906,19 @@ function App() {
                           style={{
                             padding: "6px 8px",
                             cursor: "pointer",
-                            background: selectedTable === t.name ? "var(--ant-color-primary-bg)" : undefined,
-                            borderRadius: 4,
+                            background: selectedTable === t.name ? "rgba(102,126,234,0.1)" : undefined,
+                            borderRadius: 6,
+                            transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
+                          }}
+                          onMouseEnter={(e) => {
+                            if (selectedTable !== t.name) {
+                              (e.currentTarget as HTMLElement).background = "rgba(102,126,234,0.05)";
+                            }
+                          }}
+                          onMouseLeave={(e) => {
+                            if (selectedTable !== t.name) {
+                              (e.currentTarget as HTMLElement).background = "transparent";
+                            }
                           }}
                         >
                           <Space direction="vertical" size={0}>
@@ -885,7 +930,7 @@ function App() {
                         </div>
                       ))}
                       {selectedTable && (
-                        <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px dashed #f0f0f0" }}>
+                        <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px dashed var(--ant-color-border-secondary)` }}>
                           <Text strong>{selectedTable} 字段：</Text>
                           {columns.map((c) => (
                             <div key={c.name} style={{ marginTop: 6, fontSize: 12 }}>
@@ -909,25 +954,63 @@ function App() {
                     {/* SQL 编辑器 */}
                     <Card
                       size="small"
-                      style={{ marginBottom: 8, flex: "0 0 auto" }}
-                      title="SQL 编辑器"
+                      style={{ 
+                        marginBottom: 8, 
+                        flex: "0 0 auto",
+                        borderRadius: 12,
+                        background: cardBgGradient,
+                      }}
+                      title={
+                        <span style={{ 
+                          fontWeight: 600,
+                          background: brandGradient,
+                          WebkitBackgroundClip: "text",
+                          WebkitTextFillColor: "transparent",
+                          backgroundImage: brandGradient,
+                        }}>SQL 编辑器</span>
+                      }
                       extra={
                         <Space>
                           <Tooltip title="保存为常用查询">
-                            <Button size="small" icon={<StarOutlined />} onClick={() => {
-                              setEditingSavedQuery(null);
-                              setShowSaveQueryModal(true);
-                            }}>
+                            <Button 
+                              size="small" 
+                              icon={<StarOutlined />} 
+                              onClick={() => {
+                                setEditingSavedQuery(null);
+                                setShowSaveQueryModal(true);
+                              }}
+                              style={{ borderRadius: 6 }}
+                            >
                               收藏
                             </Button>
                           </Tooltip>
-                          <Button size="small" icon={<FormatPainterOutlined />} onClick={formatSQL}>
+                          <Button 
+                            size="small" 
+                            icon={<FormatPainterOutlined />} 
+                            onClick={formatSQL}
+                            style={{ borderRadius: 6 }}
+                          >
                             格式化
                           </Button>
-                          <Button size="small" icon={<CopyOutlined />} onClick={() => copy(sqlCode)}>
+                          <Button 
+                            size="small" 
+                            icon={<CopyOutlined />} 
+                            onClick={() => copy(sqlCode)}
+                            style={{ borderRadius: 6 }}
+                          >
                             复制
                           </Button>
-                          <Button type="primary" size="small" icon={<PlayCircleOutlined />} onClick={executeQuery}>
+                          <Button 
+                            type="primary" 
+                            size="small" 
+                            icon={<PlayCircleOutlined />} 
+                            onClick={executeQuery}
+                            style={{ 
+                              borderRadius: 6,
+                              background: brandGradient,
+                              boxShadow: "0 4px 12px rgba(102,126,234,0.3)",
+                            }}
+                          >
                             执行
                           </Button>
                         </Space>
@@ -937,7 +1020,11 @@ function App() {
                         value={sqlCode}
                         onChange={(e) => setSqlCode(e.target.value)}
                         autoSize={{ minRows: 4, maxRows: 12 }}
-                        style={{ fontFamily: "monospace", fontSize: 13 }}
+                        style={{ 
+                          fontFamily: "monospace", 
+                          fontSize: 13,
+                          borderRadius: 8,
+                        }}
                         placeholder="输入 SQL 语句..."
                       />
                     </Card>
@@ -945,11 +1032,16 @@ function App() {
                     {/* 查询结果 */}
                     <Card
                       size="small"
-                      style={{ flex: 1, overflow: "hidden" }}
+                      style={{ 
+                        flex: 1, 
+                        overflow: "hidden",
+                        borderRadius: 12,
+                        background: cardBgGradient,
+                      }}
                       title={`查询结果 (${queryResults.length} 行)`}
                       extra={
                         <Space>
-                          <Button size="small" icon={<SaveOutlined />}>导出</Button>
+                          <Button size="small" icon={<SaveOutlined />} style={{ borderRadius: 6 }}>导出</Button>
                         </Space>
                       }
                     >
@@ -959,19 +1051,20 @@ function App() {
                         size="small"
                         scroll={{ x: "max-content", y: 300 }}
                         pagination={{ pageSize: 50 }}
+                        style={{ borderRadius: 8 }}
                       />
                     </Card>
                   </div>
 
                   {/* 右：历史 + 收藏 */}
-                  <div style={{ width: "280px", borderLeft: "1px solid #f0f0f0", overflow: "auto" }}>
+                  <div style={{ width: "280px", borderLeft: `1px solid var(--ant-color-border-secondary)`, overflow: "auto" }}>
                     <Tabs
                       size="small"
                       style={{ padding: 8 }}
                       items={[
                         {
                           key: "history",
-                          label: <span><HistoryOutlined />历史</span>,
+                          label: <span><HistoryOutlined style={{ color: brandGradient }} />历史</span>,
                           children: (
                             <div style={{ maxHeight: "calc(100vh - 200px)", overflow: "auto" }}>
                               {history.map((h) => (
@@ -981,7 +1074,14 @@ function App() {
                                   style={{
                                     padding: 8,
                                     cursor: "pointer",
-                                    borderBottom: "1px solid #f0f0f0",
+                                    borderBottom: `1px solid var(--ant-color-border-secondary)`,
+                                    transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    (e.currentTarget as HTMLElement).background = "rgba(102,126,234,0.05)";
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    (e.currentTarget as HTMLElement).background = "transparent";
                                   }}
                                 >
                                   <Space direction="vertical" size={2} style={{ width: "100%" }}>
@@ -1005,7 +1105,7 @@ function App() {
                         },
                         {
                           key: "saved",
-                          label: <span><StarFilled />常用</span>,
+                          label: <span><StarFilled style={{ color: "#faad14" }} />常用</span>,
                           children: (
                             <div style={{ maxHeight: "calc(100vh - 200px)", overflow: "auto" }}>
                               {savedQueries.map((q) => (
@@ -1014,7 +1114,14 @@ function App() {
                                   style={{
                                     padding: 8,
                                     cursor: "pointer",
-                                    borderBottom: "1px solid #f0f0f0",
+                                    borderBottom: `1px solid var(--ant-color-border-secondary)`,
+                                    transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    (e.currentTarget as HTMLElement).background = "rgba(102,126,234,0.05)";
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    (e.currentTarget as HTMLElement).background = "transparent";
                                   }}
                                 >
                                   <Space direction="vertical" size={2} style={{ width: "100%" }}>
@@ -1072,11 +1179,11 @@ function App() {
                   justifyContent: "center",
                   alignItems: "center",
                   height: "100%",
-                  color: "#999",
+                  color: "var(--ant-color-text-secondary)",
                 }}
               >
-                <DatabaseOutlined style={{ fontSize: "64px", marginBottom: "16px" }} />
-                <h2>数据库管理工具</h2>
+                <DatabaseOutlined style={{ fontSize: "64px", marginBottom: "16px", background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }} />
+                <h2 style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>数据库管理工具</h2>
                 <p>请从左侧选择一个连接或创建新连接</p>
               </div>
             )}
