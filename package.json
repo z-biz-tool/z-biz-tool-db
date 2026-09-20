@@ -22,7 +22,8 @@
     "@tauri-apps/plugin-fs": "^2.0.0",
     "@tauri-apps/plugin-shell": "^2.0.0",
     "sql-formatter": "^12.0.0",
-    "react-syntax-highlighter": "^15.0.0"
+    "react-syntax-highlighter": "^15.0.0",
+    "z-biz-tool-shared": "file:../z-biz-tool-shared"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
