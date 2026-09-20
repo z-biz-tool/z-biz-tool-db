@@ -16,12 +16,11 @@ import {
   message,
   Tooltip,
   Tag,
-  Row as AntRow,
-  Col,
   Empty,
-  Tabs as AntdTabs,
-  Popconfirm,
-  Dropdown,
+  Switch,
+  Typography,
+  Alert,
+  Spin,
 } from "antd";
 import {
   DatabaseOutlined,
@@ -34,23 +33,29 @@ import {
   SaveOutlined,
   SyncOutlined,
   TableOutlined,
-  CodeOutlined,
   HistoryOutlined,
   SettingOutlined,
-  CloudOutlined,
-  ThunderboltOutlined,
   DownloadOutlined,
-  UploadOutlined,
   StarOutlined,
   StarFilled,
-  MoreOutlined,
-  EyeOutlined,
+  ApiOutlined,
+  RobotOutlined,
+  CodeOutlined,
+  BugOutlined,
+  BulbOutlined,
+  SnippetsOutlined,
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
+// 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
+import { AgentPanel } from './agent/AgentPanel';
+import { useAgentStore } from './agent/AgentManager';
 
 const { Header, Sider, Content } = Layout;
 const { TextArea } = Input;
-const { TabPane } = Tabs;
+const { Text } = Typography;
+
+// Rust 风格可空类型
+type Option<T> = T | null;
 
 // 类型定义
 interface DBConnection {
@@ -100,46 +105,9 @@ interface SavedQuery {
   updated_at: number;
 }
 
-// 模拟数据
-const mockConnections: DBConnection[] = [
-  {
-    id: "1",
-    name: "本地 MySQL",
-    type: "mysql",
-    host: "localhost",
-    port: 3306,
-    username: "root",
-    password: "",
-    database: "test_db",
-  },
-  {
-    id: "2",
-    name: "生产 PostgreSQL",
-    type: "postgresql",
-    host: "192.168.1.100",
-    port: 5432,
-    username: "admin",
-    password: "",
-    database: "production",
-  },
-];
-
-const mockTables: TableInfo[] = [
-  { name: "users", schema: "public", row_estimate: 1234, size_bytes: 524288 },
-  { name: "orders", schema: "public", row_estimate: 5678, size_bytes: 2097152 },
-  { name: "products", schema: "public", row_estimate: 890, size_bytes: 1048576 },
-];
-
-const mockColumns: ColumnInfo[] = [
-  { name: "id", data_type: "INTEGER", nullable: false, is_primary: true, default_value: "AUTO_INCREMENT" },
-  { name: "name", data_type: "VARCHAR(255)", nullable: false, is_primary: false, default_value: null },
-  { name: "email", data_type: "VARCHAR(255)", nullable: true, is_primary: false, default_value: null },
-  { name: "created_at", data_type: "TIMESTAMP", nullable: false, is_primary: false, default_value: "CURRENT_TIMESTAMP" },
-];
-
 function App() {
   const [darkMode, setDarkMode] = useState(false);
-  const [connections, setConnections] = useState<DBConnection[]>(mockConnections);
+  const [connections, setConnections] = useState<DBConnection[]>([]);
   const [selectedConnection, setSelectedConnection] = useState<DBConnection | null>(null);
   const [sqlCode, setSqlCode] = useState("SELECT * FROM users WHERE id = 1");
   const [queryResults, setQueryResults] = useState<any[]>([]);
@@ -155,8 +123,8 @@ function App() {
   const [activeTabId, setActiveTabId] = useState("tab-1");
 
   // 表结构
-  const [tables] = useState<TableInfo[]>(mockTables);
-  const [columns] = useState<ColumnInfo[]>(mockColumns);
+  const [tables, setTables] = useState<TableInfo[]>([]);
+  const [columns, setColumns] = useState<ColumnInfo[]>([]);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
 
   // 查询历史
@@ -166,7 +134,7 @@ function App() {
       sql: "SELECT * FROM users LIMIT 10",
       connection_id: "1",
       connection_name: "本地 MySQL",
-      timestamp: Date.now() / 1000 - 3600,
+      timestamp: Math.floor(Date.now() / 1000) - 3600,
       execution_time_ms: 23,
       success: true,
       error: null,
@@ -176,7 +144,7 @@ function App() {
       sql: "SELECT COUNT(*) FROM orders",
       connection_id: "1",
       connection_name: "本地 MySQL",
-      timestamp: Date.now() / 1000 - 7200,
+      timestamp: Math.floor(Date.now() / 1000) - 7200,
       execution_time_ms: 45,
       success: true,
       error: null,
@@ -191,27 +159,71 @@ function App() {
       sql: "SELECT * FROM users WHERE active = true",
       description: "获取所有状态为活跃的用户",
       tags: ["user", "常用"],
-      created_at: Date.now() / 1000 - 86400 * 7,
-      updated_at: Date.now() / 1000 - 86400,
+      created_at: Math.floor(Date.now() / 1000) - 86400 * 7,
+      updated_at: Math.floor(Date.now() / 1000) - 86400,
     },
   ]);
   const [showSaveQueryModal, setShowSaveQueryModal] = useState(false);
   const [editingSavedQuery, setEditingSavedQuery] = useState<SavedQuery | null>(null);
+  
+  // AI 配置
+  const [aiConfig, setAiConfig] = useState({
+    baseUrl: "",
+    apiKey: "",
+    model: "xop3qwencodernext",
+  });
+  const [showAiConfigModal, setShowAiConfigModal] = useState(false);
+  const [aiForm] = Form.useForm();
+  
+  // AI 功能状态
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiResult, setAiResult] = useState<string>("");
+  const [showAiResultModal, setShowAiResultModal] = useState(false);
+  const [aiActiveTab, setAiActiveTab] = useState<string>("generate");
+  const [aiNaturalLanguage, setAiNaturalLanguage] = useState("");
+  const [aiSqlForOptimize, setAiSqlForOptimize] = useState("");
+  const [aiSqlForExplain, setAiSqlForExplain] = useState("");
+  const [aiErrorMessage, setAiErrorMessage] = useState("");
+  const [aiSqlForError, setAiSqlForError] = useState("");
 
   const [msgApi, msgContext] = message.useMessage();
 
   // 执行查询
   const executeQuery = async () => {
+    if (!selectedConnection) {
+      msgApi.warning("请先连接数据库");
+      return;
+    }
     try {
-      const result = await invoke<any>("execute_query", { sql: sqlCode, config: selectedConnection });
+      const result = await invoke<any>("execute_query", {
+        sql: sqlCode,
+        config: toBackendConfig(selectedConnection),
+      });
       setQueryResults(result.rows || []);
+      
+      // 添加到 Agent 历史
+      useAgentStore.getState().addMessage({
+        id: Date.now().toString(),
+        role: 'user',
+        content: `执行查询: ${sqlCode}`,
+        timestamp: Date.now(),
+      });
+      
+      useAgentStore.getState().addMessage({
+        id: (Date.now() + 1).toString(),
+        role: 'agent',
+        content: `查询返回 ${result.rows?.length || 0} 行结果`,
+        sql: sqlCode,
+        timestamp: Date.now(),
+      });
+      
       // 添加历史
       const newItem: QueryHistoryItem = {
         id: Date.now().toString(),
         sql: sqlCode,
         connection_id: selectedConnection?.id || "",
         connection_name: selectedConnection?.name || "",
-        timestamp: Date.now() / 1000,
+        timestamp: Math.floor(Date.now() / 1000),
         execution_time_ms: result.execution_time_ms || 0,
         success: true,
         error: null,
@@ -219,19 +231,14 @@ function App() {
       setHistory((prev) => [newItem, ...prev].slice(0, 100));
       msgApi.success(`查询执行成功，耗时 ${result.execution_time_ms}ms`);
     } catch (e: any) {
-      msgApi.warning(`后端未连接: ${e}，使用模拟数据`);
-      // 使用模拟数据
-      setQueryResults([
-        { id: 1, name: "张三", email: "zhangsan@example.com", age: 25 },
-        { id: 2, name: "李四", email: "lisi@example.com", age: 30 },
-      ]);
+      msgApi.error(`查询失败: ${e}`);
       const newItem: QueryHistoryItem = {
         id: Date.now().toString(),
         sql: sqlCode,
         connection_id: selectedConnection?.id || "",
         connection_name: selectedConnection?.name || "",
-        timestamp: Date.now() / 1000,
-        execution_time_ms: 12,
+        timestamp: Math.floor(Date.now() / 1000),
+        execution_time_ms: 0,
         success: false,
         error: String(e),
       };
@@ -272,11 +279,272 @@ function App() {
     );
   };
 
-  // 连接数据库
-  const connectDB = (connection: DBConnection) => {
+  // 转换为后端 DBConfig（Rust 侧字段为 db_type）
+  const toBackendConfig = (c: DBConnection) => ({
+    id: c.id,
+    name: c.name,
+    db_type: c.type,
+    host: c.host,
+    port: Number(c.port) || 0,
+    username: c.username,
+    password: c.password,
+    database: c.database,
+  });
+
+  // 连接配置落盘
+  const persistConnections = (list: DBConnection[]) => {
+    invoke("save_connections", { connections: list.map(toBackendConfig) }).catch(
+      (e) => msgApi.error(`保存连接配置失败: ${e}`)
+    );
+  };
+
+  // 启动时加载落盘的连接配置
+  useEffect(() => {
+    invoke<any[]>("load_connections")
+      .then((list) =>
+        setConnections(
+          (list || []).map((c: any) => ({
+            id: c.id ?? String(Date.now()),
+            name: c.name ?? "",
+            type: c.db_type ?? c.type ?? "",
+            host: c.host ?? "",
+            port: Number(c.port) || 0,
+            username: c.username ?? "",
+            password: c.password ?? "",
+            database: c.database ?? "",
+          }))
+        )
+      )
+      .catch(() => {});
+  }, []);
+
+  // 加载 AI 配置
+  useEffect(() => {
+    invoke<any>("get_ai_config")
+      .then((config) => {
+        if (config && config.base_url) {
+          setAiConfig({
+            baseUrl: config.base_url,
+            apiKey: config.api_key,
+            model: config.model || "xop3qwencodernext",
+          });
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // AI 调用辅助函数
+  const callAiService = async (command: string, payload: any) => {
+    if (!aiConfig.baseUrl || !aiConfig.apiKey) {
+      msgApi.warning("请先在设置中配置 AI 参数");
+      setShowAiConfigModal(true);
+      return null;
+    }
+    
+    setAiLoading(true);
+    try {
+      const result = await invoke<any>(command, payload);
+      setAiResult(result || "");
+      return result;
+    } catch (e: any) {
+      msgApi.error(`AI 服务错误: ${e}`);
+      return null;
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  // AI 功能 - 使用共享 Agent 组件
+  const handleAiGenerateSql = async () => {
+    if (!aiNaturalLanguage.trim()) {
+      msgApi.warning("请输入自然语言描述");
+      return;
+    }
+    if (!selectedConnection) {
+      msgApi.warning("请先连接数据库");
+      return;
+    }
+    
+    try {
+      const result = await useAgentStore.getState().query(aiNaturalLanguage);
+      
+      if (result.success && result.sql) {
+        setSqlCode(result.sql);
+        msgApi.success("SQL 已生成");
+      } else if (result.error) {
+        msgApi.error(`Agent 错误: ${result.error}`);
+      }
+    } catch (e: any) {
+      msgApi.error(`AI 服务错误: ${e}`);
+    }
+  };
+
+  const handleAiOptimizeSql = async () => {
+    if (!aiSqlForOptimize.trim()) {
+      msgApi.warning("请输入要优化的 SQL");
+      return;
+    }
+    
+    try {
+      const result = await useAgentStore.getState().optimize(aiSqlForOptimize);
+      
+      if (result.success && result.sql) {
+        setAiResult(result.content);
+        setShowAiResultModal(true);
+      } else if (result.error) {
+        msgApi.error(`Agent 错误: ${result.error}`);
+      }
+    } catch (e: any) {
+      msgApi.error(`AI 服务错误: ${e}`);
+    }
+  };
+
+  const handleAiExplainSql = async () => {
+    if (!aiSqlForExplain.trim()) {
+      msgApi.warning("请输入要解释的 SQL");
+      return;
+    }
+    
+    try {
+      const result = await useAgentStore.getState().optimize(aiSqlForExplain);
+      
+      if (result.success) {
+        setAiResult(result.content);
+        setShowAiResultModal(true);
+      } else if (result.error) {
+        msgApi.error(`Agent 错误: ${result.error}`);
+      }
+    } catch (e: any) {
+      msgApi.error(`AI 服务错误: ${e}`);
+    }
+  };
+
+  const handleAiDiagnoseError = async () => {
+    if (!aiErrorMessage.trim() || !aiSqlForError.trim()) {
+      msgApi.warning("请输入错误信息和 SQL");
+      return;
+    }
+    
+    try {
+      const result = await useAgentStore.getState().diagnoseError(aiErrorMessage, aiSqlForError);
+      
+      if (result.success) {
+        setAiResult(result.content);
+        setShowAiResultModal(true);
+      } else if (result.error) {
+        msgApi.error(`Agent 错误: ${result.error}`);
+      }
+    } catch (e: any) {
+      msgApi.error(`AI 服务错误: ${e}`);
+    }
+  };
+
+  const handleAiExplainResults = async () => {
+    if (queryResults.length === 0) {
+      msgApi.warning("请先执行查询");
+      return;
+    }
+    
+    try {
+      const result = await useAgentStore.getState().analyze(sqlCode, queryResults);
+      
+      if (result.success) {
+        setAiResult(result.content);
+        setShowAiResultModal(true);
+      } else if (result.error) {
+        msgApi.error(`Agent 错误: ${result.error}`);
+      }
+    } catch (e: any) {
+      msgApi.error(`AI 服务错误: ${e}`);
+    }
+  };
+
+  // 保存 AI 配置
+  const handleSaveAiConfig = async (values: any) => {
+    await invoke("save_ai_config", {
+      config: {
+        base_url: values.baseUrl,
+        api_key: values.apiKey,
+        model: values.model,
+      },
+    });
+    setAiConfig(values);
+    setShowAiConfigModal(false);
+    msgApi.success("AI 配置已保存");
+  };
+
+  // 复制
+
+  // 连接数据库（真实连接 + 加载表列表）
+  const connectDB = async (connection: DBConnection) => {
+    const cfg = toBackendConfig(connection);
+    try {
+      await invoke("test_connection", { config: cfg });
+    } catch (e: any) {
+      msgApi.error(`连接失败: ${e}`);
+      return;
+    }
     setSelectedConnection(connection);
     setIsConnected(true);
+    setTables([]);
+    setSelectedTable(null);
+    setColumns([]);
     msgApi.success(`已连接到 ${connection.name}`);
+    
+    // 设置 Agent 上下文
+    useAgentStore.getState().setContext({
+      connectionId: connection.id,
+      databaseType: connection.type,
+      databaseName: connection.database,
+    });
+    
+    try {
+      const list = await invoke<TableInfo[]>("get_tables", { config: cfg });
+      setTables(list);
+      
+      // 更新 Agent 上下文的表信息
+      useAgentStore.getState().setContext({
+        connectionId: connection.id,
+        databaseType: connection.type,
+        databaseName: connection.database,
+        tables: list.map(t => ({
+          name: t.name,
+          columns: [], // TODO: 从后端获取列信息
+        })),
+      });
+    } catch (e: any) {
+      msgApi.warning(`获取表列表失败: ${e}`);
+    }
+  };
+
+  // 刷新表列表
+  const refreshTables = async () => {
+    if (!selectedConnection) return;
+    try {
+      const list = await invoke<TableInfo[]>("get_tables", {
+        config: toBackendConfig(selectedConnection),
+      });
+      setTables(list);
+      msgApi.success(`已刷新，共 ${list.length} 张表`);
+    } catch (e: any) {
+      msgApi.error(`刷新失败: ${e}`);
+    }
+  };
+
+  // 选中表并加载字段结构
+  const selectTable = async (tableName: string) => {
+    setSelectedTable(tableName);
+    if (!selectedConnection) return;
+    try {
+      const cols = await invoke<ColumnInfo[]>("get_table_structure", {
+        tableName,
+        config: toBackendConfig(selectedConnection),
+      });
+      setColumns(cols);
+    } catch (e: any) {
+      setColumns([]);
+      msgApi.warning(`获取表结构失败: ${e}`);
+    }
   };
 
   // 断开连接
@@ -290,23 +558,32 @@ function App() {
   // 保存连接
   const saveConnection = (values: any) => {
     if (editingConnection) {
-      setConnections(
-        connections.map((c) =>
-          c.id === editingConnection.id ? { ...c, ...values } : c
-        )
+      const next = connections.map((c) =>
+        c.id === editingConnection.id ? { ...c, ...values } : c
       );
+      setConnections(next);
+      persistConnections(next);
       msgApi.success("连接已更新");
     } else {
       const newConnection: DBConnection = {
         id: Date.now().toString(),
         ...values,
       };
-      setConnections([...connections, newConnection]);
+      const next = [...connections, newConnection];
+      setConnections(next);
+      persistConnections(next);
       msgApi.success("连接已创建");
     }
     setShowConnectionModal(false);
     setEditingConnection(null);
     form.resetFields();
+  };
+
+  // 编辑连接
+  const editConnection = (connection: DBConnection) => {
+    setEditingConnection(connection);
+    form.setFieldsValue(connection);
+    setShowConnectionModal(true);
   };
 
   // 删除连接
@@ -315,7 +592,9 @@ function App() {
       title: "确认删除",
       content: "确定要删除这个连接吗？",
       onOk: () => {
-        setConnections(connections.filter((c) => c.id !== id));
+        const next = connections.filter((c) => c.id !== id);
+        setConnections(next);
+        persistConnections(next);
         msgApi.success("连接已删除");
       },
     });
@@ -371,8 +650,7 @@ function App() {
   };
 
   // 关闭标签页
-  const closeTab = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const closeTab = (id: string) => {
     if (tabs.length === 1) {
       msgApi.warning("至少保留一个标签页");
       return;
@@ -387,7 +665,7 @@ function App() {
 
   // 保存常用查询
   const saveAsSavedQuery = (values: any) => {
-    const now = Date.now() / 1000;
+    const now = Math.floor(Date.now() / 1000);
     if (editingSavedQuery) {
       setSavedQueries(
         savedQueries.map((q) =>
@@ -536,7 +814,21 @@ function App() {
                 checkedChildren="🌙"
                 unCheckedChildren="☀️"
               />
-              <SettingOutlined style={{ fontSize: "16px", cursor: "pointer" }} />
+              <Space>
+                <Tooltip title="AI 助手">
+                  <Button
+                    type="primary"
+                    icon={<RobotOutlined />}
+                    onClick={() => setShowAiConfigModal(true)}
+                  />
+                </Tooltip>
+                <Tooltip title="设置">
+                  <SettingOutlined 
+                    style={{ fontSize: "16px", cursor: "pointer" }} 
+                    onClick={() => setShowAiConfigModal(true)}
+                  />
+                </Tooltip>
+              </Space>
             </Space>
           </Header>
           <Content style={{ display: "flex", flexDirection: "column" }}>
@@ -550,6 +842,7 @@ function App() {
                     onChange={switchTab}
                     onEdit={(targetKey, action) => {
                       if (action === "add") addTab();
+                      else if (action === "remove") closeTab(String(targetKey));
                     }}
                     items={tabs.map((t) => ({
                       key: t.id,
@@ -563,11 +856,19 @@ function App() {
                 <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
                   {/* 左：表结构 */}
                   <div style={{ width: "240px", borderRight: "1px solid #f0f0f0", overflow: "auto", padding: 8 }}>
-                    <Card size="small" title={<Space><TableOutlined />表结构</Space>}>
+                    <Card
+                      size="small"
+                      title={<Space><TableOutlined />表结构{tables.length > 0 && ` (${tables.length})`}</Space>}
+                      extra={
+                        <Tooltip title="刷新表列表">
+                          <Button size="small" type="text" icon={<SyncOutlined />} onClick={refreshTables} />
+                        </Tooltip>
+                      }
+                    >
                       {tables.map((t) => (
                         <div
                           key={t.name}
-                          onClick={() => setSelectedTable(t.name)}
+                          onClick={() => selectTable(t.name)}
                           style={{
                             padding: "6px 8px",
                             cursor: "pointer",
@@ -811,11 +1112,11 @@ function App() {
               ]}
             />
           </Form.Item>
-          <Form.Item name="host" label="主机地址" rules={[{ required: true }]}>
-            <Input placeholder="例如：localhost" />
+          <Form.Item name="host" label="主机地址">
+            <Input placeholder="例如：localhost（SQLite 可留空）" />
           </Form.Item>
-          <Form.Item name="port" label="端口" rules={[{ required: true }]}>
-            <Input type="number" placeholder="例如：3306" />
+          <Form.Item name="port" label="端口">
+            <Input type="number" placeholder="例如：3306（SQLite 可留空）" />
           </Form.Item>
           <Form.Item name="username" label="用户名" rules={[{ required: true }]}>
             <Input placeholder="例如：root" />
@@ -824,7 +1125,7 @@ function App() {
             <Input.Password placeholder="输入密码" />
           </Form.Item>
           <Form.Item name="database" label="数据库名" rules={[{ required: true }]}>
-            <Input placeholder="例如：my_database" />
+            <Input placeholder="例如：my_database（SQLite 填文件路径）" />
           </Form.Item>
         </Form>
       </Modal>
@@ -861,6 +1162,226 @@ function App() {
             <Select mode="tags" placeholder="回车添加标签" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      {/* AI 配置弹窗 */}
+      <Modal
+        title="AI 助手配置"
+        open={showAiConfigModal}
+        onCancel={() => {
+          setShowAiConfigModal(false);
+          aiForm.resetFields();
+        }}
+        footer={null}
+        width={500}
+      >
+        <Form
+          form={aiForm}
+          layout="vertical"
+          onFinish={handleSaveAiConfig}
+          initialValues={aiConfig}
+        >
+          <Alert 
+            message="AI 助手功能" 
+            description="配置 AI 服务参数后，可使用自然语言生成 SQL、SQL 优化、错误诊断等功能。"
+            type="info"
+            style={{ marginBottom: 16 }}
+          />
+          
+          <Form.Item name="baseUrl" label="API 地址" rules={[{ required: true }]}>
+            <Input placeholder="例如：https://maas-coding-api.cn-huabei-1.xf-yun.com/v2" />
+          </Form.Item>
+          
+          <Form.Item name="apiKey" label="API Key" rules={[{ required: true }]}>
+            <Input.Password placeholder="格式：APIKey:APISecret" />
+          </Form.Item>
+          
+          <Form.Item name="model" label="模型" rules={[{ required: true }]}>
+            <Input placeholder="例如：xop3qwencodernext" />
+          </Form.Item>
+          
+          <Form.Item style={{ textAlign: "right", marginBottom: 0 }}>
+            <Button type="primary" htmlType="submit">
+              保存配置
+            </Button>
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* AI 结果弹窗 */}
+      <Modal
+        title={
+          <Space>
+            <RobotOutlined />
+            AI 助手
+          </Space>
+        }
+        open={showAiResultModal}
+        onCancel={() => setShowAiResultModal(false)}
+        width={800}
+        footer={null}
+        styles={{ body: { maxHeight: "70vh", overflow: "auto" } }}
+      >
+        <Tabs
+          activeKey={aiActiveTab}
+          onChange={setAiActiveTab}
+          items={[
+            {
+              key: "generate",
+              label: <Space><SnippetsOutlined />生成 SQL</Space>,
+              children: (
+                <div style={{ marginTop: 16 }}>
+                  <Form layout="vertical">
+                    <Form.Item label="自然语言描述">
+                      <TextArea
+                        value={aiNaturalLanguage}
+                        onChange={(e) => setAiNaturalLanguage(e.target.value)}
+                        placeholder="用自然语言描述你的需求，例如：查询所有活跃用户，按创建时间排序"
+                        rows={4}
+                      />
+                    </Form.Item>
+                    <Button
+                      type="primary"
+                      icon={<BulbOutlined />}
+                      onClick={handleAiGenerateSql}
+                      disabled={aiLoading || !selectedConnection}
+                      block
+                    >
+                      {aiLoading ? <Spin size="small" /> : "生成 SQL"}
+                    </Button>
+                  </Form>
+                </div>
+              ),
+            },
+            {
+              key: "optimize",
+              label: <Space><CodeOutlined />优化 SQL</Space>,
+              children: (
+                <div style={{ marginTop: 16 }}>
+                  <Form layout="vertical">
+                    <Form.Item label="要优化的 SQL">
+                      <TextArea
+                        value={aiSqlForOptimize}
+                        onChange={(e) => setAiSqlForOptimize(e.target.value)}
+                        placeholder="输入要优化的 SQL 语句"
+                        rows={6}
+                      />
+                    </Form.Item>
+                    <Button
+                      type="primary"
+                      icon={<BulbOutlined />}
+                      onClick={handleAiOptimizeSql}
+                      disabled={aiLoading}
+                      block
+                    >
+                      {aiLoading ? <Spin size="small" /> : "分析并优化"}
+                    </Button>
+                  </Form>
+                </div>
+              ),
+            },
+            {
+              key: "explain",
+              label: <Space><ApiOutlined />解释 SQL</Space>,
+              children: (
+                <div style={{ marginTop: 16 }}>
+                  <Form layout="vertical">
+                    <Form.Item label="要解释的 SQL">
+                      <TextArea
+                        value={aiSqlForExplain}
+                        onChange={(e) => setAiSqlForExplain(e.target.value)}
+                        placeholder="输入要解释的 SQL 语句"
+                        rows={6}
+                      />
+                    </Form.Item>
+                    <Button
+                      type="primary"
+                      icon={<BulbOutlined />}
+                      onClick={handleAiExplainSql}
+                      disabled={aiLoading}
+                      block
+                    >
+                      {aiLoading ? <Spin size="small" /> : "解释执行逻辑"}
+                    </Button>
+                  </Form>
+                </div>
+              ),
+            },
+            {
+              key: "diagnose",
+              label: <Space><BugOutlined />错误诊断</Space>,
+              children: (
+                <div style={{ marginTop: 16 }}>
+                  <Form layout="vertical">
+                    <Form.Item label="错误信息">
+                      <Input
+                        value={aiErrorMessage}
+                        onChange={(e) => setAiErrorMessage(e.target.value)}
+                        placeholder="复制的错误信息"
+                      />
+                    </Form.Item>
+                    <Form.Item label="执行的 SQL">
+                      <TextArea
+                        value={aiSqlForError}
+                        onChange={(e) => setAiSqlForError(e.target.value)}
+                        placeholder="执行失败的 SQL 语句"
+                        rows={4}
+                      />
+                    </Form.Item>
+                    <Button
+                      type="primary"
+                      icon={<BugOutlined />}
+                      onClick={handleAiDiagnoseError}
+                      disabled={aiLoading}
+                      block
+                    >
+                      {aiLoading ? <Spin size="small" /> : "诊断问题"}
+                    </Button>
+                  </Form>
+                </div>
+              ),
+            },
+            {
+              key: "explainResults",
+              label: <Space><DatabaseOutlined />解释结果</Space>,
+              children: (
+                <div style={{ marginTop: 16 }}>
+                  <Alert
+                    message="提示"
+                    description="执行查询后，可使用此功能分析查询结果"
+                    type="info"
+                    style={{ marginBottom: 16 }}
+                  />
+                  <Button
+                    type="primary"
+                    icon={<BulbOutlined />}
+                    onClick={handleAiExplainResults}
+                    disabled={aiLoading || queryResults.length === 0}
+                    block
+                  >
+                    {aiLoading ? <Spin size="small" /> : "分析查询结果"}
+                  </Button>
+                </div>
+              ),
+            },
+          ]}
+        />
+        
+        {aiResult && (
+          <Card
+            title="AI 回答"
+            style={{ marginTop: 16 }}
+            extra={
+              <Button size="small" onClick={() => copy(aiResult)}>
+                复制
+              </Button>
+            }
+          >
+            <Typography style={{ whiteSpace: "pre-wrap", fontFamily: "monospace" }}>
+              {aiResult}
+            </Typography>
+          </Card>
+        )}
       </Modal>
     </ConfigProvider>
   );

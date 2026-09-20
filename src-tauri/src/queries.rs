@@ -1,12 +1,28 @@
-// 查询历史 & 保存查询的本地持久化
-use crate::{QueryHistoryItem, SavedQuery};
+// 查询历史 & 保存查询 & 连接配置的本地持久化
 use std::path::PathBuf;
+use crate::{QueryHistoryItem, SavedQuery, ConnectionRecord};
 
-fn data_dir() -> PathBuf {
+pub fn get_data_dir() -> PathBuf {
+    // 测试可通过环境变量重定向数据目录，避免污染真实用户数据
+    if let Ok(custom) = std::env::var("Z_BIZ_TOOL_DB_DATA_DIR") {
+        let d = PathBuf::from(custom);
+        std::fs::create_dir_all(&d).ok();
+        return d;
+    }
     let mut dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
     dir.push("z-biz-tool-db");
     std::fs::create_dir_all(&dir).ok();
     dir
+}
+
+fn data_dir() -> PathBuf {
+    get_data_dir()
+}
+
+fn connections_path() -> PathBuf {
+    let mut p = data_dir();
+    p.push("connections.json");
+    p
 }
 
 fn history_path() -> PathBuf {
@@ -73,4 +89,21 @@ pub async fn delete_saved_query(id: &str) -> Result<(), String> {
     let json = serde_json::to_string_pretty(&all).map_err(|e| e.to_string())?;
     std::fs::write(saved_queries_path(), json).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ================== 连接配置持久化 ==================
+
+pub async fn save_connections(connections: &[ConnectionRecord]) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(connections).map_err(|e| e.to_string())?;
+    std::fs::write(connections_path(), json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub async fn load_connections() -> Result<Vec<ConnectionRecord>, String> {
+    let path = connections_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&content).map_err(|e| e.to_string())
 }
