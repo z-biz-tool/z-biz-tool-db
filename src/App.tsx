@@ -29,6 +29,15 @@ import {
 } from "./ipc/approval";
 import type { ApprovalGrant } from "./ipc/approval";
 import { classifyError, errorDescription } from "./ipc/errors";
+
+interface ExportedConnection {
+  name: string;
+  db_type: string;
+  host: string;
+  port: number;
+  username: string;
+  database: string;
+}
 import {
   DatabaseOutlined,
   PlusOutlined,
@@ -43,6 +52,7 @@ import {
   HistoryOutlined,
   SettingOutlined,
   DownloadOutlined,
+  UploadOutlined,
   StarOutlined,
   StarFilled,
   ApiOutlined,
@@ -183,6 +193,9 @@ function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [showConnectionModal, setShowConnectionModal] = useState(false);
   const [editingConnection, setEditingConnection] = useState<DBConnection | null>(null);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importPreview, setImportPreview] = useState<ExportedConnection[]>([]);
+  const [importError, setImportError] = useState<string>("");
   const [form] = Form.useForm();
 
   // 多标签页
@@ -750,6 +763,58 @@ function App() {
     }
   };
 
+  // T-037：导入连接配置
+  const handleImportFile = async () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/json,.json";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      setImportError("");
+      setImportPreview([]);
+      try {
+        const text = await file.text();
+        const list = await invoke<ExportedConnection[]>("import_connections", {
+          json: text,
+          options: { limit: 100, max_bytes: 256 * 1024, check_driver: true },
+        });
+        setImportPreview(list);
+        setShowImportModal(true);
+      } catch (e: any) {
+        setImportError(String(e));
+        setShowImportModal(true);
+      }
+    };
+    input.click();
+  };
+
+  const confirmImport = async () => {
+    if (importPreview.length === 0) return;
+    try {
+      const existingNames = new Set(connections.map((c) => c.name));
+      const toAdd = importPreview.map((c) => ({
+        id: crypto.randomUUID(),
+        name: existingNames.has(c.name) ? `${c.name} (导入)` : c.name,
+        type: c.db_type as DBConnection["type"],
+        host: c.host,
+        port: c.port,
+        username: c.username,
+        password: "",
+        database: c.database,
+      }));
+      const merged = [...connections, ...toAdd];
+      await invoke("save_connections", { connections: merged });
+      setConnections(merged);
+      setShowImportModal(false);
+      setImportPreview([]);
+      msgApi.success(`已导入 ${toAdd.length} 个连接`);
+    } catch (e: any) {
+      const err = classifyError(String(e));
+      msgApi.error(errorDescription(err));
+    }
+  };
+
   // 切换标签页
   const switchTab = (id: string) => {
     const current = tabs.find((t) => t.id === activeTabId);
@@ -887,12 +952,20 @@ function App() {
               >
                 导出配置
               </Button>
+              <Button
+                icon={<UploadOutlined />}
+                block
+                onClick={() => handleImportFile()}
+                style={{ borderRadius: 8 }}
+              >
+                导入配置
+              </Button>
             </Space>
           </div>
           <Menu
             mode="inline"
             theme={darkMode ? "dark" : "light"}
-            style={{ 
+            style={{
               borderRight: 0,
               background: 'transparent',
             }}
@@ -1737,6 +1810,45 @@ function App() {
                 <li>单次使用，已使用后无法重放</li>
               </ul>
             </Card>
+          </Space>
+        )}
+      </Modal>
+
+      {/* T-037 导入连接 Modal */}
+      <Modal
+        open={showImportModal}
+        title="导入连接配置"
+        onCancel={() => setShowImportModal(false)}
+        onOk={confirmImport}
+        okText="导入所选"
+        cancelText="取消"
+        okButtonProps={{ disabled: importPreview.length === 0 || !!importError }}
+        width={720}
+      >
+        {importError ? (
+          <Alert type="error" showIcon message="导入校验失败" description={importError} />
+        ) : (
+          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+            <Alert
+              type="info"
+              showIcon
+              message={`将导入 ${importPreview.length} 条连接`}
+              description="导入的连接不携带密码；如有重名会自动追加 (导入) 后缀。"
+            />
+            <Table
+              size="small"
+              dataSource={importPreview}
+              rowKey={(r) => `${r.db_type}-${r.name}-${r.host}`}
+              pagination={false}
+              columns={[
+                { title: "名称", dataIndex: "name", key: "name" },
+                { title: "驱动", dataIndex: "db_type", key: "db_type" },
+                { title: "主机", dataIndex: "host", key: "host" },
+                { title: "端口", dataIndex: "port", key: "port" },
+                { title: "用户名", dataIndex: "username", key: "username" },
+                { title: "数据库", dataIndex: "database", key: "database" },
+              ]}
+            />
           </Space>
         )}
       </Modal>

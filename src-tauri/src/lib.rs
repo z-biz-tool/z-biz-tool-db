@@ -1728,11 +1728,69 @@ async fn export_connections(
     serde_json::to_string_pretty(&export).map_err(|e| e.to_string())
 }
 
-// 导入连接配置
+// T-037：导入连接配置 + 版本/大小/条数校验
+// - 当前仅支持 version=1
+// - 单批最多 100 条；JSON 长度 ≤ 256 KiB
+// - 解析后必须至少 1 条；驱动类型必须是 mysql/postgresql/sqlite 之一
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ImportOptions {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+    #[serde(default)]
+    pub check_driver: Option<bool>,
+}
+
+const DEFAULT_IMPORT_LIMIT: usize = 100;
+const DEFAULT_IMPORT_MAX_BYTES: usize = 256 * 1024;
+
 #[command]
-async fn import_connections(json: String) -> Result<Vec<ExportedConnection>, String> {
+async fn import_connections(
+    json: String,
+    options: Option<ImportOptions>,
+) -> Result<Vec<ExportedConnection>, String> {
+    let opts = options.unwrap_or(ImportOptions {
+        limit: None,
+        max_bytes: None,
+        check_driver: None,
+    });
+    let max_bytes = opts.max_bytes.unwrap_or(DEFAULT_IMPORT_MAX_BYTES);
+    if json.len() > max_bytes {
+        return Err(format!("导入文件过大（{} bytes > 限额 {}）", json.len(), max_bytes));
+    }
     let export: ConnectionExport =
         serde_json::from_str(&json).map_err(|e| format!("解析失败: {}", e))?;
+    if export.version != 1 {
+        return Err(format!(
+            "不支持的导出版本 {}；当前应用仅支持 1",
+            export.version
+        ));
+    }
+    let limit = opts.limit.unwrap_or(DEFAULT_IMPORT_LIMIT);
+    if export.connections.len() > limit {
+        return Err(format!(
+            "导入条数 {} 超过限 {}",
+            export.connections.len(),
+            limit
+        ));
+    }
+    if export.connections.is_empty() {
+        return Err("导入文件不含任何连接".to_string());
+    }
+    if opts.check_driver.unwrap_or(true) {
+        for c in &export.connections {
+            if !matches!(c.db_type.as_str(), "mysql" | "postgresql" | "sqlite") {
+                return Err(format!(
+                    "驱动类型 {} 未在白名单（mysql/postgresql/sqlite）；条目 {} 被拒",
+                    c.db_type, c.name
+                ));
+            }
+            if c.port == 0 {
+                return Err(format!("连接 {} 端口字段为 0", c.name));
+            }
+        }
+    }
     Ok(export.connections)
 }
 
@@ -2149,6 +2207,59 @@ mod tests {
         .unwrap();
         assert_eq!(r.rows.len(), 1);
         let _ = grant; // suppress unused
+    }
+
+    /// T-037 验收：版本号必须为 1，否则拒绝
+    #[tokio::test]
+    async fn import_connections_rejects_wrong_version() {
+        let bad = r#"{"version":99,"exported_at":1,"connections":[]}"#;
+        // 应当被空列表拒（limit 检查）
+        let r = import_connections(bad.to_string(), None).await;
+        assert!(r.is_err(), "空连接 + 版本错应报错");
+        let bad2 = r#"{"version":99,"exported_at":1,"connections":[{"name":"a","db_type":"mysql","host":"h","port":3306,"username":"u","database":"d"}]}"#;
+        let r2 = import_connections(bad2.to_string(), None).await;
+        assert!(r2.is_err(), "v99 应拒: {:?}", r2);
+    }
+
+    /// T-037 验收：驱动类型非白名单报错
+    #[tokio::test]
+    async fn import_connections_rejects_unknown_driver() {
+        let bad = r#"{"version":1,"exported_at":1,"connections":[{"name":"a","db_type":"oracle","host":"h","port":3306,"username":"u","database":"d"}]}"#;
+        let r = import_connections(bad.to_string(), None).await;
+        assert!(r.is_err(), "非白名单驱动应拒: {:?}", r);
+    }
+
+    /// T-037 验收：超额条数拒绝
+    /// 直接把 entries 写在变量里，每条手工构造
+    #[tokio::test]
+    async fn import_connections_enforces_limit() {
+        let header = std::concat!(
+            "{",
+            "\"version\":1,\"exported_at\":1,\"connections\":["
+        );
+        let footer = std::concat!("]", "}");
+        let mut entries = String::from("");
+        let mut count = 0;
+        for i in 0..200 {
+            if i > 0 { entries.push(','); }
+            entries.push_str(&format!(
+                "{{\"name\":\"n{}\",\"db_type\":\"sqlite\",\"host\":\"\",\"port\":0,\"username\":\"\",\"database\":\"d{}\"}}",
+                i, i
+            ));
+            count = i;
+        }
+        let body = format!("{}{}{}", header, entries, footer);
+        assert_eq!(count, 199);
+        let r = import_connections(body, None).await;
+        assert!(r.is_err(), "超额应拒: {:?}", r);
+    }
+
+    /// T-037 验收：大文件拒绝
+    #[tokio::test]
+    async fn import_connections_enforces_max_bytes() {
+        let body = "x".repeat(DEFAULT_IMPORT_MAX_BYTES + 16);
+        let r = import_connections(body, None).await;
+        assert!(r.is_err(), "超大文件应拒");
     }
 
     /// T-018 验收：请求标识必须为 UUID v4，连续两次不同
