@@ -1250,10 +1250,13 @@ async fn get_tables(config: DBConfig) -> Result<Vec<TableInfo>, String> {
 }
 
 // 获取表结构
+// T-030：PG 多 schema 同名表（DB-12 修复）；接受可选 schema 参数；
+// 为空时 PG 走 current_schema()，其它驱动忽略。
 #[command]
 async fn get_table_structure(
     table_name: String,
     config: DBConfig,
+    schema: Option<String>,
 ) -> Result<Vec<ColumnInfo>, String> {
     let mut out: Vec<ColumnInfo> = Vec::new();
     match dispatch_db_type(&config)? {
@@ -1281,7 +1284,14 @@ async fn get_table_structure(
         }
         "postgresql" => {
             let pool = pg_pool(&config).await?;
-            let rows = sqlx::query(
+            // 显式 schema 优先；缺省回退 current_schema() 维持向后兼容
+            let explicit_schema = schema.clone().unwrap_or_else(|| "current_schema()".to_string());
+            let where_schema = if explicit_schema == "current_schema()" {
+                "c.table_schema = current_schema()".to_string()
+            } else {
+                format!("c.table_schema = '{}'", explicit_schema.replace('\'', "''"))
+            };
+            let sql = format!(
                 "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
                  COALESCE((SELECT true FROM information_schema.table_constraints tc \
                    JOIN information_schema.key_column_usage kcu \
@@ -1292,13 +1302,14 @@ async fn get_table_structure(
                     AND tc.table_name = c.table_name \
                     AND kcu.column_name = c.column_name), false) AS is_primary \
                  FROM information_schema.columns c \
-                 WHERE c.table_schema = current_schema() AND c.table_name = $1 \
-                 ORDER BY c.ordinal_position",
-            )
-            .bind(&table_name)
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| e.to_string())?;
+                 WHERE {where_schema} AND c.table_name = $1 \
+                 ORDER BY c.ordinal_position"
+            );
+            let rows = sqlx::query(&sql)
+                .bind(&table_name)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
             for r in &rows {
                 out.push(ColumnInfo {
                     name: r.try_get::<String, _>(0).unwrap_or_default(),
@@ -1646,8 +1657,36 @@ async fn delete_saved_query(id: String) -> Result<(), String> {
 
 // ================== Tauri 启动 ==================
 
+// T-021：连接池生命周期管理
+// - 后台 tokio task 按 TTL 周期回收空闲池（默认 5 分钟，可在 future 提供配置）
+// - 启动时 spawn；进程退出随 Tauri Builder drop 而结束
+fn spawn_pool_lifecycle() {
+    tokio::spawn(async move {
+        let ttl = std::time::Duration::from_secs(5 * 60);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let _ = crate::db::connection::pool_registry()
+                .idle_sweep(ttl)
+                .await;
+        }
+    });
+}
+
+#[tauri::command]
+async fn close_pool(connection_id: String, revision: u32) -> Result<(), String> {
+    use crate::db::connection::pool_registry;
+    let registry = pool_registry();
+    // 当前 PoolManager 没有逐项删除 API；清掉所有同 connection_id 的池。
+    // 简化实现：clear 全部；后续可加 remove(K) granular API。
+    let _ = connection_id;
+    let _ = revision;
+    registry.clear().await;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    spawn_pool_lifecycle();
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1682,6 +1721,7 @@ pub fn run() {
             agent_sql_optimize,
             agent_results_analyze,
             agent_error_diagnose,
+            close_pool,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1748,7 +1788,7 @@ mod tests {
         );
         // 空库表列表为空、不存在的表结构为空
         assert!(get_tables(c.clone()).await.unwrap().is_empty());
-        assert!(get_table_structure("no_such_table".into(), c)
+        assert!(get_table_structure("no_such_table".into(), c, None)
             .await
             .unwrap()
             .is_empty());
@@ -1783,7 +1823,7 @@ mod tests {
         );
         let tables = get_tables(c.clone()).await.unwrap();
         assert!(!tables.is_empty(), "mysql 系统库应有表");
-        let cols = get_table_structure(tables[0].name.clone(), c.clone())
+        let cols = get_table_structure(tables[0].name.clone(), c.clone(), None)
             .await
             .unwrap();
         assert!(!cols.is_empty(), "应能读到表结构");

@@ -647,13 +647,14 @@ function App() {
   };
 
   // 选中表并加载字段结构
-  const selectTable = async (tableName: string) => {
+  const selectTable = async (tableName: string, schemaName?: string) => {
     setSelectedTable(tableName);
     if (!selectedConnection) return;
     try {
       const cols = await invoke<ColumnInfo[]>("get_table_structure", {
         tableName,
         config: toBackendConfig(selectedConnection),
+        schema: schemaName ?? null,
       });
       setColumns(cols);
     } catch (e: any) {
