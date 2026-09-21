@@ -41,6 +41,12 @@ ok()    { printf "${C_GREEN}✓ %s${C_RESET}\n" "$*"; }
 warn()  { printf "${C_YELLOW}! %s${C_RESET}\n" "$*"; }
 err()   { printf "${C_RED}✗ %s${C_RESET}\n" "$*" >&2; }
 
+# ---------- PKG_JSON 提前：发布前置门禁需要探测 ----------
+PKG_JSON="package.json"
+if [ ! -f "$PKG_JSON" ]; then
+  err "找不到 $PKG_JSON, 请在项目根目录运行此脚本"; exit 1
+fi
+
 # ---------- 参数 ----------
 DRY_RUN=0
 ASSUME_YES=0
@@ -104,12 +110,36 @@ if ! git remote get-url origin >/dev/null 2>&1; then
   err "没有配置 origin 远程仓库"; exit 1
 fi
 
-# ---------- 读当前版本 ----------
-PKG_JSON="package.json"
-if [ ! -f "$PKG_JSON" ]; then
-  err "找不到 $PKG_JSON, 请在项目根目录运行此脚本"; exit 1
+# T-059：发布前置门禁
+# 1) 类型检查（npm run typecheck）
+if [ -f "$PKG_JSON" ] && grep -q '"typecheck"' "$PKG_JSON"; then
+  info "前置门禁：npm run typecheck"
+  if [ $DRY_RUN -eq 1 ]; then
+    printf "${C_YELLOW}[dry-run]${C_RESET} npm run typecheck\n"
+  else
+    npm run typecheck
+  fi
 fi
 
+# 2) 单元测试（lib + SQLite 集成）
+if [ -d src-tauri ]; then
+  info "前置门禁：cargo test --lib + test_sqlite"
+  if [ $DRY_RUN -eq 1 ]; then
+    printf "${C_YELLOW}[dry-run]${C_RESET} cargo test --lib + test_sqlite\n"
+  else
+    (cd src-tauri && cargo test --lib)
+    (cd src-tauri && cargo test --test test_sqlite)
+  fi
+fi
+
+# 3) 工作区确实干净（前置步骤可能改动 lockfile）
+if [ -n "$(git status --porcelain)" ]; then
+  err "测试/类型步骤产生新改动，请先 commit 或 stash"
+  git status --short
+  exit 1
+fi
+
+# ---------- 读当前版本 ----------
 CURRENT_VERSION="$(python3 -c "
 import json, sys
 with open('$PKG_JSON') as f:

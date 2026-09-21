@@ -37,11 +37,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev
 
-      - name: Install npm deps (z-biz-tool-shared 直接 file:../)
+      - name: Install npm deps (z-biz-tool-shared via link)
         run: |
-          # 检查 sibling 共享仓存在；缺失则降级用 stub 包
+          # 检查 sibling 共享仓存在；缺失则 vite.config 的 stub 兜底
           if [ ! -d "../z-biz-tool-shared" ]; then
-            echo "::warning::Missing sibling z-biz-tool-shared; tests still pass with file:../ stub."
+            echo "::warning::sibling z-biz-tool-shared missing; vite stub will kick in."
           fi
           npm install --registry=https://registry.npmmirror.com
 
