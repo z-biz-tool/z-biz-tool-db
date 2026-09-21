@@ -104,13 +104,47 @@ pub fn atomic_write_pub(path: &Path, content: &[u8]) -> Result<(), String> {
     atomic_write(path, content)
 }
 
+/// T-061：升级前自动备份上一版本
+/// 仅在保存时若旧文件存在并能解析为 envelope 且 schema_version 不同则备份。
+/// 备份路径：`{path}.bak.v{prev_schema_version}`；成功完成后才写新文件。
+fn backup_previous_version(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let env: PersistedEnvelope = match serde_json::from_str(&content) {
+        Ok(e) => e,
+        Err(_) => return Ok(()), // 旧格式无法解析不阻止新版写入
+    };
+    let prev = env.schema_version;
+    if prev >= CURRENT_SCHEMA_VERSION {
+        return Ok(()); // 已是新版本或更新，无需备份
+    }
+    let backup_path = path.with_extension(format!(
+        "{}.bak.v{}",
+        path.extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("json"),
+        prev
+    ));
+    if !backup_path.exists() {
+        std::fs::copy(path, &backup_path).map_err(|e| {
+            format!("升级前备份失败: {} -> {} ({})", path.display(), backup_path.display(), e)
+        })?;
+    }
+    Ok(())
+}
+
 /// 通用 envelope 保存与加载
 /// - 加载时校验 schema_version 与 checksum；任意不匹配返回 Err
 /// - 兼容旧 v1（无 envelope 的纯数组）升级路径：检测到非 envelope 自动迁移
-fn save_envelope<T>(path: &Path, payload: &T, expected_max_version: u32) -> Result<(), String>
+fn save_envelope<T>(path: &Path, payload: &T, _expected_max_version: u32) -> Result<(), String>
 where
     T: Serialize,
 {
+    // T-061：先备份旧版本（如果 schema 升级），再写新版本
+    backup_previous_version(path)?;
+
     let payload_value = serde_json::to_value(payload).map_err(|e| e.to_string())?;
     let checksum = payload_checksum(&payload_value)?;
     let env = PersistedEnvelope {
@@ -122,7 +156,7 @@ where
     };
     let json = serde_json::to_string_pretty(&env).map_err(|e| e.to_string())?;
     atomic_write(path, json.as_bytes())?;
-    let _ = expected_max_version;
+    let _ = _expected_max_version;
     Ok(())
 }
 
@@ -322,6 +356,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[tokio::test]
+    async fn upgrade_bak_v1_when_saving_v2() {
+        let path = std::env::temp_dir().join(format!(
+            "zbiz-upg-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let target = path.join("connections.json");
+        // 写一个旧 envelope，schema_version=1
+        let old = PersistedEnvelope {
+            schema_version: 1,
+            revision: 1,
+            updated_at: 0,
+            checksum: "0".repeat(16),
+            payload: serde_json::json!([1, 2, 3]),
+        };
+        std::fs::write(&target, serde_json::to_string(&old).unwrap()).unwrap();
+        // 升级到 current schema
+        save_envelope::<Vec<i32>>(&target, &vec![10, 20], CURRENT_SCHEMA_VERSION).unwrap();
+        // 备份文件应存在
+        let backup = target.with_extension("json.bak.v1");
+        assert!(backup.exists(), "升级前备份未生成: {:?}", backup);
+        let loaded = load_envelope::<Vec<i32>>(&target, CURRENT_SCHEMA_VERSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, vec![10, 20]);
+        let _ = std::fs::remove_dir_all(&path);
+    }
     #[test]
     fn legacy_v1_migrates_to_envelope() {
         let path = fresh_path("env-legacy.json");
