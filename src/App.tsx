@@ -1351,24 +1351,65 @@ function App() {
                 { value: "mysql", label: "MySQL" },
                 { value: "postgresql", label: "PostgreSQL" },
                 { value: "sqlite", label: "SQLite" },
-                { value: "sqlserver", label: "SQL Server" },
+                {
+                  value: "sqlserver",
+                  label: "SQL Server（暂不支持）",
+                  disabled: true,
+                },
               ]}
             />
           </Form.Item>
-          <Form.Item name="host" label="主机地址">
-            <Input placeholder="例如：localhost（SQLite 可留空）" />
-          </Form.Item>
-          <Form.Item name="port" label="端口">
-            <Input type="number" placeholder="例如：3306（SQLite 可留空）" />
-          </Form.Item>
-          <Form.Item name="username" label="用户名" rules={[{ required: true }]}>
-            <Input placeholder="例如：root" />
-          </Form.Item>
-          <Form.Item name="password" label="密码">
-            <Input.Password placeholder="输入密码" />
-          </Form.Item>
-          <Form.Item name="database" label="数据库名" rules={[{ required: true }]}>
-            <Input placeholder="例如：my_database（SQLite 填文件路径）" />
+          <Form.Item
+            noStyle
+            shouldUpdate={(prev, cur) =>
+              prev?.type !== cur?.type || prev?.database !== cur?.database
+            }
+          >
+            {() => {
+              const t = form.getFieldValue("type");
+              const isSqlite = t === "sqlite";
+              return (
+                <>
+                  {!isSqlite && (
+                    <Form.Item name="host" label="主机地址">
+                      <Input placeholder="例如：localhost（SQLite 可留空）" />
+                    </Form.Item>
+                  )}
+                  {!isSqlite && (
+                    <Form.Item name="port" label="端口">
+                      <Input type="number" placeholder="例如：3306（SQLite 可留空）" />
+                    </Form.Item>
+                  )}
+                  {!isSqlite && (
+                    <Form.Item
+                      name="username"
+                      label="用户名"
+                      rules={[{ required: !isSqlite }]}
+                    >
+                      <Input placeholder="例如：root" />
+                    </Form.Item>
+                  )}
+                  {!isSqlite && (
+                    <Form.Item name="password" label="密码">
+                      <Input.Password placeholder="输入密码" />
+                    </Form.Item>
+                  )}
+                  <Form.Item
+                    name="database"
+                    label={isSqlite ? "数据库文件" : "数据库名"}
+                    rules={[{ required: true }]}
+                  >
+                    <Input
+                      placeholder={
+                        isSqlite
+                          ? "选择或填写 .sqlite / .db 文件绝对路径"
+                          : "例如：my_database（SQLite 填文件路径）"
+                      }
+                    />
+                  </Form.Item>
+                </>
+              );
+            }}
           </Form.Item>
         </Form>
       </Modal>
