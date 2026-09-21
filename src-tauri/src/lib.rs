@@ -14,6 +14,8 @@ mod db;
 mod security;
 #[path = "secrets.rs"]
 mod secrets;
+#[path = "agent_service.rs"]
+mod agent_service;
 
 // ================== 数据结构 ==================
 
