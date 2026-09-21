@@ -80,6 +80,30 @@ pub struct QueryResult {
     /// 当前语句是否为结果集查询（用于 UI 区分零行结果与 DML）
     #[serde(default)]
     pub is_query: bool,
+    /// T-041：分段耗时（毫秒）
+    #[serde(default)]
+    pub timings: Timings,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Timings {
+    #[serde(default)]
+    pub connect_ms: u64,
+    #[serde(default)]
+    pub queue_ms: u64,
+    #[serde(default)]
+    pub execute_ms: u64,
+    #[serde(default)]
+    pub fetch_ms: u64,
+    #[serde(default)]
+    pub total_ms: u64,
+}
+
+pub fn new_timings(start: std::time::Instant) -> Timings {
+    Timings {
+        total_ms: start.elapsed().as_millis() as u64,
+        ..Default::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1238,6 +1262,7 @@ async fn execute_query(
         affected_rows: affected,
         execution_time_ms: start.elapsed().as_millis() as u64,
         is_query,
+        timings: crate::new_timings(start),
     })
     .map(|mut r| {
         r.id = format!("gen{}|{}", generation, r.id);
@@ -1575,6 +1600,7 @@ async fn execute_batch(
             affected_rows: affected,
             execution_time_ms: start.elapsed().as_millis() as u64,
             is_query,
+            timings: Default::default(),
         });
     }
     Ok(out)
@@ -1787,6 +1813,7 @@ async fn explain_query(
         affected_rows: affected,
         execution_time_ms: start.elapsed().as_millis() as u64,
         is_query,
+        timings: crate::new_timings(start),
     })
 }
 
