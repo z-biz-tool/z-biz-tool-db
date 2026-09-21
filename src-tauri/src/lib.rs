@@ -1104,6 +1104,57 @@ async fn ai_diagnose_error(error_message: String, sql: String, config: AIConfig)
 
 // ================== Tauri 命令 ==================
 
+// T-015 秘密迁移流程 stub
+// 扫描现有 connections，对所有 revision < CURRENT_MIGRATION_WATERMARK 的连接
+// 标记"需要重新输入密码"。S0 阶段 T-007 已把所有落盘密码清空，
+// 因此真实"迁移"主要是让 UI 知道哪些连接必须重输密码才能使用。
+pub const CURRENT_MIGRATION_WATERMARK: u32 = 2;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MigrationReport {
+    pub total_connections: u32,
+    pub needs_reentry: u32,
+    pub up_to_date: u32,
+    pub repaired: u32,
+}
+
+#[command]
+async fn run_secret_migration() -> Result<MigrationReport, String> {
+    let conns = queries::load_connections().await?;
+    let mut needs_reentry = 0u32;
+    let mut up_to_date = 0u32;
+    let repaired = 0u32;
+    for c in &conns {
+        if c.revision < CURRENT_MIGRATION_WATERMARK {
+            needs_reentry += 1;
+        } else {
+            up_to_date += 1;
+        }
+    }
+    Ok(MigrationReport {
+        total_connections: conns.len() as u32,
+        needs_reentry,
+        up_to_date,
+        repaired,
+    })
+}
+
+// T-046：检查连接 revision 是否与持久化一致；
+// 用于「编辑连接后旧会话失效」语义。
+#[command]
+async fn check_connection_revision(
+    connection_id: String,
+    expected_revision: u32,
+) -> Result<bool, String> {
+    let conns = queries::load_connections().await?;
+    for c in &conns {
+        if c.id == connection_id {
+            return Ok(c.revision == expected_revision);
+        }
+    }
+    Err(format!("连接 {} 不存在", connection_id))
+}
+
 // 测试数据库连接
 #[command]
 async fn test_connection(config: DBConfig) -> Result<bool, String> {
@@ -1939,6 +1990,8 @@ pub fn run() {
             format_sql,
             query_status_v2,
             query_cancel_v2,
+            run_secret_migration,
+            check_connection_revision,
             export_connections,
             import_connections,
             save_connections,
@@ -2269,7 +2322,70 @@ mod tests {
         let _ = grant; // suppress unused
     }
 
-    /// T-053 验收：save_connections CAS 拒绝过期 revision
+/// T-015：迁移报告正反向测试
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_secret_migration_reports_reentry() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-mig-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+        // 需要重新输入（旧）+ 已是新版本（新）
+        let old = ConnectionRecord {
+            id: "old".into(),
+            name: "old".into(),
+            db_type: "mysql".into(),
+            host: "h".into(),
+            port: 3306,
+            username: "u".into(),
+            password: String::new(),
+            database: "d".into(),
+            revision: 0,
+            environment: "dev".into(),
+        };
+        let new = ConnectionRecord {
+            id: "new".into(),
+            revision: CURRENT_MIGRATION_WATERMARK,
+            ..old.clone()
+        };
+        queries::save_connections(&vec![old, new]).await.unwrap();
+        let report = run_secret_migration().await.unwrap();
+        assert_eq!(report.total_connections, 2);
+        assert_eq!(report.needs_reentry, 1);
+        assert_eq!(report.up_to_date, 1);
+    }
+
+    /// T-046：连接 revision 校验
+    #[tokio::test(flavor = "current_thread")]
+    async fn check_connection_revision_matches() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-rev-check-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+        let c = ConnectionRecord {
+            id: "x1".into(),
+            name: "x".into(),
+            db_type: "sqlite".into(),
+            host: String::new(),
+            port: 1,
+            username: String::new(),
+            password: String::new(),
+            database: ":memory:".into(),
+            revision: 7,
+            environment: "dev".into(),
+        };
+        queries::save_connections(&vec![c]).await.unwrap();
+        assert!(check_connection_revision("x1".into(), 7).await.unwrap());
+        assert!(!check_connection_revision("x1".into(), 6).await.unwrap());
+        assert!(check_connection_revision("nope".into(), 0).await.is_err());
+    }
+
+        /// T-053 验收：save_connections CAS 拒绝过期 revision
     #[tokio::test(flavor = "current_thread")]
     async fn save_connections_cas_rejects_stale_revision() {
         let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
