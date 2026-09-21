@@ -127,6 +127,13 @@ interface QueryResultV2 {
   affected_rows: number;
   execution_time_ms: number;
   is_query: boolean;
+  timings?: {
+    connect_ms: number;
+    queue_ms: number;
+    execute_ms: number;
+    fetch_ms: number;
+    total_ms: number;
+  };
 }
 
 /** 单元格的展示文本（DB-02 / T-003） */
