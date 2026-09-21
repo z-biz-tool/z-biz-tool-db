@@ -13,7 +13,18 @@ interface AgentStore {
   diagnoseError: (error: string, sql: string) => Promise<AgentResponse>;
 }
 
-export const useAgentStore = create<AgentStore>((set, get) => ({
+/**
+ * T-005：S0 止血。所有 Agent 路径均尚未接通真实服务；任何未接通的方法
+ * 都直接返回"服务未配置"错误，禁止伪造 SQL 或示例响应。
+ * 后端 agent_* 命令也已去掉静默重执行 SQL 行为（DB-04 / A08）。
+ */
+const NOT_CONFIGURED: AgentResponse = {
+  success: false,
+  content: '',
+  error: 'Agent 服务未配置；S0 阶段所有路径均不可用。请前往设置配置后端服务后再试。',
+};
+
+export const useAgentStore = create<AgentStore>((set) => ({
   config: {
     id: 'default-agent',
     name: 'SQL Agent',
@@ -33,151 +44,20 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
 
   setContext: (context) => set({ context }),
 
-  query: async (naturalLanguage) => {
-    const { context } = get();
-    
-    try {
-      // TODO: 调用 Agent 服务
-      const response: AgentResponse = {
-        success: true,
-        content: `我将为您查询: ${naturalLanguage}`,
-        sql: `SELECT * FROM users WHERE name LIKE '%${naturalLanguage}%'`,
-        context,
-      };
-      
-      get().addMessage({
-        id: Date.now().toString(),
-        role: 'user',
-        content: naturalLanguage,
-        timestamp: Date.now(),
-      });
-      
-      get().addMessage({
-        id: (Date.now() + 1).toString(),
-        role: 'agent',
-        content: response.content,
-        sql: response.sql,
-        timestamp: Date.now(),
-      });
-      
-      return response;
-    } catch (error) {
-      return {
-        success: false,
-        content: '',
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
+  query: async (_naturalLanguage) => {
+    return NOT_CONFIGURED;
   },
 
-  optimize: async (sql) => {
-    const { context } = get();
-    
-    try {
-      // TODO: 调用 Agent 服务
-      const response: AgentResponse = {
-        success: true,
-        content: 'SQL 优化建议',
-        sql: sql.toUpperCase(), // 简单示例
-        context,
-      };
-      
-      get().addMessage({
-        id: Date.now().toString(),
-        role: 'user',
-        content: `优化 SQL: ${sql}`,
-        timestamp: Date.now(),
-      });
-      
-      get().addMessage({
-        id: (Date.now() + 1).toString(),
-        role: 'agent',
-        content: response.content,
-        sql: response.sql,
-        timestamp: Date.now(),
-      });
-      
-      return response;
-    } catch (error) {
-      return {
-        success: false,
-        content: '',
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
+  optimize: async (_sql) => {
+    return NOT_CONFIGURED;
   },
 
-  analyze: async (sql, _results) => {
-    const { context } = get();
-    
-    try {
-      // TODO: 调用 Agent 服务
-      const response: AgentResponse = {
-        success: true,
-        content: '查询结果分析',
-        sql,
-        context,
-      };
-      
-      get().addMessage({
-        id: Date.now().toString(),
-        role: 'user',
-        content: `分析结果: ${sql}`,
-        timestamp: Date.now(),
-      });
-      
-      get().addMessage({
-        id: (Date.now() + 1).toString(),
-        role: 'agent',
-        content: response.content,
-        sql: response.sql,
-        timestamp: Date.now(),
-      });
-      
-      return response;
-    } catch (error) {
-      return {
-        success: false,
-        content: '',
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
+  // T-004：结果分析仅接 resultData，禁止再次执行 SQL。
+  analyze: async (_sql, _results) => {
+    return NOT_CONFIGURED;
   },
 
-  diagnoseError: async (error, sql) => {
-    const { context } = get();
-    
-    try {
-      // TODO: 调用 Agent 服务
-      const response: AgentResponse = {
-        success: true,
-        content: `错误诊断: ${error}`,
-        sql,
-        context,
-      };
-      
-      get().addMessage({
-        id: Date.now().toString(),
-        role: 'user',
-        content: `错误: ${error}\nSQL: ${sql}`,
-        timestamp: Date.now(),
-      });
-      
-      get().addMessage({
-        id: (Date.now() + 1).toString(),
-        role: 'agent',
-        content: response.content,
-        sql: response.sql,
-        timestamp: Date.now(),
-      });
-      
-      return response;
-    } catch (error) {
-      return {
-        success: false,
-        content: '',
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
-    }
+  diagnoseError: async (_error, _sql) => {
+    return NOT_CONFIGURED;
   },
 }));

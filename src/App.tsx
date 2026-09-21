@@ -72,6 +72,60 @@ interface DBConnection {
   database: string;
 }
 
+// 后端 v2 列元数据（DB-01 / T-001）：前端不再用 Object.keys 推导列名
+interface ColumnMeta {
+  ordinal: number;
+  name: string;
+  native_type: string;
+  logical_type: string;
+  nullable: boolean;
+}
+
+// 后端 v2 结果模型：单元格为 tagged { __kind, value }
+interface TaggedCell {
+  __kind:
+    | "null"
+    | "integer"
+    | "float"
+    | "decimal"
+    | "text"
+    | "binary"
+    | "date"
+    | "time"
+    | "datetime"
+    | "timestamp"
+    | "uuid"
+    | "json"
+    | "unsupported"
+    | "decode_error";
+  value: any;
+}
+
+interface QueryResultV2 {
+  id: string;
+  columns: string[];
+  column_meta?: ColumnMeta[];
+  rows: Array<TaggedCell[]>;
+  affected_rows: number;
+  execution_time_ms: number;
+  is_query: boolean;
+}
+
+/** 单元格的展示文本（DB-02 / T-003） */
+function cellDisplay(cell: TaggedCell | null | undefined): string {
+  if (!cell || cell.__kind === "null") return "NULL";
+  switch (cell.__kind) {
+    case "binary":
+      return `二进制 ${(cell.value || "").length ?? 0}B`;
+    case "decode_error":
+      return `⚠ ${cell.value}`;
+    case "unsupported":
+      return `？${cell.value}`;
+    default:
+      return cell.value === null || cell.value === undefined ? "∅" : String(cell.value);
+  }
+}
+
 interface ColumnInfo {
   name: string;
   data_type: string;
@@ -113,7 +167,11 @@ function App() {
   const [connections, setConnections] = useState<DBConnection[]>([]);
   const [selectedConnection, setSelectedConnection] = useState<DBConnection | null>(null);
   const [sqlCode, setSqlCode] = useState("SELECT * FROM users WHERE id = 1");
-  const [queryResults, setQueryResults] = useState<any[]>([]);
+  const [queryResults, setQueryResults] = useState<TaggedCell[][]>([]);
+  // T-001 + T-002：以后端 column_meta 为准，零行结果仍有列定义
+  const [queryColumnsMeta, setQueryColumnsMeta] = useState<ColumnMeta[]>([]);
+  // T-006：可写访问模式开关；S0 默认 false，写入命令将被后端拒绝
+  const [writeAccessEnabled, setWriteAccessEnabled] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [showConnectionModal, setShowConnectionModal] = useState(false);
   const [editingConnection, setEditingConnection] = useState<DBConnection | null>(null);
@@ -192,26 +250,43 @@ function App() {
   const [msgApi, msgContext] = message.useMessage();
 
   // 执行查询
+  // T-009：invoke 前快照 connectionId+activeTabId，响应后比对当前状态
+  // 不匹配则丢弃结果并显示提示（DB-11 / A04）
   const executeQuery = async () => {
     if (!selectedConnection) {
       msgApi.warning("请先连接数据库");
       return;
     }
+    const requestConnId = selectedConnection.id;
+    const requestTabId = activeTabId;
     try {
-      const result = await invoke<any>("execute_query", {
+      const result = await invoke<QueryResultV2>("execute_query", {
         sql: sqlCode,
         config: toBackendConfig(selectedConnection),
+        access_mode: writeAccessEnabled ? "writable" : "readOnly",
       });
+
+      // 异步校验：标签或连接已切走 → 丢弃结果
+      if (
+        requestConnId !== selectedConnection?.id ||
+        requestTabId !== activeTabId
+      ) {
+        msgApi.warning("连接或标签已切换，结果已丢弃（DB-11 防竞态）");
+        return;
+      }
+
+      // 同步覆写列源：以后端 column_meta 为准；零行也有列（A01）
+      setQueryColumnsMeta(result.column_meta ?? []);
       setQueryResults(result.rows || []);
-      
+
       // 添加到 Agent 历史
       useAgentStore.getState().addMessage({
-        id: Date.now().toString(),
+        id: Date.now().to_string(),
         role: 'user',
         content: `执行查询: ${sqlCode}`,
         timestamp: Date.now(),
       });
-      
+
       useAgentStore.getState().addMessage({
         id: (Date.now() + 1).toString(),
         role: 'agent',
@@ -219,10 +294,10 @@ function App() {
         sql: sqlCode,
         timestamp: Date.now(),
       });
-      
+
       // 添加历史
       const newItem: QueryHistoryItem = {
-        id: Date.now().toString(),
+        id: Date.now().to_string(),
         sql: sqlCode,
         connection_id: selectedConnection?.id || "",
         connection_name: selectedConnection?.name || "",
@@ -234,9 +309,15 @@ function App() {
       setHistory((prev) => [newItem, ...prev].slice(0, 100));
       msgApi.success(`查询执行成功，耗时 ${result.execution_time_ms}ms`);
     } catch (e: any) {
+      if (
+        requestConnId !== selectedConnection?.id ||
+        requestTabId !== activeTabId
+      ) {
+        return;
+      }
       msgApi.error(`查询失败: ${e}`);
       const newItem: QueryHistoryItem = {
-        id: Date.now().toString(),
+        id: Date.now().to_string(),
         sql: sqlCode,
         connection_id: selectedConnection?.id || "",
         connection_name: selectedConnection?.name || "",
@@ -249,29 +330,10 @@ function App() {
     }
   };
 
-  // 格式化 SQL
+  // T-010 格式化：S0 停止使用正则改写字面量/注释/参数。
+  // 直接显示提示，等待 S2 词法感知格式化。
   const formatSQL = async () => {
-    try {
-      const formatted = await invoke<string>("format_sql", { sql: sqlCode });
-      setSqlCode(formatted);
-      msgApi.success("SQL 已格式化");
-    } catch (e: any) {
-      // 降级为本地格式化
-      const formatted = sqlCode
-        .replace(/\bSELECT\b/gi, "SELECT")
-        .replace(/\bFROM\b/gi, "\nFROM")
-        .replace(/\bWHERE\b/gi, "\nWHERE")
-        .replace(/\bAND\b/gi, "\n  AND")
-        .replace(/\bOR\b/gi, "\n  OR")
-        .replace(/\bORDER BY\b/gi, "\nORDER BY")
-        .replace(/\bGROUP BY\b/gi, "\nGROUP BY")
-        .replace(/\bHAVING\b/gi, "\nHAVING")
-        .replace(/\bLIMIT\b/gi, "\nLIMIT")
-        .replace(/\bJOIN\b/gi, "\nJOIN")
-        .replace(/\bLEFT JOIN\b/gi, "\nLEFT JOIN");
-      setSqlCode(formatted);
-      msgApi.success("已本地格式化");
-    }
+    msgApi.warning("格式化升级中：S0 已停用正则改写，避免破坏字符串字面量与注释（DB-13）");
   };
 
   // 复制
@@ -680,13 +742,20 @@ function App() {
     msgApi.success(`已加载: ${q.name}`);
   };
 
-  // 表格列定义
-  const resultColumns = queryResults.length > 0
-    ? Object.keys(queryResults[0]).map((key) => ({
-        title: key,
-        dataIndex: key,
-        key: key,
+  // T-002：表格列定义使用后端 column_meta，不再用 Object.keys 推导列名
+  // 零行结果依旧展示列头（A01 / A02）
+  const resultColumns = queryColumnsMeta.length > 0
+    ? queryColumnsMeta.map((meta) => ({
+        title: (
+          <span>
+            {meta.name}
+            <Tag style={{ marginLeft: 6 }} color="blue">{meta.logical_type}</Tag>
+          </span>
+        ),
+        dataIndex: `col_${meta.ordinal}`,
+        key: `col_${meta.ordinal}`,
         ellipsis: true,
+        render: (_: any, record: any) => cellDisplay(record[`col_${meta.ordinal}`]),
       }))
     : [];
 
@@ -978,12 +1047,22 @@ function App() {
                           >
                             复制
                           </Button>
-                          <Button 
-                            type="primary" 
-                            size="small" 
-                            icon={<PlayCircleOutlined />} 
+                          <Tooltip title={writeAccessEnabled ? "可写：可执行 DML/DDL" : "只读：禁止写入，DB-06"}>
+                            <Switch
+                              size="small"
+                              checked={writeAccessEnabled}
+                              onChange={setWriteAccessEnabled}
+                              checkedChildren="可写"
+                              unCheckedChildren="只读"
+                              style={{ marginRight: 4 }}
+                            />
+                          </Tooltip>
+                          <Button
+                            type="primary"
+                            size="small"
+                            icon={<PlayCircleOutlined />}
                             onClick={executeQuery}
-                            style={{ 
+                            style={{
                               borderRadius: 6,
                               background: brandGradient,
                               boxShadow: "0 4px 12px rgba(102,126,234,0.3)",
@@ -1025,7 +1104,14 @@ function App() {
                     >
                       <Table
                         columns={resultColumns}
-                        dataSource={queryResults.map((row, index) => ({ ...row, key: index }))}
+                        dataSource={queryResults.map((row, index) => {
+                          // T-001：按 ordinal 映射到列，便于大结果/同名列不丢数据
+                          const obj: Record<string, TaggedCell> & { key: number } = { key: index } as any;
+                          row.forEach((cell, ord) => {
+                            obj[`col_${ord}`] = cell;
+                          });
+                          return obj;
+                        })}
                         size="small"
                         scroll={{ x: "max-content", y: 300 }}
                         pagination={{ pageSize: 50 }}
