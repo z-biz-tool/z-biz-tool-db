@@ -47,16 +47,16 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// T-016 信封结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedEnvelope<T> {
+pub struct PersistedEnvelope {
     /// schema 版本（递增触发迁移分支）
     pub schema_version: u32,
     /// 单调递增修订号；用于跨实例 CAS 比对
     pub revision: u64,
     /// ISO 时间戳（UNIX 秒）
     pub updated_at: i64,
-    /// 业务数据
-    pub payload: T,
-    /// payload 序列化后 SHA-256（hex）；不匹配视为损坏
+    /// 业务数据；保留为 Value 以让序列化/反序列化自洽
+    pub payload: serde_json::Value,
+    /// payload 序列化后指纹（仅检错，不作为防篡改签名）
     pub checksum: String,
 }
 
@@ -107,22 +107,67 @@ pub fn atomic_write_pub(path: &Path, content: &[u8]) -> Result<(), String> {
 /// 通用 envelope 保存与加载
 /// - 加载时校验 schema_version 与 checksum；任意不匹配返回 Err
 /// - 兼容旧 v1（无 envelope 的纯数组）升级路径：检测到非 envelope 自动迁移
-fn save_envelope<T: Serialize>(
-    path: &Path,
-    payload: &T,
-    expected_max_version: u32,
-) -> Result<(), String> {
+fn save_envelope<T>(path: &Path, payload: &T, expected_max_version: u32) -> Result<(), String>
+where
+    T: Serialize,
+{
+    let payload_value = serde_json::to_value(payload).map_err(|e| e.to_string())?;
+    let checksum = payload_checksum(&payload_value)?;
     let env = PersistedEnvelope {
         schema_version: CURRENT_SCHEMA_VERSION,
         revision: next_revision_for(path)?,
         updated_at: chrono::Utc::now().timestamp(),
-        checksum: payload_checksum(payload)?,
-        payload: serde_json::to_value(payload).map_err(|e| e.to_string())?,
+        checksum,
+        payload: payload_value,
     };
     let json = serde_json::to_string_pretty(&env).map_err(|e| e.to_string())?;
     atomic_write(path, json.as_bytes())?;
     let _ = expected_max_version;
     Ok(())
+}
+
+fn load_envelope<T>(path: &Path, expected_max_version: u32) -> Result<Option<T>, String>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+
+    // 1) 尝试 envelope
+    if let Ok(env) = serde_json::from_str::<PersistedEnvelope>(&content) {
+        if env.schema_version > expected_max_version {
+            return Err(format!(
+                "持久化 schema_version {} 高于当前支持的 {}，拒绝读取以保护数据",
+                env.schema_version, expected_max_version
+            ));
+        }
+        // 校验 checksum
+        let expected = payload_checksum(&env.payload)?;
+        if expected != env.checksum {
+            return Err(format!(
+                "校验和不匹配：文件可能已损坏（expected={}, got={}）",
+                expected, env.checksum
+            ));
+        }
+        // 反序列化 payload 为 T
+        return serde_json::from_value::<T>(env.payload).map(Some).map_err(|e| {
+            format!("envelope payload 反序列化为目标类型失败: {}", e)
+        });
+    }
+
+    // 2) 兼容 v1：裸数组/T，按迁移分支迁移到 v2 envelope
+    match serde_json::from_str::<T>(&content) {
+        Ok(payload) => {
+            save_envelope(path, &payload, CURRENT_SCHEMA_VERSION)?;
+            Ok(Some(payload))
+        }
+        Err(e) => Err(format!(
+            "持久化文件损坏且无法迁移：{}；请手动检查 {:?}",
+            e, path
+        )),
+    }
 }
 
 /// 单调递增修订号：持久化在 .rev 文件；首次读 0
@@ -151,52 +196,6 @@ fn next_revision_for(path: &Path) -> Result<u64, String> {
     Ok(next)
 }
 
-fn load_envelope<T>(path: &Path, expected_max_version: u32) -> Result<Option<PersistedEnvelope<T>>, String>
-where
-    T: for<'de> Deserialize<'de> + Serialize + Clone,
-{
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-
-    // 1) 尝试解析为 envelope
-    if let Ok(env) = serde_json::from_str::<PersistedEnvelope<T>>(&content) {
-        if env.schema_version > expected_max_version {
-            return Err(format!(
-                "持久化 schema_version {} 高于当前支持的 {}，拒绝读取以保护数据",
-                env.schema_version, expected_max_version
-            ));
-        }
-        // 校验 checksum：重新序列化 payload 再哈希
-        let expected = payload_checksum(&env.payload)?;
-        if expected != env.checksum {
-            return Err(format!(
-                "校验和不匹配：文件可能已损坏（expected={}, got={}）",
-                expected, env.checksum
-            ));
-        }
-        return Ok(Some(env));
-    }
-
-    // 2) 兼容 v1：裸数组/T，按迁移分支迁移到 v2 envelope
-    match serde_json::from_str::<T>(&content) {
-        Ok(payload) => {
-            save_envelope(path, &payload, CURRENT_SCHEMA_VERSION)?;
-            Ok(Some(PersistedEnvelope {
-                schema_version: CURRENT_SCHEMA_VERSION,
-                revision: 1,
-                updated_at: chrono::Utc::now().timestamp(),
-                checksum: payload_checksum(&payload)?,
-                payload,
-            }))
-        }
-        Err(e) => Err(format!(
-            "持久化文件损坏且无法迁移：{}；请手动检查 {:?}",
-            e, path
-        )),
-    }
-}
 
 /// S0：写入前剥离敏感字段（DB-08 / A10）
 fn strip_secrets_from_connections(records: &mut Vec<ConnectionRecord>) {
@@ -215,7 +214,7 @@ pub async fn save_history(history: &[QueryHistoryItem]) -> Result<(), String> {
 
 pub async fn load_history() -> Result<Vec<QueryHistoryItem>, String> {
     match load_envelope::<Vec<QueryHistoryItem>>(&history_path()?, CURRENT_SCHEMA_VERSION)? {
-        Some(env) => Ok(env.payload),
+        Some(payload) => Ok(payload),
         None => Ok(Vec::new()),
     }
 }
@@ -247,7 +246,7 @@ pub async fn load_saved_queries() -> Result<Vec<SavedQuery>, String> {
 
 async fn load_saved_queries_inner() -> Result<Vec<SavedQuery>, String> {
     match load_envelope::<Vec<SavedQuery>>(&saved_queries_path()?, CURRENT_SCHEMA_VERSION)? {
-        Some(env) => Ok(env.payload),
+        Some(payload) => Ok(payload),
         None => Ok(Vec::new()),
     }
 }
@@ -268,7 +267,7 @@ pub async fn save_connections(connections: &[ConnectionRecord]) -> Result<(), St
 
 pub async fn load_connections() -> Result<Vec<ConnectionRecord>, String> {
     match load_envelope::<Vec<ConnectionRecord>>(&connections_path()?, CURRENT_SCHEMA_VERSION)? {
-        Some(env) => Ok(env.payload),
+        Some(payload) => Ok(payload),
         None => Ok(Vec::new()),
     }
 }
@@ -289,9 +288,8 @@ mod tests {
         let path = fresh_path("env-rt.json");
         save_envelope(&path, &vec![1u32, 2, 3], CURRENT_SCHEMA_VERSION).unwrap();
         let loaded = load_envelope::<Vec<u32>>(&path, CURRENT_SCHEMA_VERSION).unwrap();
-        let env = loaded.unwrap();
-        assert_eq!(env.payload, vec![1, 2, 3]);
-        assert_eq!(env.schema_version, CURRENT_SCHEMA_VERSION);
+        let payload = loaded.unwrap();
+        assert_eq!(payload, vec![1, 2, 3]);
     }
 
     #[test]
@@ -329,11 +327,11 @@ mod tests {
         let path = fresh_path("env-legacy.json");
         // 直接写入 v1 格式（裸数组）
         std::fs::write(&path, "[1,2,3,4]").unwrap();
-        let env = load_envelope::<Vec<i32>>(&path, CURRENT_SCHEMA_VERSION).unwrap().unwrap();
-        assert_eq!(env.payload, vec![1, 2, 3, 4]);
+        let payload = load_envelope::<Vec<i32>>(&path, CURRENT_SCHEMA_VERSION).unwrap().unwrap();
+        assert_eq!(payload, vec![1, 2, 3, 4]);
         // 二次加载应命中 envelope
-        let env2 = load_envelope::<Vec<i32>>(&path, CURRENT_SCHEMA_VERSION).unwrap().unwrap();
-        assert_eq!(env2.payload, vec![1, 2, 3, 4]);
+        let payload2 = load_envelope::<Vec<i32>>(&path, CURRENT_SCHEMA_VERSION).unwrap().unwrap();
+        assert_eq!(payload2, vec![1, 2, 3, 4]);
         let _ = std::fs::remove_file(&path);
     }
 

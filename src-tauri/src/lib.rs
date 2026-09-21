@@ -12,6 +12,8 @@ mod queries;
 mod db;
 #[path = "security.rs"]
 mod security;
+#[path = "secrets.rs"]
+mod secrets;
 
 // ================== 数据结构 ==================
 
@@ -160,6 +162,7 @@ pub struct AIResponse {
 }
 
 // 前端连接配置的落盘结构（与前端 DBConnection 对应，字段 type）
+// T-053：增 revision 字段；保存时 CAS 比对。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionRecord {
     #[serde(default)]
@@ -178,6 +181,9 @@ pub struct ConnectionRecord {
     pub password: String,
     #[serde(default)]
     pub database: String,
+    /// 配置修订号；编辑保存时 +1，CAS 拒绝过期写入
+    #[serde(default)]
+    pub revision: u32,
 }
 
 // 端口容错：T-026 加固
@@ -1795,8 +1801,38 @@ async fn import_connections(
 }
 
 // 连接配置落盘
+// T-053：保存连接时可携带 expected_revision 做 CAS；
+// 没有 expected_revision 时整体替换（向后兼容旧调用方）。
 #[command]
-async fn save_connections(connections: Vec<ConnectionRecord>) -> Result<(), String> {
+async fn save_connections(
+    connections: Vec<ConnectionRecord>,
+    expected_revisions: Option<std::collections::HashMap<String, u32>>,
+) -> Result<(), String> {
+    // CAS 校验：每个 id 的 expected_revision 必须等于磁盘上现有 revision
+    if let Some(expected) = expected_revisions {
+        let existing = queries::load_connections().await?;
+        let existing_by_id: std::collections::HashMap<String, u32> = existing
+            .into_iter()
+            .map(|c| (c.id, c.revision))
+            .collect();
+        for (id, exp_rev) in &expected {
+            match existing_by_id.get(id) {
+                Some(cur) if *cur != *exp_rev => {
+                    return Err(format!(
+                        "REVISION_MISMATCH: 连接 {} 的修订号不匹配（期望 {}，实际 {}）",
+                        id, exp_rev, cur
+                    ));
+                }
+                None if *exp_rev != 0 => {
+                    return Err(format!(
+                        "REVISION_MISMATCH: 连接 {} 不存在但期望 revision={}",
+                        id, exp_rev
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
     queries::save_connections(&connections).await
 }
 
@@ -1917,6 +1953,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 让会修改 Z_BIZ_TOOL_DB_DATA_DIR 环境变量的测试串行化；
+    /// 避免在并行线程下互相污染。
+    pub static DATADIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn cfg(db_type: &str, host: &str, port: u16, db: &str) -> DBConfig {
         DBConfig {
@@ -2022,9 +2061,10 @@ mod tests {
         assert!(!err.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn connections_persist_roundtrip() {
-        let tmp = std::env::temp_dir().join(format!("zbiz-db-test-{}", std::process::id()));
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("zbiz-db-test-{}-{}-{}", std::process::id(), "connections_persist", uuid::Uuid::new_v4()));
         std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
         let records = vec![ConnectionRecord {
             id: "1".into(),
@@ -2035,6 +2075,7 @@ mod tests {
             username: "root".into(),
             password: "secret_should_be_stripped".into(),
             database: "mysql".into(),
+            revision: 0,
         }];
         queries::save_connections(&records).await.unwrap();
         let loaded = queries::load_connections().await.unwrap();
@@ -2207,6 +2248,42 @@ mod tests {
         .unwrap();
         assert_eq!(r.rows.len(), 1);
         let _ = grant; // suppress unused
+    }
+
+    /// T-053 验收：save_connections CAS 拒绝过期 revision
+    #[tokio::test(flavor = "current_thread")]
+    async fn save_connections_cas_rejects_stale_revision() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("zbiz-cas-test-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+        // 初始保存 revision=1
+        let records = vec![ConnectionRecord {
+            id: "c-cas".into(),
+            name: "cas".into(),
+            db_type: "sqlite".into(),
+            host: String::new(),
+            port: 1,
+            username: String::new(),
+            password: String::new(),
+            database: ":memory:".into(),
+            revision: 1,
+        }];
+        queries::save_connections(&records).await.unwrap();
+
+        // 期望 revision=0 应被拒
+        let mut expected = std::collections::HashMap::new();
+        expected.insert("c-cas".to_string(), 0u32);
+        let err = save_connections(records.clone(), Some(expected.clone()))
+            .await
+            .expect_err("CAS 应拒");
+        assert!(err.contains("REVISION_MISMATCH"), "应含 REVISION_MISMATCH: {}", err);
+
+        // 期望 revision=1 通过
+        let mut expected_ok = std::collections::HashMap::new();
+        expected_ok.insert("c-cas".to_string(), 1u32);
+        save_connections(records, Some(expected_ok))
+            .await
+            .expect("正确 revision 应通过");
     }
 
     /// T-037 验收：版本号必须为 1，否则拒绝
