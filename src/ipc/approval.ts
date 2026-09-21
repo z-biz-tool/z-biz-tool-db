@@ -1,7 +1,10 @@
 // T-045 兼容层：审批 Modal 状态与生产逻辑
 // 与 src-tauri/src/security.rs 配对；本文件保持前端无任何 Tauri/Mock 副作用。
 
-import { ApprovalGrant, digestSql } from "../ipc/db";
+import { digestSql } from "./db";
+import type { ApprovalGrant } from "./db";
+
+export type { ApprovalGrant };
 
 export interface PendingApproval {
   sql: string;
