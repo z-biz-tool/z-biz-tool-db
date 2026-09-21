@@ -388,7 +388,14 @@ function App() {
         error: null,
       };
       setHistory((prev) => [newItem, ...prev].slice(0, 100));
-      msgApi.success(`查询执行成功，耗时 ${result.execution_time_ms}ms`);
+      msgApi.success({
+        content: `查询执行成功，总耗时 ${result.execution_time_ms}ms${
+          result.timings && result.timings.total_ms > 0
+            ? `（分类 ${result.timings.queue_ms}ms / 执行 ${result.timings.execute_ms}ms）`
+            : ""
+        }`,
+        duration: 3,
+      });
     } catch (e: any) {
       if (
         requestConnId !== selectedConnection?.id ||

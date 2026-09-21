@@ -2185,7 +2185,27 @@ mod tests {
         assert!(loaded[0].password.is_empty(), "密码字段在落盘后应被清空");
     }
 
-    /// T-019 v2 IPC：metadata_list_v2 返回 DbObjectRefV2 列表
+/// T-053 兼容：旧 connection 配置无 env 字段时也能反序列化
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_connection_without_env_field_loads() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-legacy-conn-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let legacy = r#"[{"id":"x","name":"x","type":"sqlite","host":"","port":1,"username":"","password":"","database":":memory:","revision":3}]"#;
+        std::fs::write(tmp.join("connections.json"), legacy).unwrap();
+        let conns = queries::load_connections().await.unwrap();
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].revision, 3);
+        assert_eq!(conns[0].environment, "unknown");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+        /// T-019 v2 IPC：metadata_list_v2 返回 DbObjectRefV2 列表
     #[tokio::test]
     async fn metadata_list_v2_ok_for_sqlite() {
         let c = cfg("sqlite", "", 0, ":memory:");
