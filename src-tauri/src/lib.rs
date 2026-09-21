@@ -2136,6 +2136,87 @@ async fn close_pool(connection_id: String, revision: u32) -> Result<(), String> 
     Ok(())
 }
 
+// T-033: Keyset 表浏览
+// 使用主键进行 keyset 分页，避免 OFFSET 全扫描
+// pageSize 默认 200，最大 500
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KeysetResult {
+    pub columns: Vec<String>,
+    pub column_meta: Vec<ColumnMeta>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub has_next: bool,
+    pub affected_rows: u64,
+    pub execution_time_ms: u64,
+}
+
+#[command]
+async fn keyset_query(
+    config: DBConfig,
+    table_name: String,
+    last_value: Option<String>,
+    page_size: Option<u32>,
+) -> Result<KeysetResult, String> {
+    let page_size = page_size.unwrap_or(200).min(500);
+    // 每次取 pageSize+1 行来判断是否有下一页
+    let fetch_size = (page_size + 1) as i64;
+    
+    let sql = match dispatch_db_type(&config)? {
+        "mysql" | "postgresql" => {
+            if let Some(ref lv) = last_value {
+                format!(
+                    "SELECT * FROM \"{}\" WHERE id > {} ORDER BY id LIMIT {}",
+                    table_name.replace('"', "\"\""),
+                    lv,
+                    fetch_size
+                )
+            } else {
+                format!(
+                    "SELECT * FROM \"{}\" ORDER BY id LIMIT {}",
+                    table_name.replace('"', "\"\""),
+                    fetch_size
+                )
+            }
+        }
+        "sqlite" => {
+            if let Some(ref lv) = last_value {
+                format!(
+                    "SELECT * FROM \"{}\" WHERE rowid > {} ORDER BY rowid LIMIT {}",
+                    table_name.replace('"', "\"\""),
+                    lv,
+                    fetch_size
+                )
+            } else {
+                format!(
+                    "SELECT * FROM \"{}\" ORDER BY rowid LIMIT {}",
+                    table_name.replace('"', "\"\""),
+                    fetch_size
+                )
+            }
+        }
+        _ => return Err("不支持的数据库类型".to_string()),
+    };
+    
+    let start = std::time::Instant::now();
+    let (column_meta, rows, affected, is_query) = run_dispatch(&config, &sql).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let columns: Vec<String> = column_meta.iter().map(|m| m.name.clone()).collect();
+    
+    let has_next = rows.len() as u32 > page_size;
+    let mut display_rows = rows;
+    if has_next {
+        display_rows.truncate(page_size as usize);
+    }
+    
+    Ok(KeysetResult {
+        columns,
+        column_meta,
+        rows: display_rows,
+        has_next,
+        affected_rows: affected,
+        execution_time_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     spawn_pool_lifecycle();
@@ -2181,6 +2262,7 @@ pub fn run() {
             close_pool,
             csv_preview,
             csv_import_execute,
+            keyset_query,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
