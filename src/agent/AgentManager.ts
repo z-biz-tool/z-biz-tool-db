@@ -34,7 +34,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
   setContext: (context) => set({ context }),
 
   query: async (naturalLanguage) => {
-    const { config, context } = get();
+    const { context } = get();
     
     try {
       // TODO: 调用 Agent 服务
@@ -71,7 +71,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
   },
 
   optimize: async (sql) => {
-    const { config, context } = get();
+    const { context } = get();
     
     try {
       // TODO: 调用 Agent 服务
@@ -107,8 +107,8 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
     }
   },
 
-  analyze: async (sql, results) => {
-    const { config, context } = get();
+  analyze: async (sql, _results) => {
+    const { context } = get();
     
     try {
       // TODO: 调用 Agent 服务
@@ -145,7 +145,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
   },
 
   diagnoseError: async (error, sql) => {
-    const { config, context } = get();
+    const { context } = get();
     
     try {
       // TODO: 调用 Agent 服务
