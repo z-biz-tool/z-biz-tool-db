@@ -598,8 +598,28 @@ fn mysql_cell(row: &MySqlRow, i: usize) -> serde_json::Value {
         "DECIMAL" => dec_cell!(),
         "DATE" => mysql_dec::<chrono::NaiveDate>(row, i)
             .map(|v| wrap(CellKind::Date, serde_json::Value::String(v.to_string()))),
-        "TIME" => mysql_dec::<chrono::NaiveTime>(row, i)
-            .map(|v| wrap(CellKind::Time, serde_json::Value::String(v.to_string()))),
+        "TIME" => {
+            // MySQL TIME 可以是负数或超 24 小时（-838:59:58 到 838:59:57）
+            // NaiveTime 只能表示 0-24h，超过范围时退化为字符串保留原始值
+            let time_str = row.try_get::<String, _>(i).ok();
+            Some(match time_str {
+                Some(s) if !s.is_empty() => {
+                    if s.starts_with('-') || s.len() > 8 {
+                        // 非标准 TIME（负数或超 24h），保留原始字符串
+                        tagged_cell(CellKind::Time, serde_json::Value::String(s))
+                    } else {
+                        // 标准 TIME：尝试解析为 NaiveTime 以保证格式一致
+                        match chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S%.f")
+                            .or_else(|_| chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S"))
+                        {
+                            Ok(t) => wrap(CellKind::Time, serde_json::Value::String(t.to_string())),
+                            Err(_) => tagged_cell(CellKind::Time, serde_json::Value::String(s)),
+                        }
+                    }
+                }
+                _ => tagged_cell(CellKind::Time, serde_json::Value::Null),
+            })
+        }
         "DATETIME" | "TIMESTAMP" => mysql_dec::<chrono::NaiveDateTime>(row, i)
             .map(|v| wrap(CellKind::DateTime, serde_json::Value::String(v.to_string()))),
         "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "GEOMETRY" => {
