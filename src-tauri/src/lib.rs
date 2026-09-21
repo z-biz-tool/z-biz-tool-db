@@ -85,6 +85,12 @@ pub struct QueryResult {
     /// T-041：分段耗时（毫秒）
     #[serde(default)]
     pub timings: Timings,
+    /// T-031：是否被截断（超过 max_rows）
+    #[serde(default)]
+    pub truncated: bool,
+    /// T-031：总行数（截断时提供）
+    #[serde(default)]
+    pub total_rows: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1251,6 +1257,7 @@ async fn execute_query(
     access_mode: Option<String>,
     approval: Option<security::ApprovalGrant>,
     expected_generation: Option<u32>,
+    max_rows: Option<u32>,
 ) -> Result<QueryResult, String> {
     if sql.trim().is_empty() {
         return Err("SQL 语句为空".to_string());
@@ -1298,13 +1305,21 @@ async fn execute_query(
     }
 
     let start = std::time::Instant::now();
-    let (column_meta, rows, affected, is_query) = run_dispatch(&config, &sql).await?;
+    let (column_meta, mut rows, affected, is_query) = run_dispatch(&config, &sql).await?;
     // T-018：使用 UUID v4 作为请求标识
     let id = uuid::Uuid::new_v4().to_string();
     let columns: Vec<String> = column_meta.iter().map(|m| m.name.clone()).collect();
 
     // T-022 generation 透传：UI 可携带并比对
     let generation = expected_generation.unwrap_or(0);
+
+    // T-031：max_rows 截断逻辑
+    let max = max_rows.unwrap_or(u32::MAX) as usize;
+    let total_rows = rows.len() as u64;
+    let truncated = rows.len() > max;
+    if truncated {
+        rows.truncate(max);
+    }
 
     Ok(QueryResult {
         id,
@@ -1315,6 +1330,8 @@ async fn execute_query(
         execution_time_ms: start.elapsed().as_millis() as u64,
         is_query,
         timings: crate::new_timings(start),
+        truncated,
+        total_rows,
     })
     .map(|mut r| {
         r.id = format!("gen{}|{}", generation, r.id);
@@ -1653,6 +1670,8 @@ async fn execute_batch(
             execution_time_ms: start.elapsed().as_millis() as u64,
             is_query,
             timings: Default::default(),
+            truncated: false,
+            total_rows: 0,
         });
     }
     Ok(out)
@@ -1866,6 +1885,8 @@ async fn explain_query(
         execution_time_ms: start.elapsed().as_millis() as u64,
         is_query,
         timings: crate::new_timings(start),
+        truncated: false,
+        total_rows: 0,
     })
 }
 
@@ -2302,6 +2323,7 @@ mod tests {
             access_mode,
             None,
             None,
+            None,
         )
         .await
     }
@@ -2501,6 +2523,7 @@ mod tests {
             Some("writable".to_string()),
             Some(grant),
             None,
+            None,
         )
         .await
         .expect("带审批的 CREATE TABLE 应通过");
@@ -2583,6 +2606,7 @@ mod tests {
             c,
             Some("writable".to_string()),
             Some(grant2),
+            None,
             None,
         )
         .await
