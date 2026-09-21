@@ -61,6 +61,7 @@ import {
   BugOutlined,
   BulbOutlined,
   SnippetsOutlined,
+  SearchOutlined,
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 // 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
@@ -219,6 +220,7 @@ function App() {
   // 查询历史 —— T-017 接通后端持久化
   const [history, setHistory] = useState<QueryHistoryItem[]>([]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [historySearch, setHistorySearch] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -1297,7 +1299,24 @@ function App() {
                           label: <span><HistoryOutlined style={{ color: brandGradient }} />历史</span>,
                           children: (
                             <div style={{ maxHeight: "calc(100vh - 200px)", overflow: "auto" }}>
-                              {history.map((h) => (
+                              {/* T-035: 历史搜索和过滤 */}
+                              <Input
+                                placeholder="搜索 SQL 或连接名称..."
+                                prefix={<SearchOutlined style={{ color: "#aaa" }} />}
+                                size="small"
+                                allowClear
+                                style={{ marginBottom: 8 }}
+                                onChange={(e) => setHistorySearch(e.target.value.toLowerCase())}
+                              />
+                              {history
+                                .filter((h) => {
+                                  if (!historySearch) return true;
+                                  return (
+                                    h.sql.toLowerCase().includes(historySearch) ||
+                                    h.connection_name.toLowerCase().includes(historySearch)
+                                  );
+                                })
+                                .map((h) => (
                                 <div
                                   key={h.id}
                                   onClick={() => setSqlCode(h.sql)}
