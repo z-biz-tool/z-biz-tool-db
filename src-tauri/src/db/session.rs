@@ -548,4 +548,74 @@ mod tests {
         reg.mark_transaction_unknown("unk1");
         assert_eq!(reg.get_transaction_state("unk1"), Some(TransactionState::Unknown));
     }
+
+    #[test]
+    fn conflict_detection_0_rows() {
+        let reg = QueryRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let job = QueryJobInternal {
+            query_id: "conf1".into(),
+            state: QueryState::Running,
+            state_msg: "running".into(),
+            cancel_requested: false,
+            start_time: Instant::now(),
+            batch_tx: tx,
+            transaction_state: TransactionState::Active,
+            generation: 1,
+            conflict_detected: false,
+            last_affected_rows: 0,
+        };
+        reg.insert(job);
+
+        // Record 0 rows affected = conflict detected
+        reg.record_write_impact("conf1", 0);
+        assert!(reg.has_conflict("conf1"));
+    }
+
+    #[test]
+    fn no_conflict_when_rows_affected() {
+        let reg = QueryRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let job = QueryJobInternal {
+            query_id: "noconf1".into(),
+            state: QueryState::Running,
+            state_msg: "running".into(),
+            cancel_requested: false,
+            start_time: Instant::now(),
+            batch_tx: tx,
+            transaction_state: TransactionState::Active,
+            generation: 1,
+            conflict_detected: false,
+            last_affected_rows: 0,
+        };
+        reg.insert(job);
+
+        // Record 5 rows affected = no conflict
+        reg.record_write_impact("noconf1", 5);
+        assert!(!reg.has_conflict("noconf1"));
+    }
+
+    #[test]
+    fn commit_response_lost_marks_unknown() {
+        let reg = QueryRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let job = QueryJobInternal {
+            query_id: "lost1".into(),
+            state: QueryState::Running,
+            state_msg: "running".into(),
+            cancel_requested: false,
+            start_time: Instant::now(),
+            batch_tx: tx,
+            transaction_state: TransactionState::Committing,
+            generation: 1,
+            conflict_detected: false,
+            last_affected_rows: 0,
+        };
+        reg.insert(job);
+
+        // Mark commit response lost
+        reg.mark_commit_response_lost("lost1");
+        assert!(reg.is_transaction_unknown("lost1"));
+        assert_eq!(reg.get_transaction_state("lost1"), Some(TransactionState::Unknown));
+    }
 }
