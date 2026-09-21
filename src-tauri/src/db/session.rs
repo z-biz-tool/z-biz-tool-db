@@ -118,6 +118,10 @@ pub struct QueryJobInternal {
     pub transaction_state: TransactionState,
     /// T-043：事务所属 generation（用于校验同一事务操作在同一 generation）
     pub generation: u32,
+    /// T-046：是否检测到冲突（0 行影响 = 乐观并发冲突）
+    pub conflict_detected: bool,
+    /// T-046：最近一次写操作影响的行数
+    pub last_affected_rows: u64,
 }
 
 /// 活跃查询注册表（进程内单例）
@@ -285,6 +289,42 @@ impl QueryRegistry {
             }
         }
     }
+
+    // T-046：记录写操作影响行数并检测冲突（0 行影响 = 乐观并发冲突）
+    pub fn record_write_impact(&self, query_id: &str, affected_rows: u64) {
+        if let Some(job) = self.inner.lock().expect("registry lock").get_mut(query_id) {
+            job.last_affected_rows = affected_rows;
+            if affected_rows == 0 && job.transaction_state == TransactionState::Active {
+                job.conflict_detected = true;
+            }
+        }
+    }
+
+    // T-046：检查是否有冲突
+    pub fn has_conflict(&self, query_id: &str) -> bool {
+        self.inner.lock().expect("registry lock")
+            .get(query_id)
+            .map(|j| j.conflict_detected)
+            .unwrap_or(false)
+    }
+
+    // T-046：标记 COMMIT 响应丢失（committing → unknown）
+    pub fn mark_commit_response_lost(&self, query_id: &str) {
+        if let Some(job) = self.inner.lock().expect("registry lock").get_mut(query_id) {
+            if job.transaction_state == TransactionState::Committing {
+                job.transaction_state = TransactionState::Unknown;
+                job.state_msg = "COMMIT 响应丢失".into();
+            }
+        }
+    }
+
+    // T-046：检查事务是否处于 unknown 状态（不能自动重试）
+    pub fn is_transaction_unknown(&self, query_id: &str) -> bool {
+        self.inner.lock().expect("registry lock")
+            .get(query_id)
+            .map(|j| j.transaction_state == TransactionState::Unknown)
+            .unwrap_or(false)
+    }
 }
 
 static REGISTRY: OnceLock<QueryRegistry> = OnceLock::new();
@@ -337,8 +377,10 @@ mod tests {
             cancel_requested: false,
             start_time: Instant::now(),
             batch_tx: tx,
-            transaction_state: TransactionState::Idle,
+            transaction_state: TransactionState::Active,
             generation: 1,
+            conflict_detected: false,
+            last_affected_rows: 0,
         };
         reg.insert(job);
         assert_eq!(reg.get_state("q1").unwrap().0, QueryState::Queued);
@@ -365,8 +407,10 @@ mod tests {
             cancel_requested: false,
             start_time: Instant::now(),
             batch_tx: tx,
-            transaction_state: TransactionState::Idle,
+            transaction_state: TransactionState::Active,
             generation: 1,
+            conflict_detected: false,
+            last_affected_rows: 0,
         };
         reg.insert(job);
         assert!(reg.get_state("q2").is_some());
@@ -413,6 +457,8 @@ mod tests {
             batch_tx: tx,
             transaction_state: TransactionState::Idle,
             generation: 1,
+            conflict_detected: false,
+            last_affected_rows: 0,
         };
         reg.insert(job);
 
@@ -444,8 +490,10 @@ mod tests {
             cancel_requested: false,
             start_time: Instant::now(),
             batch_tx: tx,
-            transaction_state: TransactionState::Idle,
+            transaction_state: TransactionState::Active,
             generation: 1,
+            conflict_detected: false,
+            last_affected_rows: 0,
         };
         reg.insert(job);
         let err = reg.begin_transaction("tx2", 2);
@@ -466,6 +514,8 @@ mod tests {
             batch_tx: tx,
             transaction_state: TransactionState::Idle,
             generation: 1,
+            conflict_detected: false,
+            last_affected_rows: 0,
         };
         reg.insert(job);
 
@@ -491,6 +541,8 @@ mod tests {
             batch_tx: tx,
             transaction_state: TransactionState::Active,
             generation: 1,
+            conflict_detected: false,
+            last_affected_rows: 0,
         };
         reg.insert(job);
         reg.mark_transaction_unknown("unk1");
