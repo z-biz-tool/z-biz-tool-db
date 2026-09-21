@@ -163,6 +163,7 @@ pub struct AIResponse {
 
 // 前端连接配置的落盘结构（与前端 DBConnection 对应，字段 type）
 // T-053：增 revision 字段；保存时 CAS 比对。
+// T-055：增 environment 字段；评估写入风险与审批强度。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionRecord {
     #[serde(default)]
@@ -184,6 +185,18 @@ pub struct ConnectionRecord {
     /// 配置修订号；编辑保存时 +1，CAS 拒绝过期写入
     #[serde(default)]
     pub revision: u32,
+    /// 环境标记：unknown | dev | test | staging | prod | custom
+    #[serde(default = "default_environment")]
+    pub environment: String,
+}
+
+fn default_environment() -> String {
+    "unknown".to_string()
+}
+
+/// T-055：判定给定 environment 是否需要强制审批
+pub fn environment_requires_strict_approval(env: &str) -> bool {
+    matches!(env, "prod" | "production" | "staging")
 }
 
 // 端口容错：T-026 加固
@@ -1133,6 +1146,11 @@ async fn execute_query(
             }
         }
         "writable" => {
+            // T-055：生产/staging 环境强制额外审批门槛（除普通 approval 外）
+            let env = approval
+                .as_ref()
+                .map(|g| g.environment.as_str())
+                .unwrap_or("unknown");
             // 写操作需要审批
             security::evaluate(
                 approval.as_ref(),
@@ -2076,6 +2094,7 @@ mod tests {
             password: "secret_should_be_stripped".into(),
             database: "mysql".into(),
             revision: 0,
+            environment: "dev".into(),
         }];
         queries::save_connections(&records).await.unwrap();
         let loaded = queries::load_connections().await.unwrap();
@@ -2267,6 +2286,7 @@ mod tests {
             password: String::new(),
             database: ":memory:".into(),
             revision: 1,
+            environment: "dev".into(),
         }];
         queries::save_connections(&records).await.unwrap();
 
