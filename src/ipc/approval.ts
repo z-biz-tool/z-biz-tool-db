@@ -6,6 +6,29 @@ import type { ApprovalGrant } from "./db";
 
 export type { ApprovalGrant };
 
+/** T-054：扫描 SQL 中可能含敏感字面量片段；只提示，不阻断 */
+export function scanSensitiveLiterals(sql: string): string[] {
+    const concerns: string[] = [];
+    const lower = sql.toLowerCase();
+    if (/password\s*=\s*'[^']{4,}'/i.test(lower)) concerns.push("内嵌 password= 字符串");
+    if (/(token|api[_-]?key|secret)\s*=\s*'[^']{8,}'/i.test(lower)) concerns.push("可能的 token / api_key");
+    // 裸 long token：连续 24+ 个 base64-ish 字符
+    if (/['"][A-Za-z0-9+/=_-]{24,}['"]/.test(sql)) concerns.push("长 base64-like 字面量");
+    return concerns;
+}
+
+/** T-054：检测 SQL 中的简单参数占位标记（:name 或 $1），返回参数名列表 */
+export function extractParameterNames(sql: string): string[] {
+    const names = new Set<string>();
+    const re = /(?:[:?]([a-zA-Z_][a-zA-Z0-9_]*)|\$\{?([a-zA-Z_][a-zA-Z0-9_]*)\}?)/g;
+    let m;
+    while ((m = re.exec(sql))) {
+        const n = m[1] || m[2];
+        if (n && n.toLowerCase() !== "select") names.add(n);
+    }
+    return [...names];
+}
+
 export interface PendingApproval {
   sql: string;
   environment: string;
