@@ -44,7 +44,7 @@ pub struct ColumnMeta {
 }
 
 /// 单元格类型标签（与 serde_json::Value 配合使用；通过 `__kind` 字段区分）
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CellKind {
     Null,
     Integer,
@@ -466,6 +466,36 @@ fn wrap(driver_kind: CellKind, raw: serde_json::Value) -> serde_json::Value {
     if matches!(raw, serde_json::Value::Null) {
         return tagged_cell(CellKind::Null, serde_json::Value::Null);
     }
+
+    // T-038：对于整数类型，超过 JS Number.MAX_SAFE_INTEGER (2^53) 时序列化为字符串
+    // 保留小整数为 Number 类型，大整数安全传递到前端
+    if driver_kind == CellKind::Integer {
+        if let serde_json::Value::Number(ref n) = raw {
+            // 用 i64 覆盖正/负大整数
+            if let Some(i) = n.as_i64() {
+                let max_safe: i64 = 9007199254740992; // 2^53
+                if i < -max_safe || i > max_safe {
+                    return tagged_cell(
+                        CellKind::Integer,
+                        serde_json::Value::String(i.to_string()),
+                    );
+                }
+                return tagged_cell(driver_kind, raw);
+            }
+            // 仅 u64 大正数（i64 无法表示）
+            if let Some(u) = n.as_u64() {
+                let max_safe: u64 = 9007199254740992;
+                if u > max_safe {
+                    return tagged_cell(
+                        CellKind::Integer,
+                        serde_json::Value::String(u.to_string()),
+                    );
+                }
+                return tagged_cell(driver_kind, raw);
+            }
+        }
+    }
+
     tagged_cell(driver_kind, raw)
 }
 
