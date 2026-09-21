@@ -43,6 +43,14 @@ jobs:
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
+      # Workaround: GitHub's new token format (2026-08) corrupts the cargo config
+      # that dtolnay/rust-toolchain writes, breaking later cargo invocations
+      # with "Unexpected character at row 2, col 24". Remove it so cargo
+      # regenerates a clean one on the next build step.
+      - name: Reset broken cargo config
+        shell: bash
+        run: rm -f "$HOME/.cargo/config.toml" "$USERPROFILE/.cargo/config.toml"
+
       - name: Install dependencies (Linux)
         if: matrix.platform == 'ubuntu-22.04'
         run: |

@@ -47,7 +47,6 @@ import {
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 // 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
-import { AgentPanel } from './agent/AgentPanel';
 import { useAgentStore } from './agent/AgentManager';
 
 // 渐变色主题常量
@@ -891,12 +890,12 @@ function App() {
                           }}
                           onMouseEnter={(e) => {
                             if (selectedTable !== t.name) {
-                              (e.currentTarget as HTMLElement).background = "rgba(102,126,234,0.05)";
+                              (e.currentTarget as HTMLElement).style.background = "rgba(102,126,234,0.05)";
                             }
                           }}
                           onMouseLeave={(e) => {
                             if (selectedTable !== t.name) {
-                              (e.currentTarget as HTMLElement).background = "transparent";
+                              (e.currentTarget as HTMLElement).style.background = "transparent";
                             }
                           }}
                         >
@@ -1057,10 +1056,10 @@ function App() {
                                     transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
                                   }}
                                   onMouseEnter={(e) => {
-                                    (e.currentTarget as HTMLElement).background = "rgba(102,126,234,0.05)";
+                                    (e.currentTarget as HTMLElement).style.background = "rgba(102,126,234,0.05)";
                                   }}
                                   onMouseLeave={(e) => {
-                                    (e.currentTarget as HTMLElement).background = "transparent";
+                                    (e.currentTarget as HTMLElement).style.background = "transparent";
                                   }}
                                 >
                                   <Space direction="vertical" size={2} style={{ width: "100%" }}>
@@ -1097,10 +1096,10 @@ function App() {
                                     transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
                                   }}
                                   onMouseEnter={(e) => {
-                                    (e.currentTarget as HTMLElement).background = "rgba(102,126,234,0.05)";
+                                    (e.currentTarget as HTMLElement).style.background = "rgba(102,126,234,0.05)";
                                   }}
                                   onMouseLeave={(e) => {
-                                    (e.currentTarget as HTMLElement).background = "transparent";
+                                    (e.currentTarget as HTMLElement).style.background = "transparent";
                                   }}
                                 >
                                   <Space direction="vertical" size={2} style={{ width: "100%" }}>
