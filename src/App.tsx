@@ -176,7 +176,7 @@ function App() {
   const [aiForm] = Form.useForm();
   
   // AI 功能状态
-  const [aiLoading, setAiLoading] = useState(false);
+  const [aiLoading] = useState(false);
   const [aiResult, setAiResult] = useState<string>("");
   const [showAiResultModal, setShowAiResultModal] = useState(false);
   const [aiActiveTab, setAiActiveTab] = useState<string>("generate");
@@ -332,27 +332,6 @@ function App() {
       })
       .catch(() => {});
   }, []);
-
-  // AI 调用辅助函数
-  const callAiService = async (command: string, payload: any) => {
-    if (!aiConfig.baseUrl || !aiConfig.apiKey) {
-      msgApi.warning("请先在设置中配置 AI 参数");
-      setShowAiConfigModal(true);
-      return null;
-    }
-    
-    setAiLoading(true);
-    try {
-      const result = await invoke<any>(command, payload);
-      setAiResult(result || "");
-      return result;
-    } catch (e: any) {
-      msgApi.error(`AI 服务错误: ${e}`);
-      return null;
-    } finally {
-      setAiLoading(false);
-    }
-  };
 
   // AI 功能 - 使用共享 Agent 组件
   const handleAiGenerateSql = async () => {
@@ -1226,6 +1205,15 @@ function App() {
           activeKey={aiActiveTab}
           onChange={setAiActiveTab}
           items={[
+            {
+              key: "agent",
+              label: <Space><RobotOutlined />Agent 对话</Space>,
+              children: (
+                <div style={{ height: 480 }}>
+                  <AgentPanel />
+                </div>
+              ),
+            },
             {
               key: "generate",
               label: <Space><SnippetsOutlined />生成 SQL</Space>,
