@@ -196,6 +196,11 @@ function App() {
   const [queryResults, setQueryResults] = useState<TaggedCell[][]>([]);
   // T-001 + T-002：以后端 column_meta 为准，零行结果仍有列定义
   const [queryColumnsMeta, setQueryColumnsMeta] = useState<ColumnMeta[]>([]);
+  // T-044: 网格编辑状态
+  const [editingCell, setEditingCell] = useState<{ rowIndex: number; colIndex: number } | null>(null);
+  const [editValue, setEditValue] = useState<string>('');
+  const [changeSet, setChangeSet] = useState<Map<string, TaggedCell>>(new Map());
+  // T-044: 记录变更数量用于UI显示
   // T-006：可写访问模式开关；S0 默认 false，写入命令将被后端拒绝
   const [writeAccessEnabled, setWriteAccessEnabled] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
@@ -940,6 +945,7 @@ function App() {
 
   // T-002：表格列定义使用后端 column_meta，不再用 Object.keys 推导列名
   // 零行结果依旧展示列头（A01 / A02）
+  // T-044: 添加单元格编辑支持（双击编辑，change set 跟踪变更）
   const resultColumns = queryColumnsMeta.length > 0
     ? queryColumnsMeta.map((meta) => ({
         title: (
@@ -951,7 +957,48 @@ function App() {
         dataIndex: `col_${meta.ordinal}`,
         key: `col_${meta.ordinal}`,
         ellipsis: true,
-        render: (_: any, record: any) => cellDisplay(record[`col_${meta.ordinal}`]),
+        onCell: (record: any, rowIndex?: number) => ({
+          onDoubleClick: () => {
+            if (rowIndex !== undefined && writeAccessEnabled) {
+              const cellValue = record[`col_${meta.ordinal}`];
+              setEditingCell({ rowIndex, colIndex: meta.ordinal });
+              setEditValue(cellValue?.value ?? '');
+            }
+          },
+          style: { cursor: writeAccessEnabled ? 'pointer' : 'default' },
+        }),
+        render: (_: any, record: any) => {
+          const cellKey = `${record.key}_${meta.ordinal}`;
+          const isEditing = editingCell?.rowIndex === record.key && editingCell?.colIndex === meta.ordinal;
+          
+          if (isEditing) {
+            return (
+              <Input
+                size="small"
+                value={editValue}
+                onChange={(e) => setEditValue(e.target.value)}
+                onPressEnter={() => {
+                  const newCell: TaggedCell = { __kind: 'text', value: editValue };
+                  const changeKey = cellKey;
+                  setChangeSet(prev => new Map(prev).set(changeKey, newCell));
+                  setEditingCell(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') setEditingCell(null);
+                }}
+                autoFocus
+                style={{ width: '100%', fontSize: 12 }}
+              />
+            );
+          }
+          
+          const isChanged = changeSet.has(cellKey);
+          return (
+            <span style={isChanged ? { backgroundColor: 'rgba(82, 196, 26, 0.15)', padding: '1px 4px', borderRadius: 2 } : {}}>
+              {cellDisplay(record[`col_${meta.ordinal}`])}
+            </span>
+          );
+        },
       }))
     : [];
 
@@ -1302,7 +1349,23 @@ function App() {
                       title={`查询结果 (${queryResults.length} 行)`}
                       extra={
                         <Space>
+                          {changeSet.size > 0 && (
+                            <Tag color="green">已修改 {changeSet.size} 项</Tag>
+                          )}
                           <Button size="small" icon={<SaveOutlined />} onClick={handleExportResults} style={{ borderRadius: 6 }}>导出</Button>
+                          {changeSet.size > 0 && writeAccessEnabled && (
+                            <Button
+                              size="small"
+                              type="primary"
+                              onClick={() => {
+                                msgApi.info(`已记录 ${changeSet.size} 项变更（待后端提交）`);
+                                setChangeSet(new Map());
+                              }}
+                              style={{ borderRadius: 6, background: brandGradient }}
+                            >
+                              提交变更
+                            </Button>
+                          )}
                         </Space>
                       }
                     >
