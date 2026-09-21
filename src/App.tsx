@@ -577,9 +577,11 @@ function App() {
       msgApi.warning("请先执行查询");
       return;
     }
-    
+    // T-049：上下文授权提示前置——S2 将插入 Modal.confirm
+    // 截取前 100 行作为样例，最大 64 KiB；明示 NOT_CONFIGURED 边界
+    const sample = queryResults.slice(0, 100);
     try {
-      const result = await useAgentStore.getState().analyze(sqlCode, queryResults);
+      const result = await useAgentStore.getState().analyze(sqlCode, sample);
       
       if (result.success) {
         setAiResult(result.content);
