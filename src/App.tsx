@@ -281,6 +281,42 @@ function App() {
   const [showSaveQueryModal, setShowSaveQueryModal] = useState(false);
   const [editingSavedQuery, setEditingSavedQuery] = useState<SavedQuery | null>(null);
   
+  // T-036: 导出结果为 CSV
+  const handleExportResults = () => {
+    if (queryResults.length === 0) {
+      msgApi.warning("没有查询结果可导出");
+      return;
+    }
+    try {
+      const headers = resultColumns.map((c) => c.title);
+      const csvRows = queryResults.map((row) => {
+        return row.map((cell) => {
+          if (cell.__kind === 'null') return 'NULL';
+          if (cell.__kind === 'binary') return '[BINARY]';
+          const val = String(cell.value ?? '');
+          // CSV 公式防护：字段以 = + - @ \t \n 开头时加前缀单引号
+          if (/^[=+\-@\t\n]/.test(val)) return "'" + val;
+          // 含逗号或引号时用双引号包裹
+          if (val.includes(',') || val.includes('"')) {
+            return '"' + val.replace(/"/g, '""') + '"';
+          }
+          return val;
+        });
+      });
+      const csv = [headers.join(','), ...csvRows.map((r) => r.join(','))].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `query_results_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      msgApi.success(`已导出 ${queryResults.length} 行到 CSV`);
+    } catch (e: any) {
+      msgApi.error(`导出失败: ${e}`);
+    }
+  };
+  
   // AI 配置
   const [aiConfig, setAiConfig] = useState({
     baseUrl: "",
@@ -1266,7 +1302,7 @@ function App() {
                       title={`查询结果 (${queryResults.length} 行)`}
                       extra={
                         <Space>
-                          <Button size="small" icon={<SaveOutlined />} style={{ borderRadius: 6 }}>导出</Button>
+                          <Button size="small" icon={<SaveOutlined />} onClick={handleExportResults} style={{ borderRadius: 6 }}>导出</Button>
                         </Space>
                       }
                     >
