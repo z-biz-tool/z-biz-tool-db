@@ -1270,6 +1270,7 @@ function App() {
                         </Space>
                       }
                     >
+                      {/* T-032: 虚拟滚动结果网格 */}
                       <Table
                         columns={resultColumns}
                         dataSource={queryResults.map((row, index) => {
@@ -1281,8 +1282,9 @@ function App() {
                           return obj;
                         })}
                         size="small"
-                        scroll={{ x: "max-content", y: 300 }}
-                        pagination={{ pageSize: 50 }}
+                        virtual
+                        scroll={{ x: "max-content", y: 400 }}
+                        pagination={{ pageSize: 100, showSizeChanger: true, pageSizeOptions: ["50", "100", "200", "500"] }}
                         style={{ borderRadius: 8 }}
                       />
                     </Card>
