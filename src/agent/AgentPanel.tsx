@@ -37,11 +37,15 @@ export const AgentPanel: React.FC = () => {
     if (!input.trim()) return;
 
     setLoading(true);
-    
+
     try {
       // 尝试智能识别用户意图
       const text = input.toLowerCase();
-      
+
+      // T-049 统一意图入口：先显式意图，再回退到关键词猜测。
+      // 所有 Agent 路径已通过 AgentManager 统一返回 NOT_CONFIGURED（如不可用），
+      // 面板只负责 intent 路由，不重复上述 store 内的 fallback
+      // （关键字猜测保留作兼容层；S3 会替换为显式 intent 选择器）
       let response;
       if (text.includes('优化') || text.includes('改进')) {
         // 优化 SQL
