@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import SqlEditor from "./components/SqlEditor";
 import {
   ConfigProvider,
   theme,
@@ -1324,16 +1325,11 @@ function App() {
                         </Space>
                       }
                     >
-                      <TextArea
+                      {/* T-029: CodeMirror 6 SQL 编辑器 */}
+                      <SqlEditor
                         value={sqlCode}
-                        onChange={(e) => setSqlCode(e.target.value)}
-                        autoSize={{ minRows: 4, maxRows: 12 }}
-                        style={{ 
-                          fontFamily: "monospace", 
-                          fontSize: 13,
-                          borderRadius: 8,
-                        }}
-                        placeholder="输入 SQL 语句..."
+                        onChange={setSqlCode}
+                        height="150px"
                       />
                     </Card>
 
