@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   ConfigProvider,
   theme,
@@ -22,6 +22,12 @@ import {
   Alert,
   Spin,
 } from "antd";
+import {
+  buildGrant,
+  isLikelyWriteSql,
+  PendingApproval,
+} from "./ipc/approval";
+import type { ApprovalGrant } from "./ipc/approval";
 import {
   DatabaseOutlined,
   PlusOutlined,
@@ -236,6 +242,25 @@ function App() {
   });
   const [showAiConfigModal, setShowAiConfigModal] = useState(false);
   const [aiForm] = Form.useForm();
+
+  // T-045 写入审批状态
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
+  const [pendingGrant, setPendingGrant] = useState<ApprovalGrant | null>(null);
+  const approvalPendingRef = useRef<((g: ApprovalGrant | null) => void) | null>(null);
+
+  const requestApproval = (sql: string, environment: string): Promise<ApprovalGrant | null> =>
+    new Promise((resolve) => {
+      const ttlSec = 60;
+      const pending: PendingApproval = {
+        sql,
+        environment,
+        issuedAt: Math.floor(Date.now() / 1000),
+        ttlSec,
+      };
+      setPendingApproval(pending);
+      setPendingGrant(null);
+      approvalPendingRef.current = resolve;
+    });
   
   // AI 功能状态
   const [aiLoading] = useState(false);
@@ -252,7 +277,7 @@ function App() {
 
   // 执行查询
   // T-009：invoke 前快照 connectionId+activeTabId，响应后比对当前状态
-  // 不匹配则丢弃结果并显示提示（DB-11 / A04）
+  // T-045：writable + isLikelyWriteSql 时弹审批 Modal 收集 grant
   const executeQuery = async () => {
     if (!selectedConnection) {
       msgApi.warning("请先连接数据库");
@@ -260,11 +285,28 @@ function App() {
     }
     const requestConnId = selectedConnection.id;
     const requestTabId = activeTabId;
+    const wantWrite = writeAccessEnabled;
+    const likelyWrite = isLikelyWriteSql(sqlCode);
+    let grant: ApprovalGrant | null | undefined = undefined;
+    if (wantWrite && likelyWrite) {
+      // 弹 Modal 等用户确认；环境暂取 selectedConnection.environment ?? "unknown"
+      grant = await requestApproval(
+        sqlCode,
+        (selectedConnection as any).environment ?? "unknown",
+      );
+      if (!grant) {
+        // 用户取消
+        msgApi.info("写入操作已取消");
+        return;
+      }
+    }
     try {
       const result = await invoke<QueryResultV2>("execute_query", {
         sql: sqlCode,
         config: toBackendConfig(selectedConnection),
-        access_mode: writeAccessEnabled ? "writable" : "readOnly",
+        access_mode: wantWrite ? "writable" : "readOnly",
+        approval: grant ?? null,
+        expected_generation: null,
       });
 
       // 异步校验：标签或连接已切走 → 丢弃结果
@@ -282,7 +324,7 @@ function App() {
 
       // 添加到 Agent 历史
       useAgentStore.getState().addMessage({
-        id: Date.now().to_string(),
+        id: Date.now().toString(),
         role: 'user',
         content: `执行查询: ${sqlCode}`,
         timestamp: Date.now(),
@@ -298,7 +340,7 @@ function App() {
 
       // 添加历史
       const newItem: QueryHistoryItem = {
-        id: Date.now().to_string(),
+        id: Date.now().toString(),
         sql: sqlCode,
         connection_id: selectedConnection?.id || "",
         connection_name: selectedConnection?.name || "",
@@ -318,7 +360,7 @@ function App() {
       }
       msgApi.error(`查询失败: ${e}`);
       const newItem: QueryHistoryItem = {
-        id: Date.now().to_string(),
+        id: Date.now().toString(),
         sql: sqlCode,
         connection_id: selectedConnection?.id || "",
         connection_name: selectedConnection?.name || "",
@@ -1566,6 +1608,65 @@ function App() {
               {aiResult}
             </Typography>
           </Card>
+        )}
+      </Modal>
+
+      {/* T-045 写入审批 Modal */}
+      <Modal
+        open={!!pendingApproval}
+        title={
+          <Space>
+            <Tag color="orange">写入审批</Tag>
+            <span>确认高风险 SQL</span>
+          </Space>
+        }
+        onCancel={() => {
+          approvalPendingRef.current?.(null);
+          setPendingApproval(null);
+        }}
+        okButtonProps={{
+          danger: true,
+          disabled: !pendingApproval || pendingGrant !== null,
+        }}
+        okText="授权执行"
+        cancelText="取消"
+        onOk={() => {
+          if (!pendingApproval) return;
+          const g = buildGrant(pendingApproval);
+          setPendingGrant(g);
+          approvalPendingRef.current?.(g);
+          setPendingApproval(null);
+        }}
+        width={640}
+      >
+        {pendingApproval && (
+          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+            <Alert
+              type="warning"
+              showIcon
+              message="此 SQL 包含写入/危险子句，需要显式审批"
+              description={
+                <span>
+                  环境：
+                  <Tag color="blue">{pendingApproval.environment}</Tag>
+                  TTL：{pendingApproval.ttlSec}s ｜ 仅本次有效 ｜ 摘要绑定 SQL 全文
+                </span>
+              }
+            />
+            <Card size="small" title="待执行 SQL">
+              <pre style={{ whiteSpace: "pre-wrap", margin: 0, fontSize: 12 }}>
+                {pendingApproval.sql}
+              </pre>
+            </Card>
+            <Card size="small" title="校验信息">
+              <ul style={{ paddingLeft: 18, margin: 0 }}>
+                <li>审批 ID 将自动生成（UUID v4）</li>
+                <li>SQL 摘要由前 64 字符 + 长度组成</li>
+                <li>超过 TTL 或摘要变化将导致后端拒绝执行</li>
+                <li>单次使用，已使用后无法重放</li>
+              </ul>
+            </Card>
+          </Space>
         )}
       </Modal>
     </ConfigProvider>
