@@ -28,6 +28,7 @@ import {
   PendingApproval,
 } from "./ipc/approval";
 import type { ApprovalGrant } from "./ipc/approval";
+import { classifyError, errorDescription } from "./ipc/errors";
 import {
   DatabaseOutlined,
   PlusOutlined,
@@ -382,7 +383,11 @@ function App() {
       ) {
         return;
       }
-      msgApi.error(`查询失败: ${e}`);
+      msgApi.error({
+        content: `${errorDescription(classifyError(String(e)))}`,
+        duration: 5,
+      });
+      const err = classifyError(String(e));
       const newItem: QueryHistoryItem = {
         id: Date.now().toString(),
         sql: sqlCode,
@@ -391,7 +396,7 @@ function App() {
         timestamp: Math.floor(Date.now() / 1000),
         execution_time_ms: 0,
         success: false,
-        error: String(e),
+        error: err.code,
       };
       setHistory((prev) => [newItem, ...prev].slice(0, 100));
     }
