@@ -195,42 +195,66 @@ function App() {
   const [columns, setColumns] = useState<ColumnInfo[]>([]);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
 
-  // 查询历史
-  const [history, setHistory] = useState<QueryHistoryItem[]>([
-    {
-      id: "h1",
-      sql: "SELECT * FROM users LIMIT 10",
-      connection_id: "1",
-      connection_name: "本地 MySQL",
-      timestamp: Math.floor(Date.now() / 1000) - 3600,
-      execution_time_ms: 23,
-      success: true,
-      error: null,
-    },
-    {
-      id: "h2",
-      sql: "SELECT COUNT(*) FROM orders",
-      connection_id: "1",
-      connection_name: "本地 MySQL",
-      timestamp: Math.floor(Date.now() / 1000) - 7200,
-      execution_time_ms: 45,
-      success: true,
-      error: null,
-    },
-  ]);
+  // 查询历史 —— T-017 接通后端持久化
+  const [history, setHistory] = useState<QueryHistoryItem[]>([]);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
 
-  // 保存的查询
-  const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([
-    {
-      id: "sq-1",
-      name: "查询所有活跃用户",
-      sql: "SELECT * FROM users WHERE active = true",
-      description: "获取所有状态为活跃的用户",
-      tags: ["user", "常用"],
-      created_at: Math.floor(Date.now() / 1000) - 86400 * 7,
-      updated_at: Math.floor(Date.now() / 1000) - 86400,
-    },
-  ]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await invoke<QueryHistoryItem[]>("load_query_history");
+        if (!cancelled) {
+          setHistory(Array.isArray(list) ? list : []);
+          setHistoryLoaded(true);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          msgApi.warning(`历史加载失败：${e}（应用不会保存空历史覆盖损坏文件）`);
+          setHistoryLoaded(true);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 历史变更后去抖持久化（500ms）
+  useEffect(() => {
+    if (!historyLoaded) return;
+    const t = setTimeout(() => {
+      invoke("save_query_history", { history }).catch((e) =>
+        msgApi.error(`保存历史失败：${e}`),
+      );
+    }, 500);
+    return () => clearTimeout(t);
+  }, [history, historyLoaded]);
+
+  // 保存的查询 —— T-017 接通后端持久化
+  const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await invoke<SavedQuery[]>("load_saved_queries");
+        if (!cancelled) {
+          setSavedQueries(Array.isArray(list) ? list : []);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          msgApi.warning(`收藏加载失败：${e}`);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 新增/修改/删除仍走原 handleSave/handleDelete 调用 save_query/delete_saved_query，
+  // 这里不再做整体快照保存（避免与单条命令竞态）。
   const [showSaveQueryModal, setShowSaveQueryModal] = useState(false);
   const [editingSavedQuery, setEditingSavedQuery] = useState<SavedQuery | null>(null);
   

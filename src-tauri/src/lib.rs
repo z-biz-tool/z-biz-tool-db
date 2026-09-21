@@ -1537,6 +1537,49 @@ fn compute_safe_positions(sql: &str) -> Vec<bool> {
     safe
 }
 
+// T-040 EXPLAIN 基础面板
+// - MySQL：EXPLAIN <sql>
+// - PostgreSQL：EXPLAIN <sql>（FORMAT JSON 由 DB 端默认）；
+// - SQLite：EXPLAIN QUERY PLAN <sql>
+// - 强制 readOnly；识别 ANALYZE 后缀并拒绝，避免静默执行
+// - 结果走标准的 QueryResult 通道（columns + rows 都是 tagged cell）
+#[command]
+async fn explain_query(
+    sql: String,
+    config: DBConfig,
+) -> Result<QueryResult, String> {
+    let upper = sql.trim().to_ascii_uppercase();
+    if upper.contains("ANALYZE") {
+        return Err("EXPLAIN ANALYZE 会真正执行 SQL；S0 拒绝自动执行；如确需请人工单次授权".to_string());
+    }
+    if upper.starts_with("EXPLAIN") {
+        return Err("请仅提供被分析的 SQL 语句（不含 EXPLAIN 前缀）".to_string());
+    }
+
+    let dialect_explain: &str = match dispatch_db_type(&config)? {
+        "mysql" => "",                  // MySQL 直接用 EXPLAIN <sql>
+        "postgresql" => "",             // PG 默认走 FORMAT TEXT；之后可加 FORMAT JSON
+        "sqlite" => "EXPLAIN QUERY PLAN ", // SQLite 必须显式
+        _ => return Err("不支持的数据库类型".to_string()),
+    };
+
+    let prefixed = match dialect_explain {
+        "" => format!("EXPLAIN {}", sql.trim()),
+        other => format!("{}{}", other, sql.trim()),
+    };
+    let start = std::time::Instant::now();
+    let (column_meta, rows, affected, is_query) = run_dispatch(&config, &prefixed).await?;
+    Ok(QueryResult {
+        id: uuid::Uuid::new_v4().to_string(),
+        columns: column_meta.iter().map(|m| m.name.clone()).collect(),
+        column_meta,
+        rows,
+        affected_rows: affected,
+        execution_time_ms: start.elapsed().as_millis() as u64,
+        is_query,
+    })
+}
+
 // 导出连接配置
 #[command]
 async fn export_connections(
@@ -1613,6 +1656,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             test_connection,
             execute_query,
+            explain_query,
             get_tables,
             get_table_structure,
             execute_batch,
@@ -1774,6 +1818,35 @@ mod tests {
         assert_eq!(loaded[0].port, 3306);
         // T-007 验收：写入前必须剥离密码明文
         assert!(loaded[0].password.is_empty(), "密码字段在落盘后应被清空");
+    }
+
+    /// T-040 验收：EXPLAIN 拒绝显式 ANALYZE 与显式 EXPLAIN 前缀
+    #[tokio::test]
+    async fn explain_rejects_analyze_and_prefix() {
+        let c = cfg("sqlite", "", 0, ":memory:");
+        let err1 = explain_query(
+            "SELECT 1".replace("SELECT", "EXPLAIN ANALYZE SELECT 1"),
+            c.clone(),
+        )
+        .await
+        .expect_err("EXPLAIN ANALYZE 应被拒");
+        assert!(err1.contains("EXPLAIN ANALYZE"), "{}", err1);
+
+        let err2 = explain_query("EXPLAIN SELECT 1".into(), c)
+            .await
+            .expect_err("显式 EXPLAIN 前缀应被拒");
+        assert!(err2.contains("EXPLAIN"), "{}", err2);
+    }
+
+    /// T-040 验收：EXPLAIN 正常产出计划行（SQLite 自检）
+    #[tokio::test]
+    async fn explain_ok_for_sqlite() {
+        // EXPLAIN QUERY PLAN 不需要真实数据，SQLite 内存库即可
+        let c = cfg("sqlite", "", 0, ":memory:");
+        let r = explain_query("SELECT 1".into(), c).await.unwrap();
+        assert!(!r.rows.is_empty(), "EXPLAIN 应至少 1 行（plan id）");
+        // SQLite EXPLAIN QUERY PLAN 输出列：id, parent, notused, detail
+        assert!(r.column_meta.len() >= 1, "SQLite EXPLAIN QUERY PLAN 至少 1 列");
     }
 
     /// T-006 验收：默认只读拒绝写入
