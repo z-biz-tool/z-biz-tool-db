@@ -1948,6 +1948,92 @@ async fn import_connections(
     Ok(export.connections)
 }
 
+// T-047：CSV 预览
+// 返回前 N 行预览数据，包括编码检测、列头、行数据
+#[command]
+async fn csv_preview(
+    file_path: String,
+    delimiter: Option<String>,
+    limit: Option<usize>,
+) -> Result<db::csv_import::PreviewResult, String> {
+    let bytes = std::fs::read(&file_path)
+        .map_err(|e| format!("读取文件失败: {}", e))?;
+    let delim = delimiter
+        .map(|s| s.chars().next().unwrap_or(','))
+        .unwrap_or(',');
+    let lim = limit.unwrap_or(10);
+    db::csv_import::preview_csv(&bytes, delim, lim)
+}
+
+// T-047：CSV 导入（预览确认后调用）
+// 返回导入结果：成功行数、失败行数、错误信息
+#[command]
+async fn csv_import_execute(
+    config: DBConfig,
+    file_path: String,
+    table_name: String,
+    delimiter: Option<String>,
+    limit: Option<usize>,
+    dry_run: Option<bool>,
+) -> Result<db::csv_import::ImportResult, String> {
+    let bytes = std::fs::read(&file_path)
+        .map_err(|e| format!("读取文件失败: {}", e))?;
+    let delim = delimiter
+        .map(|s| s.chars().next().unwrap_or(','))
+        .unwrap_or(',');
+    let lim = limit.unwrap_or(1000);
+    let dry = dry_run.unwrap_or(false);
+    
+    let (headers, rows) = db::csv_import::parse_csv(&bytes, delim, lim)?;
+    
+    if headers.is_empty() {
+        return Err("CSV 文件没有列头".to_string());
+    }
+    
+    if dry {
+        return Ok(db::csv_import::ImportResult {
+            success: true,
+            rows_imported: 0,
+            rows_failed: 0,
+            errors: vec!["预览模式，未实际导入".to_string()],
+            preview: rows,
+        });
+    }
+    
+    // 构造 INSERT 语句（简化版：列名直接拼接）
+    let cols = headers.iter()
+        .map(|h| format!("\"{}\"", h.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    
+    let mut imported = 0u64;
+    let mut errors = Vec::new();
+    
+    for (idx, row) in rows.iter().enumerate() {
+        let values = row.iter()
+            .map(|v| if v.is_empty() || v == "NULL" { "NULL".to_string() } else { format!("'{}'", v.replace('\'', "''")) })
+            .collect::<Vec<_>>()
+            .join(", ");
+        
+        let sql = format!("INSERT INTO \"{}\" ({}) VALUES ({})", table_name, cols, values);
+        
+        match run_dispatch(&config, &sql).await {
+            Ok(_) => imported += 1,
+            Err(e) => {
+                errors.push(format!("第 {} 行: {}", idx + 2, e));
+            }
+        }
+    }
+    
+    Ok(db::csv_import::ImportResult {
+        success: errors.is_empty(),
+        rows_imported: imported,
+        rows_failed: errors.len() as u64,
+        errors,
+        preview: vec![],
+    })
+}
+
 // 连接配置落盘
 // T-053：保存连接时可携带 expected_revision 做 CAS；
 // 没有 expected_revision 时整体替换（向后兼容旧调用方）。
@@ -2093,6 +2179,8 @@ pub fn run() {
             agent_results_analyze,
             agent_error_diagnose,
             close_pool,
+            csv_preview,
+            csv_import_execute,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
