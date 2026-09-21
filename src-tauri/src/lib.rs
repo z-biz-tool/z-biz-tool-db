@@ -1170,6 +1170,130 @@ async fn execute_query(
     })
 }
 
+// T-019 v2 IPC：metadata_list_v2
+// 相比 get_tables：返回结构化 DbObjectRef + 缓存版本。
+// 旧 get_tables 保留做向后兼容；新调用方用 v2 路径。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DbObjectRefV2 {
+    pub schema: Option<String>,
+    pub name: String,
+    pub kind: String, // "table" | "view"
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MetadataListV2 {
+    pub objects: Vec<DbObjectRefV2>,
+    pub cache_version: String,
+}
+
+#[command]
+async fn metadata_list_v2(config: DBConfig) -> Result<MetadataListV2, String> {
+    let kind = dispatch_db_type(&config)?;
+    let mut objects = Vec::new();
+    match kind {
+        "postgresql" => {
+            let pool = pg_pool(&config).await?;
+            let rows = sqlx::query(
+                "SELECT n.nspname AS schema, c.relname AS name, c.relkind AS kind \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN ('r','v','p') \
+                   AND n.nspname NOT IN ('pg_catalog','information_schema') \
+                   AND n.nspname NOT LIKE 'pg_toast%' \
+                 ORDER BY n.nspname, c.relname",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            for r in &rows {
+                let schema: String = r.try_get("schema").unwrap_or_default();
+                let name: String = r.try_get("name").unwrap_or_default();
+                let k: String = r.try_get("kind").unwrap_or_else(|_| "r".to_string());
+                let kind_str = match k.as_str() {
+                    "v" => "view",
+                    _ => "table",
+                };
+                objects.push(DbObjectRefV2 {
+                    schema: Some(schema),
+                    name,
+                    kind: kind_str.to_string(),
+                });
+            }
+        }
+        "mysql" => {
+            let pool = mysql_pool(&config).await?;
+            let rows = sqlx::query(
+                "SELECT table_name AS name, table_type FROM information_schema.tables \
+                 WHERE table_schema = ? ORDER BY table_name",
+            )
+            .bind(&config.database)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            for r in &rows {
+                let name: String = r.try_get("name").unwrap_or_default();
+                let kind_str: String = r.try_get("table_type").unwrap_or_default();
+                let k = if kind_str.eq_ignore_ascii_case("view") {
+                    "view"
+                } else {
+                    "table"
+                };
+                objects.push(DbObjectRefV2 {
+                    schema: Some(config.database.clone()),
+                    name,
+                    kind: k.to_string(),
+                });
+            }
+        }
+        "sqlite" => {
+            let pool = sqlite_pool(&config).await?;
+            let rows = sqlx::query(
+                "SELECT type, name FROM sqlite_master \
+                 WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            for r in &rows {
+                let name: String = r.try_get("name").unwrap_or_default();
+                let t: String = r.try_get("type").unwrap_or_default();
+                objects.push(DbObjectRefV2 {
+                    schema: None,
+                    name,
+                    kind: t,
+                });
+            }
+        }
+        _ => return Err("不支持的数据库类型".to_string()),
+    }
+    // 缓存版本：当前时间秒 + 表数；后端可换成实际缓存 hash
+    let cache_version = format!("v{}-{}", chrono::Utc::now().timestamp(), objects.len());
+    Ok(MetadataListV2 { objects, cache_version })
+}
+
+// T-019 v2 IPC：query_status_v2
+// 接受 queryId 返回 InFlight 状态快照（暂只骨架，未与执行器绑活）
+#[command]
+async fn query_status_v2(query_id: String) -> Result<crate::db::cancel::CancelResponse, String> {
+    // 当前 InFlightRegistry 是每进程单例；S1 接入后将通过这里查询；
+    // 现在直接返回 cancelled accepted 状态机正在 pending。
+    Ok(crate::db::cancel::CancelResponse {
+        query_id,
+        state: crate::db::cancel::CancelState::Pending,
+        message: "v2 命令已注册；具体状态接入待 session actor 完成".to_string(),
+    })
+}
+
+// T-019 v2 IPC：query_cancel_v2
+#[command]
+async fn query_cancel_v2(query_id: String) -> Result<crate::db::cancel::CancelResponse, String> {
+    use crate::db::cancel::InFlightRegistry;
+    // 内部取全局注册：S1 拆出 static OnceLock 后可寻址
+    // 这里使用本地注册实例；生产应替换为全局唯一实例
+    static REG: std::sync::OnceLock<InFlightRegistry> = std::sync::OnceLock::new();
+    let reg = REG.get_or_init(InFlightRegistry::new);
+    Ok(reg.cancel(&query_id))
+}
+
 // 获取数据库表列表
 #[command]
 async fn get_tables(config: DBConfig) -> Result<Vec<TableInfo>, String> {
@@ -1697,9 +1821,12 @@ pub fn run() {
             execute_query,
             explain_query,
             get_tables,
+            metadata_list_v2,
             get_table_structure,
             execute_batch,
             format_sql,
+            query_status_v2,
+            query_cancel_v2,
             export_connections,
             import_connections,
             save_connections,
@@ -1858,6 +1985,31 @@ mod tests {
         assert_eq!(loaded[0].port, 3306);
         // T-007 验收：写入前必须剥离密码明文
         assert!(loaded[0].password.is_empty(), "密码字段在落盘后应被清空");
+    }
+
+    /// T-019 v2 IPC：metadata_list_v2 返回 DbObjectRefV2 列表
+    #[tokio::test]
+    async fn metadata_list_v2_ok_for_sqlite() {
+        let c = cfg("sqlite", "", 0, ":memory:");
+        let r = metadata_list_v2(c).await.expect("v2 元数据");
+        assert!(r.cache_version.starts_with("v"), "版本前缀 v: {}", r.cache_version);
+        // 空库：objects 应空，但 version 仍给出
+        assert!(r.objects.is_empty(), "空库应无对象");
+    }
+
+    /// T-019 v2 IPC：query_status_v2 返回 pending 骨架（待 session actor 接入真实状态）
+    #[tokio::test]
+    async fn query_status_v2_returns_skeleton() {
+        let resp = query_status_v2("demo-q".into()).await.expect("status");
+        assert_eq!(resp.query_id, "demo-q");
+        assert!(matches!(resp.state, crate::db::cancel::CancelState::Pending));
+    }
+
+    /// T-019 v2 IPC：query_cancel_v2 处理未知 id
+    #[tokio::test]
+    async fn query_cancel_v2_unknown_returns_not_found() {
+        let resp = query_cancel_v2("never-registered".into()).await.expect("cancel");
+        assert!(matches!(resp.state, crate::db::cancel::CancelState::NotFound));
     }
 
     /// T-040 验收：EXPLAIN 拒绝显式 ANALYZE 与显式 EXPLAIN 前缀
