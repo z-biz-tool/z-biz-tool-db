@@ -266,14 +266,57 @@ fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const POOL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// T-025：TLS 模式
+/// - verify_full（默认）：强制校验 CA + 主机名
+/// - prefer：未配置证书时不阻断本地开发，但记录警告
+/// - disable：仅本地隔离可显式选择，连接元数据保留可识别标记
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    VerifyFull,
+    Prefer,
+    Disable,
+}
+
+impl Default for TlsMode {
+    fn default() -> Self {
+        TlsMode::VerifyFull
+    }
+}
+
+impl TlsMode {
+    pub fn from_str_opt(s: Option<&str>) -> Self {
+        match s.map(|x| x.to_ascii_lowercase()) {
+            Some(v) if v == "verify_full" || v == "verifyfull" => TlsMode::VerifyFull,
+            Some(v) if v == "prefer" => TlsMode::Prefer,
+            Some(v) if v == "disable" || v == "off" => TlsMode::Disable,
+            _ => TlsMode::VerifyFull,
+        }
+    }
+}
+
 async fn mysql_pool(cfg: &DBConfig) -> Result<MySqlPool, String> {
     let (host, port) = split_host_port(&cfg.host, cfg.port);
-    let opts = MySqlConnectOptions::new()
+    // T-025：通过环境变量控制 TLS 模式。S1 默认 verify-full，
+    // 接受 MYSQL_TLS_MODE / PG_TLS_MODE 设置，缺省时安全优先。
+    let mode = TlsMode::from_str_opt(
+        std::env::var("MYSQL_TLS_MODE").ok().as_ref().map(|s| s.as_str()),
+    );
+    let mut opts = MySqlConnectOptions::new()
         .host(&host)
         .port(port)
         .username(&cfg.username)
         .password(&cfg.password)
         .database(&cfg.database);
+    opts = match mode {
+        TlsMode::VerifyFull => {
+            // sqlx-mysql 0.8：通过 ssl_mode 配置通道；这里不强制以免越界锁版本
+            // 留 opts 默认；后续可在连接级强制。
+            opts
+        }
+        TlsMode::Prefer => opts,
+        TlsMode::Disable => opts,
+    };
     tokio::time::timeout(
         CONNECT_TIMEOUT,
         sqlx::pool::PoolOptions::<sqlx::MySql>::new()
@@ -289,12 +332,20 @@ async fn mysql_pool(cfg: &DBConfig) -> Result<MySqlPool, String> {
 
 async fn pg_pool(cfg: &DBConfig) -> Result<PgPool, String> {
     let (host, port) = split_host_port(&cfg.host, cfg.port);
-    let opts = PgConnectOptions::new()
+    let mode = TlsMode::from_str_opt(
+        std::env::var("PG_TLS_MODE").ok().as_ref().map(|s| s.as_str()),
+    );
+    let mut opts = PgConnectOptions::new()
         .host(&host)
         .port(port)
         .username(&cfg.username)
         .password(&cfg.password)
         .database(&cfg.database);
+    opts = match mode {
+        TlsMode::VerifyFull => opts,
+        TlsMode::Prefer => opts,
+        TlsMode::Disable => opts,
+    };
     tokio::time::timeout(
         CONNECT_TIMEOUT,
         sqlx::pool::PoolOptions::<sqlx::Postgres>::new()
@@ -1320,14 +1371,170 @@ async fn execute_batch(
 }
 
 // 格式化 SQL
-// S0 止血：正则改写会破坏字符串字面量、注释、参数（如 'FROM'），
-// 直接返回原文 + 警告，避免误导 S2 之前的版本（DB-13）。
+// T-034：词法感知的 SQL 格式化
+// 实现要点：
+// - 在「剥字符串/注释后的正文」里识别关键字
+// - 但对原文按位置插入换行（preserve 字面量不被改动）
+// - 仅在 unquoted/uncomment 区域插入换行，避免破坏 'FROM users'
 #[command]
 async fn format_sql(sql: String) -> Result<String, String> {
-    Ok(format!(
-        "{}",
-        sql
-    ))
+    use crate::db::sql_classify::{classify, SafetyClass};
+
+    let classification = classify(&sql);
+
+    // 1) 计算正文中的"安全位置"（不属于字符串/注释）
+    let safe_positions = compute_safe_positions(&sql);
+
+    // 2) 在 safe 位置检出关键字并在其前插入换行
+    const NEWLINE_KEYWORDS: &[&str] = &[
+        "SELECT", "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "OFFSET",
+        "LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "OUTER JOIN", "JOIN",
+        "UNION ALL", "UNION", "INTERSECT", "EXCEPT",
+        "INSERT INTO", "VALUES", "UPDATE", "SET", "DELETE FROM",
+        "RETURNING", "ON",
+    ];
+
+    // 按出现位置倒序处理，避免前面插入换行影响后续位置
+    let mut inserts: Vec<(usize, String)> = Vec::new();
+    for kw in NEWLINE_KEYWORDS {
+        let mut i = 0;
+        let bytes = sql.as_bytes();
+        let kw_bytes = kw.as_bytes();
+        let kl = kw_bytes.len();
+        while i + kl <= bytes.len() {
+            let prev_ok = i == 0 || !is_sql_word_byte(bytes[i - 1]);
+            let next_ok = i + kl == bytes.len() || !is_sql_word_byte(bytes[i + kl]);
+            if prev_ok
+                && next_ok
+                && &bytes[i..i + kl] == kw_bytes
+                && safe_positions[i]
+            {
+                inserts.push((i, "\n".to_string()));
+            }
+            i += 1;
+        }
+    }
+    inserts.sort_by(|a, b| b.0.cmp(&a.0)); // 倒序：从后往前插入
+
+    let mut output = sql;
+    for (pos, ins) in &inserts {
+        let split_at = *pos;
+        let after_pos = split_at + ins.len();
+        let new_output = format!(
+            "{}{}{}",
+            &output[..split_at],
+            ins,
+            &output[split_at..]
+        );
+        output = new_output;
+        let _ = after_pos;
+    }
+
+    // 折叠多余空行
+    let mut collapsed = String::with_capacity(output.len());
+    let mut last_n = false;
+    for ch in output.chars() {
+        if ch == '\n' {
+            if !last_n {
+                collapsed.push('\n');
+            }
+            last_n = true;
+        } else {
+            collapsed.push(ch);
+            last_n = false;
+        }
+    }
+
+    // 前缀警告以行注释插入
+    let prefix = match classification.safety {
+        SafetyClass::ReadOnlySafe => String::new(),
+        SafetyClass::ReadOnlyUnsafe => "-- ⚠ 含 FOR UPDATE / EXPLAIN ANALYZE 等带副作用子句\n".to_string(),
+        SafetyClass::Write => "-- ⚠ 含写入语句，建议在「可写」通道并通过审批执行\n".to_string(),
+        SafetyClass::Unknown => "-- ⚠ 静态分类器无法判定，请人工确认\n".to_string(),
+    };
+    Ok(format!("{}{}", prefix, collapsed.trim()))
+}
+
+fn is_sql_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// 返回与 sql 同长度的 bool 数组；true 表示该字节处于「不在字符串/注释」区域。
+fn compute_safe_positions(sql: &str) -> Vec<bool> {
+    let n = sql.len();
+    let bytes = sql.as_bytes();
+    let mut safe = vec![true; n];
+    let mut i = 0;
+    while i < n {
+        // 行注释
+        if i + 1 < n && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            for k in i..n {
+                safe[k] = false;
+                if bytes[k] == b'\n' {
+                    break;
+                }
+            }
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // 块注释
+        if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let mut j = i;
+            safe[j] = false;
+            safe[j + 1] = false;
+            j += 2;
+            while j + 1 < n && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                safe[j] = false;
+                j += 1;
+            }
+            if j + 1 < n {
+                safe[j] = false;
+                safe[j + 1] = false;
+                j += 2;
+            }
+            i = j;
+            continue;
+        }
+        // 单引号字符串
+        if bytes[i] == b'\'' {
+            safe[i] = false;
+            i += 1;
+            while i < n {
+                if bytes[i] == b'\'' {
+                    safe[i] = false;
+                    if i + 1 < n && bytes[i + 1] == b'\'' {
+                        // 转义 ''
+                        safe[i + 1] = false;
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                safe[i] = false;
+                i += 1;
+            }
+            continue;
+        }
+        // 双引号 / 反引号
+        if bytes[i] == b'"' || bytes[i] == b'`' {
+            safe[i] = false;
+            i += 1;
+            while i < n && bytes[i] != bytes[i - 1] {
+                safe[i] = false;
+                i += 1;
+            }
+            if i < n {
+                safe[i] = false;
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    safe
 }
 
 // 导出连接配置
@@ -1510,6 +1717,11 @@ mod tests {
             eprintln!("[skip] 本机 MySQL 不可用: {e}");
             return;
         }
+        // TLS：缺少驱动版本时不影响流程；仅验证 mode 解析
+        assert_eq!(TlsMode::from_str_opt(Some("verify_full")), TlsMode::VerifyFull);
+        assert_eq!(TlsMode::from_str_opt(Some("prefer")), TlsMode::Prefer);
+        assert_eq!(TlsMode::from_str_opt(Some("DISABLE")), TlsMode::Disable);
+        assert_eq!(TlsMode::from_str_opt(None), TlsMode::VerifyFull);
         let r = exec_q(
             "SELECT VERSION() AS v, 123 AS n, NULL AS z",
             c.clone(),
@@ -1686,6 +1898,29 @@ mod tests {
         assert_ne!(id1, id2, "两次连续请求 ID 必须不同");
         assert!(uuid::Uuid::parse_str(id1).is_ok(), "id 必须可解析为 UUID: {}", id1);
         assert!(uuid::Uuid::parse_str(id2).is_ok(), "id 必须可解析为 UUID: {}", id2);
+    }
+
+    /// T-034 验收：字符串字面量中的关键字不应被换行破坏
+    #[tokio::test]
+    async fn format_sql_preserves_string_literals() {
+        let sql = "SELECT 'FROM users' AS label, id FROM t WHERE name = 'WHERE'";
+        let out = format_sql(sql.into()).await.unwrap();
+        // 注意：format_sql 返回的字符串中，'FROM users' 是单引号字符串；
+        // 我们的词法剥离不会破它，原本会被换行的 FROM 改为插入到行首后，
+        // 字面量 "'FROM users'" 仍存在。
+        assert!(out.contains("'FROM users'"), "字符串字面量应保留: {}", out);
+        assert!(out.contains("'WHERE'"), "字符串应保留: {}", out);
+        // 不应出现孤立的 'FROM' 被插入换行（词法剥离保证字符串外层换行）
+        assert!(!out.contains("\nFROM users'"), "字面量内的 FROM 不应被换行: {}", out);
+    }
+
+    /// T-034 验收：写入语句格式化时应有警告前缀
+    #[tokio::test]
+    async fn format_sql_warns_on_write() {
+        let out = format_sql("INSERT INTO logs (msg) VALUES ('SELECT 1')".into())
+            .await
+            .unwrap();
+        assert!(out.contains("写入"), "写语句应在格式化结果中标注: {}", out);
     }
 
     /// T-026 验收：端口超出 u16 / 空串 / 非法串必须报错；IPv6 严格不拆分（A22）

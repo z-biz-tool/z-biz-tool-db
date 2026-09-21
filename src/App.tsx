@@ -331,10 +331,14 @@ function App() {
     }
   };
 
-  // T-010 格式化：S0 停止使用正则改写字面量/注释/参数。
-  // 直接显示提示，等待 S2 词法感知格式化。
+  // T-010 + T-034 格式化：后端已升级为词法感知格式化（保留字符串字面量与注释）
   const formatSQL = async () => {
-    msgApi.warning("格式化升级中：S0 已停用正则改写，避免破坏字符串字面量与注释（DB-13）");
+    try {
+      const formatted = await invoke<string>("format_sql", { sql: sqlCode });
+      setSqlCode(formatted);
+    } catch (e: any) {
+      msgApi.error(`格式化失败: ${e}`);
+    }
   };
 
   // 复制

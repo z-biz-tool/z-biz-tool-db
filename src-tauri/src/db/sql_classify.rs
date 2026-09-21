@@ -46,7 +46,7 @@ pub struct Classification {
 
 /// 剥除 SQL 中的字符串字面量与注释，返回剩余正文（保留空白）。
 /// 行内注释 `-- ...` 直到换行；块注释 `/* ... */`；字符串 `'...'` 含两倍引号转义。
-fn strip_strings_and_comments(sql: &str) -> String {
+pub fn strip_strings_and_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
