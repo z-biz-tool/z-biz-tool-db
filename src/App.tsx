@@ -48,6 +48,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 // 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
 import { useAgentStore } from './agent/AgentManager';
+import AgentPanel from './agent/AgentPanel';
 
 // 渐变色主题常量
 const brandGradient = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
