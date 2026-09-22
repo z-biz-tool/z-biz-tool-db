@@ -14,19 +14,14 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// 引擎内部标量。边界处与 tagged-cell JSON 互转。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum Value {
+    #[default]
     Null,
     Int(i64),
     Float(f64),
     Text(String),
     Bool(bool),
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Value::Null
-    }
 }
 
 impl Value {
@@ -319,11 +314,6 @@ impl Parser {
     fn peek(&self) -> &Tok {
         self.toks.get(self.pos).unwrap_or(&Tok::Eof)
     }
-    fn bump(&mut self) -> Tok {
-        let t = self.peek().clone();
-        self.pos += 1;
-        t
-    }
     fn eat_ident_kw(&mut self, kw: &str) -> bool {
         if let Tok::Ident(s) = self.peek() {
             if s.eq_ignore_ascii_case(kw) {
@@ -586,7 +576,7 @@ pub fn parse_expr(src: &str, cols: &AllowedColumns) -> Result<Expr, String> {
     }
     let toks = tokenize(src)?;
     let mut p = Parser { toks, pos: 0 };
-    let e = p.parse_or(&cols)?;
+    let e = p.parse_or(cols)?;
     if !matches!(p.peek(), Tok::Eof) {
         return Err(format!("表达式尾部有多余内容: {:?}", p.peek()));
     }
@@ -828,12 +818,52 @@ fn cmp_eq(a: &Value, b: &Value) -> Value {
 }
 
 /// -1 / 0 / 1；None 表示不可比（含任一侧 NULL）
-fn ord_key(a: &Value, b: &Value) -> Option<i32> {
+pub fn ord_key(a: &Value, b: &Value) -> Option<i32> {
     compare(a, b).map(|o| match o {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     })
+}
+
+/// join 判等：任一侧 NULL 都不匹配（SQL 的 ON 语义）。
+pub fn join_eq(a: &Value, b: &Value) -> bool {
+    matches!(compare(a, b), Some(std::cmp::Ordering::Equal))
+}
+
+/// group by 判等：NULL 自成一组，因此 NULL == NULL 在这里为真。
+pub fn group_eq(a: &Value, b: &Value) -> bool {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => true,
+        (true, _) | (_, true) => false,
+        _ => matches!(compare(a, b), Some(std::cmp::Ordering::Equal)),
+    }
+}
+
+/// 粗分组用的桶键：同桶内再用 join_eq / group_eq 精判。
+/// Int(1) 与 Float(1.0) 必须落进同一个桶，所以数值统一按 f64 投影；
+/// 超过 2^53 的两个不同整数会撞桶，但精判会把它们分开，不影响正确性。
+pub fn bucket_of(v: &Value) -> String {
+    match v {
+        Value::Null => String::from("\0N"),
+        Value::Text(s) => {
+            let mut o = String::from("S");
+            o.push_str(s);
+            o
+        }
+        other => match other.as_f64() {
+            Some(f) => {
+                let mut o = String::from("#");
+                o.push_str(&format!("{:?}", f));
+                o
+            }
+            None => {
+                let mut o = String::from("T");
+                o.push_str(&other.as_text().unwrap_or_default());
+                o
+            }
+        },
+    }
 }
 
 fn eval_fn(
@@ -861,7 +891,7 @@ fn eval_fn(
                 None => return Ok(Value::Null),
             };
             let digits = arg(1).ok().and_then(|x| x.as_i64()).unwrap_or(0);
-            let d = digits.max(0).min(12) as u32;
+            let d = digits.clamp(0, 12) as u32;
             let p = 10f64.powi(d as i32);
             let scaled = v * p;
             // half-up（与 SQL 习惯一致，不用 Rust 的 half-even）
@@ -1061,10 +1091,10 @@ mod tests {
 
     #[test]
     fn coalesce_nullif_round() {
-        let r = row(&[("a", Value::Null), ("b", Value::Int(5)), ("f", Value::Float(3.14159))]);
+        let r = row(&[("a", Value::Null), ("b", Value::Int(5)), ("f", Value::Float(1.61803))]);
         assert_eq!(ev("COALESCE(a, b, 0)", &["a", "b", "f"], &r), Value::Int(5));
         assert_eq!(ev("NULLIF(b, 5)", &["a", "b", "f"], &r), Value::Null);
-        assert_eq!(ev("ROUND(f, 2)", &["a", "b", "f"], &r), Value::Float(3.14));
+        assert_eq!(ev("ROUND(f, 2)", &["a", "b", "f"], &r), Value::Float(1.62));
         assert_eq!(ev("ROUND(2.5, 0)", &[], &r), Value::Int(3)); // half-up
     }
 
