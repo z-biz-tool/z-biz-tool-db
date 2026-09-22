@@ -8,8 +8,24 @@
 //   3. 跨库联邦：每张表声明自己的 connection_id，按源拉数后内存 hash join
 //   4. AI 幻觉在求值前就被本地解析器挡掉（未知列 / 未知函数直接报错）
 
+pub mod ai;
 pub mod dataset;
 pub mod expr;
 pub mod source;
 pub mod table;
 pub mod view;
+
+use serde::{de, Deserialize};
+
+/// 枚举字面量按大小写不敏感反序列化。
+///
+/// 模型会写 "SUM"、"sum"、"Count_Distinct"、"left outer"，每种都值得收下：
+/// 一次不匹配就是一次重试往返，而重试是要花钱、要等网络的。
+pub(crate) fn de_ci<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr<Err = String>,
+{
+    let raw = String::deserialize(d)?;
+    raw.parse::<T>().map_err(de::Error::custom)
+}

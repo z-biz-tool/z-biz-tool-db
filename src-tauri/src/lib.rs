@@ -940,34 +940,8 @@ async fn save_ai_config(config: AIConfig) -> Result<(), String> {
 
 // 调用 AI 服务
 async fn call_ai_service(config: &AIConfig, prompt: &str) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    
-    let body = serde_json::json!({
-        "message": prompt,
-        "model": config.model
-    });
-    
-    let response = client
-        .post(format!("{}/chat/completions", config.base_url))
-        .bearer_auth(&config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("请求失败: {}", e))?;
-    
-    if response.status().is_success() {
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("解析响应失败: {}", e))?;
-        
-        json["choices"][0]["message"]["content"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| "响应格式错误".to_string())
-    } else {
-        Err(format!("AI 服务错误: {}", response.status()))
-    }
+    // 统一走 report::ai::chat：OpenAI 兼容的 messages 结构 + 超时 + 带状态码的报错。
+    report::ai::chat(config, prompt).await
 }
 
 // AI 生成 SQL（自然语言 → SQL）
@@ -2448,6 +2422,7 @@ pub fn run() {
             report::source::report_describe_columns,
             report::source::report_view_validate,
             report::source::report_view_render,
+            report::ai::ai_report_draft,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

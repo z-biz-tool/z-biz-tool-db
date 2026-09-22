@@ -60,7 +60,7 @@ impl DbSource {
             )
         })?;
         let real = dispatch_db_type(cfg)?;
-        if real != src.database_type {
+        if !src.database_type.trim().is_empty() && real != src.database_type {
             return Err(format!(
                 "源 {} 声明方言 {}，但连接 {} 实际是 {}，请修正数据集而不是连接",
                 src.alias, src.database_type, cfg.name, real
@@ -70,6 +70,30 @@ impl DbSource {
     }
 }
 
+/// 没写方言的 source 按连接真实方言回填。写错方言仍然报错——那通常是把 MySQL
+/// 的反引号写法带进了 SQLite 连接，静默改掉反而会让人查不出列为什么不存在。
+pub fn aligned(src: &SourceRef, real: &str) -> SourceRef {
+    if src.database_type.trim().is_empty() {
+        SourceRef { database_type: real.to_string(), ..src.clone() }
+    } else {
+        src.clone()
+    }
+}
+
+/// 命令层第一步：把省略了 database_type 的 source 按连接真实方言回填。
+/// 方言本来就是连接的属性，不该要求每个 spec（尤其是 AI 草稿）重抄一遍；
+/// 回填一次之后 plan / execute / previews 看到的是同一份方言，不会各猜各的。
+pub fn align_dialects(spec: &DatasetSpec, source: &DbSource) -> Result<DatasetSpec, String> {
+    let mut sources = spec.sources.clone();
+    for src in sources.iter_mut() {
+        if src.database_type.trim().is_empty() {
+            let (_, real) = source.resolve(src)?;
+            src.database_type = real.to_string();
+        }
+    }
+    Ok(DatasetSpec { sources, ..spec.clone() })
+}
+
 impl RowSource for DbSource {
     fn fetch<'a>(
         &'a self,
@@ -77,8 +101,8 @@ impl RowSource for DbSource {
         cap: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Table, String>> + Send + 'a>> {
         Box::pin(async move {
-            let (cfg, _) = self.resolve(src)?;
-            let sql = guarded_sql(src, cap)?;
+            let (cfg, real) = self.resolve(src)?;
+            let sql = guarded_sql(&aligned(src, real), cap)?;
             let (meta, rows, _, _) = run_dispatch(&cfg, &sql).await?;
             let columns: Vec<String> = meta.iter().map(|m| m.name.clone()).collect();
             Ok(dataset::table_from_tagged(&columns, &rows))
@@ -293,7 +317,7 @@ pub fn previews(spec: &DatasetSpec, source: &DbSource) -> Result<Vec<SqlPreview>
             connection_id: src.connection_id.clone(),
             connection_name: cfg.name.clone(),
             database_type: dialect.to_string(),
-            sql: guarded_sql(src, cap)?,
+            sql: guarded_sql(&aligned(src, dialect), cap)?,
         });
         seen.push(alias.to_string());
         Ok(())
@@ -331,6 +355,7 @@ pub async fn report_dataset_validate(
     schemas: Option<SchemaCache>,
 ) -> Result<ValidationReport, String> {
     let source = DbSource::new(&configs);
+    let spec = align_dialects(&spec, &source)?;
     let cache = build_schemas(&spec, &source, schemas.as_ref()).await?;
     let steps = dataset::validate_dataset(&spec, &cache)?;
     Ok(ValidationReport {
@@ -346,7 +371,9 @@ pub async fn report_dataset_sql(
     spec: DatasetSpec,
     configs: Vec<DBConfig>,
 ) -> Result<Vec<SqlPreview>, String> {
-    previews(&spec, &DbSource::new(&configs))
+    let source = DbSource::new(&configs);
+    let spec = align_dialects(&spec, &source)?;
+    previews(&spec, &source)
 }
 
 /// 校验 → 拉数 → 内存算子链，一次跑完
@@ -358,6 +385,7 @@ pub async fn report_dataset_execute(
 ) -> Result<DatasetPayload, String> {
     let start = std::time::Instant::now();
     let source = DbSource::new(&configs);
+    let spec = align_dialects(&spec, &source)?;
     let cache = build_schemas(&spec, &source, schemas.as_ref()).await?;
     let steps = dataset::validate_dataset(&spec, &cache)?;
     let sqls = previews(&spec, &source)?;
@@ -446,6 +474,7 @@ async fn run_datasets(
         if tables.contains_key(&ds.id) {
             return Err(format!("数据集 id {} 重复", ds.id));
         }
+        let ds = &align_dialects(ds, source)?;
         let owned = provided.and_then(|p| p.get(&ds.id));
         let cache = build_schemas(ds, source, owned).await?;
         let plan = dataset::plan_dataset(ds, &cache)?;
@@ -950,6 +979,97 @@ mod tests {
     }
 
     /// AI 编了个不存在的度量：报错要指名道姓，而不是回一张空图
+    /// 省略 database_type 的 spec（前端 designer 手搓、AI 只写三个字段）也要能跑，
+    /// 方言由连接真实值回填，而不是报一句看不懂的"声明方言 "。
+    #[tokio::test]
+    async fn omitted_dialect_is_filled_from_the_connection() {
+        let db = temp_db();
+        let cfg = sqlite_cfg("lite", &path_in(&db, "lite.sqlite"));
+        run_dispatch(&cfg, "CREATE TABLE t (id INTEGER, amount REAL)")
+            .await
+            .unwrap();
+        run_dispatch(&cfg, "INSERT INTO t VALUES (1, 12.5)").await.unwrap();
+        let mut s = src("t", "lite", "t");
+        s.database_type = String::new();
+        let spec = DatasetSpec {
+            id: "d".into(),
+            name: "d".into(),
+            base: "t".into(),
+            sources: vec![s],
+            ..DatasetSpec::new("d", "d", "t")
+        };
+        let source = DbSource::new(&[cfg]);
+        let payload = report_dataset_execute(spec.clone(), vec![sqlite_cfg("lite", &path_in(&db, "lite.sqlite"))], None)
+            .await
+            .unwrap();
+        assert_eq!(payload.row_count, 1);
+        let sqls = previews(&spec, &source).unwrap();
+        assert_eq!(sqls[0].database_type, "sqlite", "回显的方言必须是连接真实方言");
+        assert!(sqls[0].sql.starts_with("SELECT * FROM \"t\" LIMIT"), "{}", sqls[0].sql);
+    }
+
+    /// 全链路收口：模型只写 alias/connection_id/table（不带方言、不带列清单），
+    /// 本地校验补全后直接喂给真实的两文件跨库渲染。
+    #[tokio::test]
+    async fn ai_draft_feeds_a_real_cross_db_render() {
+        use crate::report::ai::{self, CatalogTable};
+        let db = temp_db();
+        let (shop, crm) = seed_shop_crm(&db).await;
+        let catalog = vec![
+            CatalogTable {
+                connection_id: "shop".into(),
+                connection_name: "商城库".into(),
+                database_type: "sqlite".into(),
+                schema: String::new(),
+                table: "orders".into(),
+                columns: vec!["id".into(), "user_id".into(), "amount".into(), "status".into()],
+            },
+            CatalogTable {
+                connection_id: "crm".into(),
+                connection_name: "客户库".into(),
+                database_type: "sqlite".into(),
+                schema: String::new(),
+                table: "users".into(),
+                columns: vec!["id".into(), "city".into()],
+            },
+        ];
+        let raw = r#"好的，这是你要的看板：
+        ```json
+        {"datasets":[{"id":"city-gmv","name":"城市成交额","base":"o",
+          "sources":[{"alias":"o","connection_id":"shop","table":"orders"},
+                     {"alias":"u","connection_id":"crm","table":"users"}],
+          "joins":[{"source":"u","on":[{"left":"user_id","right":"id"}]}],
+          "filters":["status = 'paid'"],"group_by":["city"],
+          "aggregates":[{"output":"gmv","func":"SUM","column":"amount"}],
+          "sort":[{"column":"gmv","desc":true}]}],
+         "view":{"id":"board","name":"成交看板","widgets":[
+           {"id":"kpi","type":"KPI","title":"总成交额","dataset":"city-gmv","encode":{"y":"gmv"}},
+           {"id":"bar","type":"BAR","title":"分城市","dataset":"city-gmv","encode":{"x":"city","y":"gmv"}}
+         ]}}
+        ```
+        希望有帮助。"#;
+        let draft = ai::check_draft(ai::parse_draft(raw).unwrap(), &catalog).unwrap();
+        assert_eq!(draft.datasets[0].sources[1].database_type, "sqlite");
+        assert_eq!(draft.columns["city-gmv"], vec!["city", "gmv"]);
+
+        let payload = report_view_render(
+            draft.view,
+            draft.datasets,
+            vec![shop, crm],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!payload.partial);
+        assert_eq!(payload.charts[0].value, Some(Value::Float(300.0)));
+        assert_eq!(
+            payload.charts[1].categories,
+            vec!["SH".to_string(), "BJ".into(), "SZ".into()]
+        );
+        // 两个库各一条源 SQL，模型从没写过任何 SQL
+        assert_eq!(payload.generated_sql.len(), 2);
+    }
+
     #[tokio::test]
     async fn report_view_names_the_hallucinated_field() {
         let db = temp_db();

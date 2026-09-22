@@ -365,11 +365,21 @@ impl AggFunc {
     }
 }
 
+/// JSON 里聚合函数名交给 [`parse`]，所以 "SUM" / "sum" / "countd" 都能落回同一个算子。
+impl std::str::FromStr for AggFunc {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        AggFunc::parse(s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AggSpec {
     pub output: String,
+    #[serde(deserialize_with = "super::de_ci")]
     pub func: AggFunc,
     /// None 表示 `COUNT(*)`
+    #[serde(default)]
     pub column: Option<String>,
 }
 

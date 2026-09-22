@@ -35,6 +35,25 @@ pub enum ChartType {
     Kpi,
 }
 
+/// 图表类型字面量大小写不敏感，且接受 AI 爱写的别名。
+impl std::str::FromStr for ChartType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let norm = s.trim().to_ascii_uppercase().replace([' ', '_'], "");
+        match norm.as_str() {
+            "LINE" | "LINECHART" => Ok(ChartType::Line),
+            "BAR" | "BARCHART" | "COLUMN" => Ok(ChartType::Bar),
+            "PIE" | "PIECHART" | "DONUT" => Ok(ChartType::Pie),
+            "TABLE" | "GRID" | "DETAIL" => Ok(ChartType::Table),
+            "KPI" | "KPICARD" | "NUMBER" => Ok(ChartType::Kpi),
+            other => Err(format!(
+                "不支持的图表类型 {}（可选 LINE / BAR / PIE / TABLE / KPI）",
+                other
+            )),
+        }
+    }
+}
+
 impl ChartType {
     /// 是否需要一个度量列（KPI 例外：COUNT 时可以没有列）
     pub fn needs_measure(self) -> bool {
@@ -63,6 +82,27 @@ pub enum AggType {
     Avg,
     Min,
     Max,
+}
+
+/// 聚合字面量大小写不敏感，且接受 COUNTD / MEAN 这类 BI 工具写法。
+impl std::str::FromStr for AggType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let norm = s.trim().to_ascii_uppercase().replace([' ', '_'], "");
+        match norm.as_str() {
+            "" | "RAW" | "NONE" | "NONE_AGG" => Ok(AggType::Raw),
+            "SUM" => Ok(AggType::Sum),
+            "COUNT" => Ok(AggType::Count),
+            "COUNTDISTINCT" | "COUNTD" => Ok(AggType::CountDistinct),
+            "AVG" | "MEAN" => Ok(AggType::Avg),
+            "MIN" => Ok(AggType::Min),
+            "MAX" => Ok(AggType::Max),
+            other => Err(format!(
+                "不支持的聚合 {}（可选 RAW / SUM / COUNT / COUNT_DISTINCT / AVG / MIN / MAX）",
+                other
+            )),
+        }
+    }
 }
 
 impl AggType {
@@ -126,7 +166,7 @@ impl WidgetEncode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WidgetSpec {
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "super::de_ci")]
     pub kind: ChartType,
     #[serde(default)]
     pub title: String,
@@ -134,7 +174,7 @@ pub struct WidgetSpec {
     pub dataset: String,
     #[serde(default)]
     pub encode: WidgetEncode,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::de_ci")]
     pub agg: AggType,
     /// 组件级过滤：作用在数据集输出之上，语义与数据集过滤完全一致（三值逻辑）
     #[serde(default)]

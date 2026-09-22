@@ -33,7 +33,9 @@ pub struct SourceRef {
     /// spec 内的唯一别名，join 与字段引用都以它定位
     pub alias: String,
     pub connection_id: String,
-    /// mysql | postgresql | sqlite
+    /// mysql | postgresql | sqlite。可以省略：报表链路会按连接实际方言回填，
+    /// 直接调用 report_dataset_* 时缺省会由 source_sql 报"方言不受支持"。
+    #[serde(default)]
     pub database_type: String,
     #[serde(default)]
     pub schema: String,
@@ -58,11 +60,23 @@ pub enum JoinKind {
     Left,
 }
 
+/// 模型会写 "inner" / "LEFT OUTER" / "Join"，全部按同一种连接收下来。
+impl std::str::FromStr for JoinKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_uppercase().replace(' ', "").as_str() {
+            "INNER" | "JOIN" | "INNERJOIN" => Ok(JoinKind::Inner),
+            "LEFT" | "LEFTJOIN" | "LEFTOUTER" | "OUTERLEFT" => Ok(JoinKind::Left),
+            other => Err(format!("不支持的连接类型 {}（可选 INNER / LEFT）", other)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JoinSpec {
     pub source: String,
     pub on: Vec<JoinPair>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::de_ci")]
     pub kind: JoinKind,
 }
 
