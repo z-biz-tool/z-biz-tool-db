@@ -54,8 +54,9 @@ jobs:
         run: |
           cargo test --lib
           cargo test --test test_sqlite
-          # MySQL/PG 集成需要 docker，留给手动/CI 阶段（标记 ignored）
-          cargo test --lib -- --ignored --no-run
+          # MySQL/PG 集成测试需要 docker，标了 #[ignore]，只在手动跑
+          # （--no-run 是 cargo 级参数，放在 `--` 后 libtest 会报 Unrecognized option）
+          cargo test --lib --no-run
 
   build:
     needs: test
