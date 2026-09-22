@@ -445,7 +445,36 @@ pub struct ViewPayload {
     pub elapsed_ms: u64,
 }
 
-/// 逐个数据集：探查列 → 出计划 → 执行。返回计划、结果表与生成的 SQL。
+/// 回填方言 → 探列 → 出计划，一行数据都不取。返回（数据集 id → 输出列、
+/// 源 SQL、按连接真实方言补齐后的 spec）。
+/// 校验只需要这三样：让"检查字段"顺手扫一遍库，是白付一次跨库取数。
+async fn plan_datasets(
+    datasets: &[DatasetSpec],
+    source: &DbSource,
+    provided: Option<&HashMap<String, SchemaCache>>,
+) -> Result<(HashMap<String, Vec<String>>, Vec<SqlPreview>, Vec<DatasetSpec>), String> {
+    let mut cols: HashMap<String, Vec<String>> = HashMap::new();
+    let mut sqls: Vec<SqlPreview> = Vec::new();
+    let mut aligned: Vec<DatasetSpec> = Vec::new();
+    for ds in datasets {
+        if ds.id.trim().is_empty() {
+            return Err("数据集缺少 id".into());
+        }
+        if cols.contains_key(&ds.id) {
+            return Err(format!("数据集 id {} 重复", ds.id));
+        }
+        let ds = align_dialects(ds, source)?;
+        let owned = provided.and_then(|p| p.get(&ds.id));
+        let cache = build_schemas(&ds, source, owned).await?;
+        let plan = dataset::plan_dataset(&ds, &cache)?;
+        sqls.extend(previews(&ds, source)?);
+        cols.insert(ds.id.clone(), plan.columns);
+        aligned.push(ds);
+    }
+    Ok((cols, sqls, aligned))
+}
+
+/// 逐个数据集：先出计划，再真取数。返回计划、结果表与生成的 SQL。
 /// 计划里的列清单与结果表的列清单同源（plan_dataset 有回归测试锁住），
 /// 所以视图校验报错指向的列一定是用户看得见的列。
 async fn run_datasets(
@@ -463,31 +492,18 @@ async fn run_datasets(
     String,
 > {
     let mut tables: HashMap<String, Table> = HashMap::new();
-    let mut cols: HashMap<String, Vec<String>> = HashMap::new();
+    let (cols, sqls, aligned) = plan_datasets(datasets, source, provided).await?;
     let mut stats: Vec<DatasetRunStat> = Vec::new();
-    let mut sqls: Vec<SqlPreview> = Vec::new();
     let mut partial = false;
-    for ds in datasets {
-        if ds.id.trim().is_empty() {
-            return Err("数据集缺少 id".into());
-        }
-        if tables.contains_key(&ds.id) {
-            return Err(format!("数据集 id {} 重复", ds.id));
-        }
-        let ds = &align_dialects(ds, source)?;
-        let owned = provided.and_then(|p| p.get(&ds.id));
-        let cache = build_schemas(ds, source, owned).await?;
-        let plan = dataset::plan_dataset(ds, &cache)?;
+    for ds in &aligned {
         let start = std::time::Instant::now();
         let run = dataset::execute_dataset(ds, source).await?;
-        sqls.extend(previews(ds, source)?);
         partial |= run.is_partial();
-        cols.insert(ds.id.clone(), plan.columns.clone());
         stats.push(DatasetRunStat {
             id: ds.id.clone(),
             name: ds.name.clone(),
             rows: run.table.len(),
-            columns: plan.columns,
+            columns: cols[&ds.id].clone(),
             truncated: run.truncated.clone(),
             partial: run.is_partial(),
             elapsed_ms: start.elapsed().as_millis() as u64,
@@ -506,7 +522,7 @@ pub async fn report_view_validate(
     schemas: Option<HashMap<String, SchemaCache>>,
 ) -> Result<ValidationReport, String> {
     let source = DbSource::new(&configs);
-    let (_, cols, _, sqls, _) = run_datasets(&datasets, &source, schemas.as_ref()).await?;
+    let (cols, sqls, _) = plan_datasets(&datasets, &source, schemas.as_ref()).await?;
     let steps = view::validate_view(&view, &cols)?;
     Ok(ValidationReport {
         steps,
