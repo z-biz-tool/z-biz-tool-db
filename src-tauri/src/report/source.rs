@@ -974,8 +974,14 @@ mod tests {
         for pair in payload.layout.windows(2) {
             assert!(pair[0].y + pair[0].h <= pair[1].y, "{:?}", payload.layout);
         }
-        // 前端要能直接吃到这个结构，序列化不能失败
-        serde_json::to_string(&payload).expect("ViewPayload 可序列化");
+        // 前端要能直接吃这个结构：值必须是标量，不能是 {"Float":150.0} 这种外部标签
+        let wire = serde_json::to_value(&payload).expect("ViewPayload 可序列化");
+        assert_eq!(wire["charts"][0]["value"], serde_json::json!(300.0));
+        assert_eq!(
+            wire["charts"][1]["series"][0]["values"],
+            serde_json::json!([150.0, 80.0, 70.0])
+        );
+        assert_eq!(wire["charts"][2]["rows"][0][0], serde_json::json!(5));
     }
 
     /// AI 编了个不存在的度量：报错要指名道姓，而不是回一张空图

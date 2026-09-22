@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// 引擎内部标量。边界处与 tagged-cell JSON 互转。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum Value {
     #[default]
     Null,
@@ -108,6 +108,20 @@ impl Value {
             // 对象/数组视为文本（tagged cell 在入口已拆包）
             other => Value::Text(other.to_string()),
         }
+    }
+}
+
+// 上线形状就是 JSON 标量，不是 derive 出来的 {"Int":3}：图表值要直接喂给
+// 前端画图，多包一层等于在每个消费点重写一次拆包。
+impl Serialize for Value {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.to_json().serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Value::from_json(&serde_json::Value::deserialize(d)?))
     }
 }
 
@@ -1269,5 +1283,29 @@ mod tests {
         assert_eq!(ev("'10' < '9'", &["s", "n"], &r), Value::Bool(true));
         // 数值优先：两侧都能数值化才按数值比
         assert_eq!(ev("n = 5", &["s", "n"], &r), Value::Bool(true));
+    }
+
+    #[test]
+    fn value_crosses_the_ipc_boundary_as_a_plain_scalar() {
+        // 前端拿到的必须是 300 而不是 {"Int":300}
+        assert_eq!(serde_json::to_string(&Value::Int(300)).unwrap(), "300");
+        assert_eq!(serde_json::to_string(&Value::Text("SH".into())).unwrap(), "\"SH\"");
+        assert_eq!(serde_json::to_string(&Value::Bool(true)).unwrap(), "true");
+        assert_eq!(serde_json::to_string(&Value::Null).unwrap(), "null");
+        // 超出 JS 精确整数域时降文本，这是 to_json 既有的取舍
+        assert_eq!(
+            serde_json::to_string(&Value::Int(9007199254740993)).unwrap(),
+            "\"9007199254740993\""
+        );
+        for v in [
+            Value::Int(-7),
+            Value::Float(1.5),
+            Value::Text("1月".into()),
+            Value::Bool(false),
+            Value::Null,
+        ] {
+            let j = serde_json::to_string(&v).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&j).unwrap(), v, "{}", j);
+        }
     }
 }
