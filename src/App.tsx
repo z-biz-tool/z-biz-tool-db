@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import SqlEditor from "./components/SqlEditor";
 import {
   ConfigProvider,
@@ -22,6 +22,7 @@ import {
   Typography,
   Alert,
   Spin,
+  Segmented,
 } from "antd";
 import {
   buildGrant,
@@ -63,11 +64,13 @@ import {
   BulbOutlined,
   SnippetsOutlined,
   SearchOutlined,
+  DashboardOutlined,
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 // 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
 import { useAgentStore } from './agent/AgentManager';
 import AgentPanel from './agent/AgentPanel';
+import { ReportWorkbench } from "./report/ReportWorkbench";
 
 // 渐变色主题常量
 const brandGradient = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
@@ -332,6 +335,9 @@ function App() {
   const [showAiConfigModal, setShowAiConfigModal] = useState(false);
   const [aiForm] = Form.useForm();
 
+  // 工作模式：SQL 查询 / AI 报表工作台
+  const [mode, setMode] = useState<"sql" | "report">("sql");
+
   // T-045 写入审批状态
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [pendingGrant, setPendingGrant] = useState<ApprovalGrant | null>(null);
@@ -502,6 +508,17 @@ function App() {
     password: c.password,
     database: c.database,
   });
+
+  // 报表工作台要一次拿到所有连接的凭据（跨库 join 的每个源各自定位连接）。
+  // 必须 memo：workbench 以 configs 为依赖去拉表清单，每次渲染换引用就会狂刷库。
+  const backendConfigs = useMemo(
+    () => connections.map((c) => toBackendConfig(c)),
+    [connections],
+  );
+  const aiConfigForReport = useMemo(
+    () => ({ base_url: aiConfig.baseUrl, api_key: aiConfig.apiKey, model: aiConfig.model }),
+    [aiConfig],
+  );
 
   // 连接配置落盘
   const persistConnections = (list: DBConnection[]) => {
@@ -1027,7 +1044,7 @@ function App() {
             <strong style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>数据库连接</strong>
           </div>
           <div style={{ padding: "8px" }}>
-            <Space direction="vertical" style={{ width: "100%" }}>
+            <Space orientation="vertical" style={{ width: "100%" }}>
               <Button
                 type="primary"
                 icon={<PlusOutlined />}
@@ -1115,6 +1132,14 @@ function App() {
             }}
           >
             <Space>
+              <Segmented
+                value={mode}
+                onChange={(v) => setMode(v as "sql" | "report")}
+                options={[
+                  { label: "SQL 查询", value: "sql", icon: <CodeOutlined /> },
+                  { label: "AI 报表", value: "report", icon: <DashboardOutlined /> },
+                ]}
+              />
               {isConnected && selectedConnection && (
                 <>
                   <Tag color="green">已连接</Tag>
@@ -1153,7 +1178,15 @@ function App() {
             </Space>
           </Header>
           <Content style={{ display: "flex", flexDirection: "column" }}>
-            {isConnected ? (
+            {mode === "report" ? (
+              <div style={{ flex: 1, minHeight: 0 }}>
+                <ReportWorkbench
+                  configs={backendConfigs}
+                  aiConfig={aiConfigForReport}
+                  onOpenAiSettings={() => setShowAiConfigModal(true)}
+                />
+              </div>
+            ) : isConnected ? (
               <>
                 {/* 多标签页 */}
                 <div 
@@ -1220,7 +1253,7 @@ function App() {
                             }
                           }}
                         >
-                          <Space direction="vertical" size={0}>
+                          <Space orientation="vertical" size={0}>
                             <strong>{t.name}</strong>
                             <Text type="secondary" style={{ fontSize: 11 }}>
                               ~{t.row_estimate} 行 · {((t.size_bytes || 0) / 1024).toFixed(0)} KB
@@ -1430,7 +1463,7 @@ function App() {
                                     (e.currentTarget as HTMLElement).style.background = "transparent";
                                   }}
                                 >
-                                  <Space direction="vertical" size={2} style={{ width: "100%" }}>
+                                  <Space orientation="vertical" size={2} style={{ width: "100%" }}>
                                     <Space style={{ width: "100%", justifyContent: "space-between" }}>
                                       <Tag color={h.success ? "success" : "error"} style={{ margin: 0 }}>
                                         {h.execution_time_ms}ms
@@ -1470,7 +1503,7 @@ function App() {
                                     (e.currentTarget as HTMLElement).style.background = "transparent";
                                   }}
                                 >
-                                  <Space direction="vertical" size={2} style={{ width: "100%" }}>
+                                  <Space orientation="vertical" size={2} style={{ width: "100%" }}>
                                     <Space style={{ width: "100%", justifyContent: "space-between" }}>
                                       <strong style={{ fontSize: 13 }}>{q.name}</strong>
                                       <Space size={4}>
@@ -1676,7 +1709,7 @@ function App() {
           initialValues={aiConfig}
         >
           <Alert 
-            message="AI 助手功能" 
+            title="AI 助手功能" 
             description="配置 AI 服务参数后，可使用自然语言生成 SQL、SQL 优化、错误诊断等功能。"
             type="info"
             style={{ marginBottom: 16 }}
@@ -1850,7 +1883,7 @@ function App() {
               children: (
                 <div style={{ marginTop: 16 }}>
                   <Alert
-                    message="提示"
+                    title="提示"
                     description="执行查询后，可使用此功能分析查询结果"
                     type="info"
                     style={{ marginBottom: 16 }}
@@ -1916,11 +1949,11 @@ function App() {
         width={640}
       >
         {pendingApproval && (
-          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
             <Alert
               type="warning"
               showIcon
-              message="此 SQL 包含写入/危险子句，需要显式审批"
+              title="此 SQL 包含写入/危险子句，需要显式审批"
               description={
                 <span>
                   环境：
@@ -1958,13 +1991,13 @@ function App() {
         width={720}
       >
         {importError ? (
-          <Alert type="error" showIcon message="导入校验失败" description={importError} />
+          <Alert type="error" showIcon title="导入校验失败" description={importError} />
         ) : (
-          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
             <Alert
               type="info"
               showIcon
-              message={`将导入 ${importPreview.length} 条连接`}
+              title={`将导入 ${importPreview.length} 条连接`}
               description="导入的连接不携带密码；如有重名会自动追加 (导入) 后缀。"
             />
             <Table

@@ -1,0 +1,206 @@
+// 报表语义层的前端类型：与 src-tauri/src/report/{dataset,view,source,ai}.rs 的
+// serde 结构一一对应。后端没有做 camelCase 重命名，所以这里保持 snake_case，
+// 前端拿到的就是线上形状，不做任何"猜字段"。
+
+export type Scalar = string | number | boolean | null;
+
+/** 数据集聚合函数（后端 AggFunc；反序列化大小写不敏感） */
+export type AggFuncName = "Count" | "CountDistinct" | "Sum" | "Avg" | "Min" | "Max";
+export type JoinKindName = "Inner" | "Left";
+/** 组件图表类型（后端 ChartType，序列化为大写） */
+export type ChartKind = "LINE" | "BAR" | "PIE" | "TABLE" | "KPI";
+/** 组件级聚合（后端 AggType）；RAW = 不聚合，按数据集原样画 */
+export type WidgetAgg = "RAW" | "SUM" | "COUNT" | "COUNT_DISTINCT" | "AVG" | "MIN" | "MAX";
+
+export interface SourceRef {
+  alias: string;
+  connection_id: string;
+  /** 可省略：报表链路会按连接真实方言回填 */
+  database_type?: string;
+  schema?: string;
+  table: string;
+  /** 空 = SELECT * */
+  columns?: string[];
+}
+
+export interface JoinPair {
+  left: string;
+  right: string;
+}
+
+export interface JoinSpec {
+  source: string;
+  on: JoinPair[];
+  kind?: JoinKindName;
+}
+
+export interface ComputedSpec {
+  name: string;
+  expr: string;
+}
+
+export interface AggSpec {
+  output: string;
+  func: AggFuncName;
+  /** 省略表示 COUNT(*) */
+  column?: string | null;
+}
+
+export interface SortDir {
+  column: string;
+  desc?: boolean;
+}
+
+export interface DatasetSpec {
+  id: string;
+  name: string;
+  /** 基表别名，必须是 sources 之一 */
+  base: string;
+  sources: SourceRef[];
+  joins?: JoinSpec[];
+  filters?: string[];
+  computed?: ComputedSpec[];
+  group_by?: string[];
+  aggregates?: AggSpec[];
+  post_computed?: ComputedSpec[];
+  fields?: string[];
+  sort?: SortDir[];
+  limit?: number | null;
+  /** 单个源的取数硬闸；撞闸会标 partial */
+  max_rows?: number | null;
+}
+
+export interface WidgetEncode {
+  x?: string | null;
+  y?: string | null;
+  series?: string | null;
+  category?: string | null;
+  value?: string | null;
+  columns?: string[];
+}
+
+export interface WidgetSpec {
+  id: string;
+  type: ChartKind;
+  title?: string;
+  dataset: string;
+  encode?: WidgetEncode;
+  agg?: WidgetAgg;
+  filters?: string[];
+  limit?: number | null;
+}
+
+export interface WidgetLayout {
+  widget: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface ViewSpec {
+  id: string;
+  name: string;
+  version?: number;
+  widgets: WidgetSpec[];
+  /** 留空则自动纵向堆叠 */
+  layout?: WidgetLayout[];
+}
+
+export interface SqlPreview {
+  dataset: string;
+  alias: string;
+  connection_id: string;
+  connection_name: string;
+  database_type: string;
+  sql: string;
+}
+
+export interface ValidationReport {
+  steps: string[];
+  sqls: SqlPreview[];
+  /** 数据集 id → 输出列 */
+  schemas: Record<string, string[]>;
+}
+
+export interface SourceRowStat {
+  alias: string;
+  rows: number;
+}
+
+export interface DatasetPayload {
+  columns: string[];
+  rows: Scalar[][];
+  row_count: number;
+  source_rows: SourceRowStat[];
+  /** 撞上 max_rows 的源别名 */
+  truncated: string[];
+  partial: boolean;
+  generated_sql: SqlPreview[];
+  steps: string[];
+  elapsed_ms: number;
+}
+
+export interface DatasetRunStat {
+  id: string;
+  name: string;
+  rows: number;
+  columns: string[];
+  truncated: string[];
+  partial: boolean;
+  elapsed_ms: number;
+}
+
+export interface Series {
+  name: string;
+  values: Scalar[];
+}
+
+export interface ChartData {
+  widget: string;
+  kind: ChartKind;
+  title: string;
+  categories: string[];
+  series: Series[];
+  columns: string[];
+  rows: Scalar[][];
+  /** KPI 的单个标量 */
+  value: Scalar;
+  row_count: number;
+  warnings: string[];
+}
+
+export interface ViewPayload {
+  steps: string[];
+  layout: WidgetLayout[];
+  charts: ChartData[];
+  datasets: DatasetRunStat[];
+  generated_sql: SqlPreview[];
+  partial: boolean;
+  elapsed_ms: number;
+}
+
+/** 喂给模型的目录：只有结构信息，没有任何连接凭据 */
+export interface CatalogTable {
+  connection_id: string;
+  connection_name?: string;
+  database_type: string;
+  schema?: string;
+  table: string;
+  columns: string[];
+}
+
+export interface ReportDraft {
+  datasets: DatasetSpec[];
+  view: ViewSpec;
+}
+
+export interface DraftResult {
+  datasets: DatasetSpec[];
+  view: ViewSpec;
+  steps: string[];
+  columns: Record<string, string[]>;
+  warnings: string[];
+  /** 模型被本机校验打回了几次 */
+  repairs: number;
+}
