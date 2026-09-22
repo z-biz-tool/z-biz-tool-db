@@ -506,7 +506,10 @@ fn numericize(vals: &[Value], warnings: &mut Vec<String>, col: &str) -> Vec<Valu
 
 /// 把 (分类, 系列, 度量) 三元组摊成 categories + 多条 series。
 /// 同一格出现多次时后写的覆盖前写的，并明确告警——静默平均或静默丢弃都会骗人。
-fn pivot(rows: &Table, x: &str, series: Option<&str>, measure: &str, out: &mut ChartData) {
+/// `no_series_label` 是"没有系列列"时那条系列的显示名。
+/// 内部仍然用 "-" 占一个系列桶，但系列名是给 tooltip / 图例看的，
+/// 写 "-" 等于把 "SUM(gmv)" 这个口径信息丢掉。
+fn pivot(rows: &Table, x: &str, series: Option<&str>, measure: &str, no_series_label: &str, out: &mut ChartData) {
     let xs: Vec<String> = rows.column_values(x).iter().map(label).collect();
     let sy: Vec<String> = match series {
         Some(s) => rows.column_values(s).iter().map(label).collect(),
@@ -554,6 +557,13 @@ fn pivot(rows: &Table, x: &str, series: Option<&str>, measure: &str, out: &mut C
     }
     out.series = names
         .into_iter()
+        .map(|n| {
+            if series.is_none() {
+                no_series_label.to_string()
+            } else {
+                n
+            }
+        })
         .zip(grid)
         .map(|(name, values)| Series { name, values })
         .collect();
@@ -647,15 +657,27 @@ pub fn render_widget(w: &WidgetSpec, table: &Table) -> Result<ChartData, String>
         measure.clone()
     };
     out.row_count = rows.len();
+    // 系列名 = 口径名，图例/tooltip 直接可读；聚合过就写成 SUM(gmv)
+    let measure_label = match agg {
+        AggType::Raw => measure.clone(),
+        other => format!("{}({})", agg_name(other), measure),
+    };
     if w.kind == ChartType::Pie {
         out.categories = rows.column_values(&x).iter().map(label).collect();
         let vals = numericize(&rows.column_values(&measure_col), &mut out.warnings, &measure);
         out.series = vec![Series {
-            name: out.title.clone(),
+            name: measure_label.clone(),
             values: vals,
         }];
     } else {
-        pivot(&rows, &x, series.as_deref(), &measure_col, &mut out);
+        pivot(
+            &rows,
+            &x,
+            series.as_deref(),
+            &measure_col,
+            &measure_label,
+            &mut out,
+        );
     }
     Ok(out)
 }
@@ -899,6 +921,37 @@ mod tests {
         let c = render_widget(&w, &monthly()).unwrap();
         assert_eq!(c.categories, vec!["1月", "2月"]);
         assert_eq!(c.series[0].values, vec![Value::Float(130.0), Value::Float(160.0)]);
+    }
+
+    #[test]
+    fn series_names_say_which_measure_they_plot() {
+        // 没有系列列时系列名曾是占位符 "-"，tooltip 会读成 "-: 100"。
+        // 系列名是图例/tooltip 唯一的口径线索，必须写成列名或 SUM(列名)。
+        let raw = render_widget(&widget(ChartType::Bar), &monthly()).unwrap();
+        assert_eq!(raw.series.len(), 1);
+        assert_eq!(raw.series[0].name, "gmv", "RAW 就是列名");
+
+        let mut summed = widget(ChartType::Bar);
+        summed.agg = AggType::Sum;
+        let c = render_widget(&summed, &monthly()).unwrap();
+        assert_eq!(c.series[0].name, "SUM(gmv)");
+
+        // 写了系列列就按列值命名，别把口径名盖到系列上
+        let mut split = widget(ChartType::Bar);
+        split.encode.series = Some("channel".into());
+        split.agg = AggType::Sum;
+        let c = render_widget(&split, &monthly()).unwrap();
+        let names: Vec<&str> = c.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["直营", "加盟"]);
+
+        let mut pie = widget(ChartType::Pie);
+        pie.encode = WidgetEncode {
+            category: Some("month".into()),
+            value: Some("gmv".into()),
+            ..Default::default()
+        };
+        let c = render_widget(&pie, &monthly()).unwrap();
+        assert_eq!(c.series[0].name, "SUM(gmv)", "饼图缺省 SUM");
     }
 
     #[test]
