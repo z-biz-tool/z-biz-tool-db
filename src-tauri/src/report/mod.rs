@@ -8,5 +8,6 @@
 //   3. 跨库联邦：每张表声明自己的 connection_id，按源拉数后内存 hash join
 //   4. AI 幻觉在求值前就被本地解析器挡掉（未知列 / 未知函数直接报错）
 
+pub mod dataset;
 pub mod expr;
 pub mod table;

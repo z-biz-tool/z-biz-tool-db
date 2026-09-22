@@ -13,6 +13,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::expr::{bucket_of, group_eq, join_eq, ord_key, Expr, Value};
 
 #[derive(Debug, Clone, Default)]
@@ -173,13 +175,13 @@ impl Table {
 
 // ==================== Join ====================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinType {
     Inner,
     Left,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JoinKey {
     pub left: String,
     pub right: String,
@@ -222,6 +224,23 @@ fn ensure_free_name(columns: &[String], name: &str) -> String {
     }
 }
 
+/// join 输出列的唯一规则：右列与已有列重名时依次加 _2 / _3 后缀。
+/// 计划期（validate）与执行期共用它，避免列名推断和实际结果对不上。
+/// 返回 (完整输出列, 右表原列名→输出列名)
+pub fn plan_join_columns(
+    left: &[String],
+    right: &[String],
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut out = left.to_vec();
+    let mut alias = Vec::with_capacity(right.len());
+    for c in right {
+        let a = ensure_free_name(&out, c);
+        out.push(a.clone());
+        alias.push((c.clone(), a));
+    }
+    (out, alias)
+}
+
 /// 多键 hash join。右表按连接键建桶，左表逐行探测。
 ///
 /// 复合键任一侧含 NULL 就不可能匹配；右表命中多行时按插入顺序扇出。
@@ -250,14 +269,7 @@ pub fn hash_join(
         );
     }
 
-    // 右表输出列名：与左表（及已改名的右列）重名时加后缀，避免静默覆盖
-    let mut out_columns = left.columns.clone();
-    let mut right_alias: Vec<(String, String)> = Vec::with_capacity(right.columns.len());
-    for c in &right.columns {
-        let a = ensure_free_name(&out_columns, c);
-        out_columns.push(a.clone());
-        right_alias.push((c.clone(), a));
-    }
+    let (out_columns, right_alias) = plan_join_columns(&left.columns, &right.columns);
 
     let mut index: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, row) in right.rows.iter().enumerate() {
@@ -324,7 +336,7 @@ pub fn hash_join(
 
 // ==================== Aggregate ====================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggFunc {
     Count,
     CountDistinct,
@@ -353,7 +365,7 @@ impl AggFunc {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AggSpec {
     pub output: String,
     pub func: AggFunc,
@@ -601,7 +613,7 @@ pub fn aggregate(
 
 // ==================== Sort ====================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SortSpec {
     pub column: String,
     pub desc: bool,
