@@ -10,4 +10,5 @@
 
 pub mod dataset;
 pub mod expr;
+pub mod source;
 pub mod table;

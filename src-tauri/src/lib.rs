@@ -430,13 +430,27 @@ async fn pg_pool(cfg: &DBConfig) -> Result<PgPool, String> {
 }
 
 async fn sqlite_pool(cfg: &DBConfig) -> Result<SqlitePool, String> {
-    if cfg.database.trim().is_empty() {
+    let path = cfg.database.trim();
+    if path.is_empty() {
         return Err("SQLite 需要在「数据库名」中填写数据库文件路径".to_string());
     }
-    let opts = SqliteConnectOptions::new().filename(cfg.database.trim());
+    // sqlx 不会代建文件，失败只吐 "unable to open database file"。
+    // 先把原因说清楚，否则用户会以为是权限 bug 而不是路径写错。
+    // :memory: 与 file: URI 不是文件系统路径，不能做存在性检查。
+    let special = path == ":memory:" || path.starts_with("file:");
+    if !special {
+        let p = std::path::Path::new(path);
+        if !p.exists() {
+            return Err(format!("SQLite 文件不存在：{}（本工具不会代建新库文件）", path));
+        }
+        if !p.is_file() {
+            return Err(format!("SQLite 路径不是文件：{}", path));
+        }
+    }
+    let opts = SqliteConnectOptions::new().filename(path);
     tokio::time::timeout(CONNECT_TIMEOUT, SqlitePool::connect_with(opts))
         .await
-        .map_err(|_| "SQLite 打开失败或文件不可读".to_string())?
+        .map_err(|_| "SQLite 打开超时：文件可能被其它进程独占或位于慢速网络盘".to_string())?
         .map_err(|e| e.to_string())
 }
 
@@ -2428,6 +2442,10 @@ pub fn run() {
             csv_preview,
             csv_import_execute,
             keyset_query,
+            report::source::report_dataset_validate,
+            report::source::report_dataset_sql,
+            report::source::report_dataset_execute,
+            report::source::report_describe_columns,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

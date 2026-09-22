@@ -221,7 +221,10 @@ pub fn source_sql(src: &SourceRef, cap: usize) -> Result<String, String> {
 
 /// 与驱动层解耦的取数接缝：真实实现按 connection_id 找连接池执行 source_sql；
 /// 测试实现直接吐内存表。
-pub trait RowSource {
+///
+/// `Send + Sync` 是硬要求：跨库联邦会为每个源各起一次 await，调用方又是 Tauri 的
+/// 多线程 IPC future，没有这两条就编不过（不是风格问题）。
+pub trait RowSource: Send + Sync {
     fn fetch<'a>(
         &'a self,
         src: &'a SourceRef,
@@ -570,51 +573,63 @@ pub async fn execute_dataset(
 // ==================== 与驱动层的类型桥 ====================
 
 /// tagged-cell JSON（`{"__kind":..,"value":..}`）→ 引擎标量。
+///
+/// `__kind` 的字面值由 lib.rs 的 `kind_to_str` 决定，是小写（`text` / `integer` /
+/// `decode_error`）。这里必须按那份契约匹配：拼错一个大小写不会报错，只会让整列
+/// 静默变成 NULL——报表算出来"全是空"比直接崩更难查。
+///
 /// Binary / Unsupported / DecodeError 一律 NULL：报表宁可少一个点，
 /// 也不能把解码失败当成 0 或空串混进聚合结果。
 pub fn tagged_to_value(cell: &serde_json::Value) -> Value {
-    let obj = match cell {
+    let (kind, val): (String, serde_json::Value) = match cell {
         serde_json::Value::Null => return Value::Null,
-        serde_json::Value::Object(m) => {
-            if m.contains_key("__kind") {
-                (
-                    m.get("__kind").and_then(|k| k.as_str()).unwrap_or("raw"),
-                    m.get("value").cloned().unwrap_or(serde_json::Value::Null),
-                )
-            } else {
-                ("raw", cell.clone())
-            }
-        }
-        other => ("raw", other.clone()),
+        serde_json::Value::Object(m) => match m.get("__kind") {
+            Some(k) => (
+                k.as_str().unwrap_or("raw").to_ascii_lowercase(),
+                m.get("value").cloned().unwrap_or(serde_json::Value::Null),
+            ),
+            None => ("raw".to_string(), cell.clone()),
+        },
+        other => ("raw".to_string(), other.clone()),
     };
-    let (kind, val) = obj;
-    match kind {
-        "Null" => Value::Null,
-        "Integer" => val.as_i64().map(Value::Int).unwrap_or(Value::Null),
-        "Float" | "Decimal" => val
-            .as_f64()
-            .map(Value::Float)
-            .or_else(|| val.as_str().and_then(|s| s.parse::<f64>().ok()).map(Value::Float))
-            .unwrap_or(Value::Null),
-        "Text" | "Uuid" | "Json" | "Date" | "Time" | "DateTime" | "Timestamp" => match val {
+    let num = |v: &serde_json::Value| -> Option<f64> {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    };
+    match kind.as_str() {
+        "null" | "binary" | "unsupported" | "decode_error" => Value::Null,
+        // T-038：大整数在过 IPC 前会被降级成字符串，所以 integer 也可能是文本。
+        // 超出 i64（MySQL BIGINT UNSIGNED）时退到 f64 而不是丢掉这一行。
+        "integer" => match &val {
+            serde_json::Value::Null => Value::Null,
+            _ => val
+                .as_i64()
+                .or_else(|| val.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+                .map(Value::Int)
+                .or_else(|| num(&val).map(Value::Float))
+                .unwrap_or_else(|| Value::Text(val.to_string().trim_matches('"').to_string())),
+        },
+        "float" | "decimal" => match num(&val) {
+            Some(f) => Value::Float(f),
+            None => Value::Null,
+        },
+        "text" | "uuid" | "json" | "date" | "time" | "datetime" | "timestamp" => match val {
             serde_json::Value::String(s) => Value::Text(s),
             serde_json::Value::Null => Value::Null,
             other => Value::Text(other.to_string()),
         },
         "raw" => match val {
             serde_json::Value::Bool(b) => Value::Bool(b),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Value::Int(i)
-                } else {
-                    n.as_f64().map(Value::Float).unwrap_or(Value::Null)
-                }
-            }
+            serde_json::Value::Number(n) => match n.as_i64() {
+                Some(i) => Value::Int(i),
+                None => n.as_f64().map(Value::Float).unwrap_or(Value::Null),
+            },
             serde_json::Value::String(s) => Value::Text(s),
             serde_json::Value::Null => Value::Null,
             other => Value::Text(other.to_string()),
         },
-        _ => Value::Null,
+        // 未知标签宁可报错也不要静默 NULL：出现它说明驱动侧加了新 kind 而这里没跟上
+        other => Value::Text(format!("<unknown-kind:{}>", other)),
     }
 }
 
@@ -1022,15 +1037,30 @@ mod tests {
         let mk = |k: &str, v: serde_json::Value| -> serde_json::Value {
             serde_json::json!({ "__kind": k, "value": v })
         };
-        assert_eq!(tagged_to_value(&mk("Null", serde_json::Value::Null)), Value::Null);
-        assert_eq!(tagged_to_value(&mk("Integer", serde_json::json!(42))), Value::Int(42));
-        assert_eq!(tagged_to_value(&mk("Float", serde_json::json!(1.5))), Value::Float(1.5));
+        // 这些字面值就是 lib.rs::kind_to_str 的产物（小写）。之前这里按 PascalCase
+        // 写测试并且通过了，真接上驱动后整列静默变 NULL —— 测试记了个错的契约，
+        // 比没测试更糟。改大小写敏感的匹配前请先改这份字面量。
+        assert_eq!(tagged_to_value(&mk("null", serde_json::Value::Null)), Value::Null);
+        assert_eq!(tagged_to_value(&mk("integer", serde_json::json!(42))), Value::Int(42));
+        assert_eq!(tagged_to_value(&mk("float", serde_json::json!(1.5))), Value::Float(1.5));
+        // T-038：超过 2^53 的整数以字符串下发，必须还原成数字而不是 NULL
+        assert_eq!(
+            tagged_to_value(&mk("integer", serde_json::json!("9007199254740993"))),
+            Value::Int(9007199254740993)
+        );
+        // BIGINT UNSIGNED 超出 i64：退化成 f64 也比丢成 NULL 好（聚合还能用）
+        assert_eq!(
+            tagged_to_value(&mk("integer", serde_json::json!("18446744073709551615"))),
+            Value::Float(1.8446744073709552e19)
+        );
         // Decimal 常以字符串下发，必须还原成数值而不是文本
-        assert_eq!(tagged_to_value(&mk("Decimal", serde_json::json!("12.500"))), Value::Float(12.5));
-        assert_eq!(tagged_to_value(&mk("DateTime", serde_json::json!("2026-01-01"))), Value::Text("2026-01-01".into()));
+        assert_eq!(tagged_to_value(&mk("decimal", serde_json::json!("12.500"))), Value::Float(12.5));
+        assert_eq!(tagged_to_value(&mk("datetime", serde_json::json!("2026-01-01"))), Value::Text("2026-01-01".into()));
         // 解码失败与二进制不参与求值
-        assert_eq!(tagged_to_value(&mk("DecodeError", serde_json::json!("boom"))), Value::Null);
-        assert_eq!(tagged_to_value(&mk("Binary", serde_json::json!("AA=="))), Value::Null);
+        assert_eq!(tagged_to_value(&mk("decode_error", serde_json::json!("boom"))), Value::Null);
+        assert_eq!(tagged_to_value(&mk("binary", serde_json::json!("AA=="))), Value::Null);
+        // 大小写不敏感，容得下别的调用方沿用 serde 的 PascalCase
+        assert_eq!(tagged_to_value(&mk("Integer", serde_json::json!(7))), Value::Int(7));
         // 裸值（v1 兼容路径）
         assert_eq!(tagged_to_value(&serde_json::json!(7)), Value::Int(7));
         assert_eq!(tagged_to_value(&serde_json::json!(true)), Value::Bool(true));
@@ -1042,10 +1072,10 @@ mod tests {
         let cols: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
         let rows = vec![
             vec![
-                serde_json::json!({"__kind": "Integer", "value": 1}),
-                serde_json::json!({"__kind": "Text", "value": "x"}),
+                serde_json::json!({"__kind": "integer", "value": 1}),
+                serde_json::json!({"__kind": "text", "value": "x"}),
             ],
-            vec![serde_json::json!({"__kind": "Null", "value": null})],
+            vec![serde_json::json!({"__kind": "null", "value": null})],
         ];
         let t = table_from_tagged(&cols, &rows);
         assert_eq!(t.columns, cols);
