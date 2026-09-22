@@ -241,9 +241,22 @@ fn allowed(cols: &[String]) -> AllowedColumns {
     AllowedColumns(cols.to_vec())
 }
 
+/// 计划产物：人类可读的算子链 + 数据集最终输出的列。
+/// 两者必须同源：曾经出过"计划里推断的列名和实际结果对不上"的问题，
+/// 所以列的累积直接复用校验过程，不再另写一份推导。
+#[derive(Debug, Clone, Default)]
+pub struct DatasetPlan {
+    pub steps: Vec<String>,
+    pub columns: Vec<String>,
+}
+
 /// 静态校验 + 生成计划文本。任何一处不成立都返回 Err，绝不"先跑跑看"。
-/// 返回的每一步都是人类可读文本，前端面板与 AI 回显共用。
+/// 只要步骤文本的调用方用它；需要输出列清单的用 plan_dataset。
 pub fn validate_dataset(spec: &DatasetSpec, schemas: &SchemaCache) -> Result<Vec<String>, String> {
+    plan_dataset(spec, schemas).map(|p| p.steps)
+}
+
+pub fn plan_dataset(spec: &DatasetSpec, schemas: &SchemaCache) -> Result<DatasetPlan, String> {
     if spec.id.trim().is_empty() {
         return Err("数据集缺少 id".into());
     }
@@ -385,8 +398,9 @@ pub fn validate_dataset(spec: &DatasetSpec, schemas: &SchemaCache) -> Result<Vec
         steps.push(format!("POST {} = {}", c.name, c.expr));
     }
 
-    if spec.fields.is_empty() {
+    let projected: Option<Vec<String>> = if spec.fields.is_empty() {
         steps.push(format!("SELECT * ({} 列)", cols.len()));
+        None
     } else {
         let mut picked: Vec<String> = Vec::with_capacity(spec.fields.len());
         for f in &spec.fields {
@@ -397,7 +411,8 @@ pub fn validate_dataset(spec: &DatasetSpec, schemas: &SchemaCache) -> Result<Vec
             picked.push(real);
         }
         steps.push(format!("SELECT {}", picked.join(", ")));
-    }
+        Some(picked)
+    };
 
     for s in &spec.sort {
         if pick(&cols, &s.column).is_none() {
@@ -412,7 +427,10 @@ pub fn validate_dataset(spec: &DatasetSpec, schemas: &SchemaCache) -> Result<Vec
     if let Some(n) = spec.limit {
         steps.push(format!("LIMIT {}", n));
     }
-    Ok(steps)
+    Ok(DatasetPlan {
+        columns: projected.unwrap_or(cols),
+        steps,
+    })
 }
 
 fn source_columns(
@@ -1083,6 +1101,55 @@ mod tests {
         assert_eq!(cell(&t, 0, "b"), Value::Text("x".into()));
         assert_eq!(cell(&t, 0, "c"), Value::Null, "缺位补 NULL 而不是错位");
         assert_eq!(cell(&t, 1, "b"), Value::Null);
+    }
+
+    /// 计划推断出的输出列必须与真实执行结果逐列一致——视图校验、AI 回显都靠
+    /// plan.columns 提前知道结果形状，一旦和实际错位，报错就会指向不存在的列。
+    #[tokio::test]
+    async fn plan_columns_match_the_executed_shape() {
+        let spec = cross_spec();
+        let sc = schemas(&[
+            ("orders", &["id", "day", "amount", "cur"]),
+            ("rates", &["cur", "rate"]),
+        ]);
+        let plan = plan_dataset(&spec, &sc).unwrap();
+        assert_eq!(plan.columns, vec!["day", "total", "n", "per_order"]);
+        assert_eq!(validate_dataset(&spec, &sc).unwrap(), plan.steps);
+
+        let orders = tbl(
+            &["id", "day", "amount", "cur"],
+            &[
+                vec![("id", Value::Int(1)), ("day", Value::Text("01".into())), ("amount", Value::Int(100)), ("cur", Value::Text("usd".into()))],
+                vec![("id", Value::Int(2)), ("day", Value::Text("02".into())), ("amount", Value::Int(70)), ("cur", Value::Text("eur".into()))],
+            ],
+        );
+        let rates = tbl(
+            &["cur", "rate"],
+            &[
+                vec![("cur", Value::Text("usd".into())), ("rate", Value::Float(7.2))],
+                vec![("cur", Value::Text("eur".into())), ("rate", Value::Float(7.8))],
+            ],
+        );
+        let r = execute_dataset(&spec, &Mock::new(vec![("orders", orders), ("rates", rates)]))
+            .await
+            .unwrap();
+        assert_eq!(r.table.columns, plan.columns);
+
+        // fields 决定最终顺序，而不是"声明顺序"
+        let mut proj = spec.clone();
+        proj.fields = vec!["total".into(), "day".into()];
+        let p2 = plan_dataset(&proj, &sc).unwrap();
+        assert_eq!(p2.columns, vec!["total", "day"]);
+        let r2 = execute_dataset(
+            &proj,
+            &Mock::new(vec![
+                ("orders", tbl(&["id", "day", "amount", "cur"], &[vec![("id", Value::Int(1)), ("day", Value::Text("01".into())), ("amount", Value::Int(100)), ("cur", Value::Text("usd".into()))]])),
+                ("rates", tbl(&["cur", "rate"], &[vec![("cur", Value::Text("usd".into())), ("rate", Value::Float(7.2))]])),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r2.table.columns, p2.columns);
     }
 
     #[test]

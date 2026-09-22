@@ -55,7 +55,7 @@ async fn sqlite_smoke_crud_tagged_cells() {
 
     // 插入测试数据
     sqlx::query(
-        "INSERT INTO smoke VALUES (1, 42, 3.14, 'hello', NULL, X'DEADBEEF')",
+        "INSERT INTO smoke VALUES (1, 42, 12.34, 'hello', NULL, X'DEADBEEF')",
     )
     .execute(&pool)
     .await
@@ -72,10 +72,10 @@ async fn sqlite_smoke_crud_tagged_cells() {
     let (id, int_val, real_val, text_val, null_val, blob_val) = &rows[0];
     assert_eq!(*id, 1);
     assert_eq!(*int_val, Some(42));
-    assert!((real_val.unwrap() - 3.14).abs() < 0.001);
+    assert!((real_val.unwrap() - 12.34).abs() < 0.001);
     assert_eq!(text_val.as_deref(), Some("hello"));
     assert!(null_val.is_none());
-    assert!(blob_val.as_ref().unwrap().len() > 0, "BLOB 不为空");
+    assert!(!blob_val.as_ref().unwrap().is_empty(), "BLOB 不为空");
 
     // 更新验证
     sqlx::query("UPDATE smoke SET int_val = -1000 WHERE id = 1")

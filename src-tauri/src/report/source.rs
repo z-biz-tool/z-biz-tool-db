@@ -21,6 +21,7 @@ use crate::{dispatch_db_type, run_dispatch, DBConfig};
 use super::dataset::{
     self, assert_ident, source_sql, DatasetSpec, RowSource, SchemaCache, SourceRef,
 };
+use super::view::{self, ViewSpec};
 use super::expr::Value;
 use super::table::Table;
 
@@ -235,6 +236,8 @@ pub async fn build_schemas(
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SqlPreview {
+    /// 属于哪个数据集（一张报表可以有多个数据集）
+    pub dataset: String,
     pub alias: String,
     pub connection_id: String,
     pub connection_name: String,
@@ -272,10 +275,7 @@ pub struct DatasetPayload {
 }
 
 /// 生成"查看生成的 SQL"清单；顺带把连接是否可解析一起校验掉
-pub fn previews(
-    spec: &DatasetSpec,
-    source: &DbSource,
-) -> Result<Vec<SqlPreview>, String> {
+pub fn previews(spec: &DatasetSpec, source: &DbSource) -> Result<Vec<SqlPreview>, String> {
     let cap = spec.row_cap();
     let mut out = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -288,6 +288,7 @@ pub fn previews(
             .ok_or_else(|| format!("源 {} 不在 sources 里", alias))?;
         let (cfg, dialect) = source.resolve(src)?;
         out.push(SqlPreview {
+            dataset: spec.id.clone(),
             alias: src.alias.clone(),
             connection_id: src.connection_id.clone(),
             connection_name: cfg.name.clone(),
@@ -390,12 +391,134 @@ pub async fn report_describe_columns(
     describe_columns(&config, &schema, &table).await
 }
 
+// ==================== 报表（视图 × 多数据集） ====================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DatasetRunStat {
+    pub id: String,
+    pub name: String,
+    pub rows: usize,
+    pub columns: Vec<String>,
+    pub truncated: Vec<String>,
+    pub partial: bool,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ViewPayload {
+    /// 视图算子链（组件 × 编码 × 布局），前端"执行计划"面板直接列出来
+    pub steps: Vec<String>,
+    pub layout: Vec<view::WidgetLayout>,
+    pub charts: Vec<view::ChartData>,
+    pub datasets: Vec<DatasetRunStat>,
+    pub generated_sql: Vec<SqlPreview>,
+    /// 任一数据集被 max_rows 截断 → 整张报表标"不完整"，UI 不许当均值画
+    pub partial: bool,
+    pub elapsed_ms: u64,
+}
+
+/// 逐个数据集：探查列 → 出计划 → 执行。返回计划、结果表与生成的 SQL。
+/// 计划里的列清单与结果表的列清单同源（plan_dataset 有回归测试锁住），
+/// 所以视图校验报错指向的列一定是用户看得见的列。
+async fn run_datasets(
+    datasets: &[DatasetSpec],
+    source: &DbSource,
+    provided: Option<&HashMap<String, SchemaCache>>,
+) -> Result<
+    (
+        HashMap<String, Table>,
+        HashMap<String, Vec<String>>,
+        Vec<DatasetRunStat>,
+        Vec<SqlPreview>,
+        bool,
+    ),
+    String,
+> {
+    let mut tables: HashMap<String, Table> = HashMap::new();
+    let mut cols: HashMap<String, Vec<String>> = HashMap::new();
+    let mut stats: Vec<DatasetRunStat> = Vec::new();
+    let mut sqls: Vec<SqlPreview> = Vec::new();
+    let mut partial = false;
+    for ds in datasets {
+        if ds.id.trim().is_empty() {
+            return Err("数据集缺少 id".into());
+        }
+        if tables.contains_key(&ds.id) {
+            return Err(format!("数据集 id {} 重复", ds.id));
+        }
+        let owned = provided.and_then(|p| p.get(&ds.id));
+        let cache = build_schemas(ds, source, owned).await?;
+        let plan = dataset::plan_dataset(ds, &cache)?;
+        let start = std::time::Instant::now();
+        let run = dataset::execute_dataset(ds, source).await?;
+        sqls.extend(previews(ds, source)?);
+        partial |= run.is_partial();
+        cols.insert(ds.id.clone(), plan.columns.clone());
+        stats.push(DatasetRunStat {
+            id: ds.id.clone(),
+            name: ds.name.clone(),
+            rows: run.table.len(),
+            columns: plan.columns,
+            truncated: run.truncated.clone(),
+            partial: run.is_partial(),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        });
+        tables.insert(ds.id.clone(), run.table);
+    }
+    Ok((tables, cols, stats, sqls, partial))
+}
+
+/// 只校验不出数：AI 生成完整报表后先用它自检，能省下一次全量取数
+#[tauri::command]
+pub async fn report_view_validate(
+    view: ViewSpec,
+    datasets: Vec<DatasetSpec>,
+    configs: Vec<DBConfig>,
+    schemas: Option<HashMap<String, SchemaCache>>,
+) -> Result<ValidationReport, String> {
+    let source = DbSource::new(&configs);
+    let (_, cols, _, sqls, _) = run_datasets(&datasets, &source, schemas.as_ref()).await?;
+    let steps = view::validate_view(&view, &cols)?;
+    Ok(ValidationReport {
+        steps,
+        sqls,
+        // 这里回传每个数据集的输出列，前端据此渲染字段选择器
+        schemas: cols,
+    })
+}
+
+/// 出数并渲染成图表结构
+#[tauri::command]
+pub async fn report_view_render(
+    view: ViewSpec,
+    datasets: Vec<DatasetSpec>,
+    configs: Vec<DBConfig>,
+    schemas: Option<HashMap<String, SchemaCache>>,
+) -> Result<ViewPayload, String> {
+    let start = std::time::Instant::now();
+    let source = DbSource::new(&configs);
+    let (tables, cols, stats, sqls, partial) =
+        run_datasets(&datasets, &source, schemas.as_ref()).await?;
+    let steps = view::validate_view(&view, &cols)?;
+    let layout = view::resolve_layout(&view)?;
+    let charts = view::render_view(&view, &tables)?;
+    Ok(ViewPayload {
+        steps,
+        layout,
+        charts,
+        datasets: stats,
+        generated_sql: sqls,
+        partial,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::report::dataset;
+    use crate::report::dataset;
     use crate::report::dataset::{JoinPair, JoinSpec, SortDir};
-use crate::report::table::{AggFunc, AggSpec};
+    use crate::report::table::{AggFunc, AggSpec};
 
     fn sqlite_cfg(id: &str, path: &str) -> DBConfig {
         DBConfig {
@@ -562,19 +685,14 @@ use crate::report::table::{AggFunc, AggSpec};
         assert!(describe_columns(&cfg, "", "ghost").await.is_err());
     }
 
-    /// 端到端：两个 SQLite 文件联邦 + join + 过滤 + 聚合 + 排序
-    #[tokio::test]
-    async fn federates_two_sqlite_files_and_aggregates() {
-        let db = temp_db();
-        let shop = sqlite_cfg("shop", &path_in(&db, "shop.sqlite"));
-        let crm = sqlite_cfg("crm", &path_in(&db, "crm.sqlite"));
-
-        run_dispatch(
-            &shop,
-            "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount REAL, status TEXT)",
-        )
-        .await
-        .unwrap();
+    /// 两个独立 SQLite 文件：订单在 shop 库、客户在 crm 库。
+    /// 两条连接、两个连接池，是真跨库而不是同库两表。
+    async fn seed_shop_crm(db: &TempDb) -> (DBConfig, DBConfig) {
+        let shop = sqlite_cfg("shop", &path_in(db, "shop.sqlite"));
+        let crm = sqlite_cfg("crm", &path_in(db, "crm.sqlite"));
+        run_dispatch(&shop, "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount REAL, status TEXT)")
+            .await
+            .unwrap();
         for (id, uid, amt, st) in [
             (1, 1, 100.0, "paid"),
             (2, 1, 50.0, "paid"),
@@ -597,8 +715,11 @@ use crate::report::table::{AggFunc, AggSpec};
                 .await
                 .unwrap();
         }
+        (shop, crm)
+    }
 
-        let spec = DatasetSpec {
+    fn city_gmv_spec() -> DatasetSpec {
+        DatasetSpec {
             id: "city-gmv".into(),
             name: "城市成交额".into(),
             base: "o".into(),
@@ -622,7 +743,15 @@ use crate::report::table::{AggFunc, AggSpec};
                 desc: true,
             }],
             ..DatasetSpec::new("city-gmv", "城市成交额", "o")
-        };
+        }
+    }
+
+    /// 端到端：两个 SQLite 文件联邦 + join + 过滤 + 聚合 + 排序
+    #[tokio::test]
+    async fn federates_two_sqlite_files_and_aggregates() {
+        let db = temp_db();
+        let (shop, crm) = seed_shop_crm(&db).await;
+        let spec = city_gmv_spec();
 
         let source = DbSource::new(&[shop.clone(), crm.clone()]);
         // 列清单留空 → 走真实探查，证明 pragma/information_schema 通道可用
@@ -696,5 +825,149 @@ use crate::report::table::{AggFunc, AggSpec};
             .await
             .unwrap_err();
         assert!(err.contains("total_fee"), "{}", err);
+    }
+
+    fn widget(
+        id: &str,
+        kind: view::ChartType,
+        dataset_id: &str,
+        encode: view::WidgetEncode,
+    ) -> view::WidgetSpec {
+        view::WidgetSpec {
+            id: id.into(),
+            kind,
+            title: id.into(),
+            dataset: dataset_id.into(),
+            encode,
+            agg: Default::default(),
+            filters: Vec::new(),
+            limit: None,
+        }
+    }
+
+    /// 单库明细数据集，和城市聚合集一起放进同一张报表
+    fn paid_orders_spec() -> DatasetSpec {
+        DatasetSpec {
+            sources: vec![src("o", "shop", "orders")],
+            filters: vec!["status = 'paid'".into()],
+            fields: vec!["id".into(), "amount".into()],
+            sort: vec![SortDir {
+                column: "id".into(),
+                desc: true,
+            }],
+            limit: Some(2),
+            ..DatasetSpec::new("paid-orders", "已支付订单明细", "o")
+        }
+    }
+
+    fn shop_board() -> ViewSpec {
+        let kpi = widget(
+            "kpi-gmv",
+            view::ChartType::Kpi,
+            "city-gmv",
+            view::WidgetEncode {
+                y: Some("gmv".into()),
+                ..Default::default()
+            },
+        );
+        let bar = widget(
+            "bar-city",
+            view::ChartType::Bar,
+            "city-gmv",
+            view::WidgetEncode {
+                x: Some("city".into()),
+                y: Some("gmv".into()),
+                ..Default::default()
+            },
+        );
+        let table = widget(
+            "tbl-orders",
+            view::ChartType::Table,
+            "paid-orders",
+            view::WidgetEncode {
+                columns: vec!["id".into(), "amount".into()],
+                ..Default::default()
+            },
+        );
+        ViewSpec {
+            id: "shop-board".into(),
+            name: "成交看板".into(),
+            version: 1,
+            widgets: vec![kpi, bar, table],
+            layout: Vec::new(),
+        }
+    }
+
+    /// 端到端：一次 render 跑通"跨库聚合 + 单库明细"两个数据集、三类组件
+    #[tokio::test]
+    async fn report_view_renders_every_widget_from_cross_db_datasets() {
+        let db = temp_db();
+        let (shop, crm) = seed_shop_crm(&db).await;
+        let datasets = || vec![city_gmv_spec(), paid_orders_spec()];
+
+        let report = report_view_validate(
+            shop_board(),
+            datasets(),
+            vec![shop.clone(), crm.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.schemas["city-gmv"], vec!["city", "gmv", "cnt"]);
+        assert_eq!(report.schemas["paid-orders"], vec!["id", "amount"]);
+        // 跨库集 2 条源 SQL + 明细集 1 条
+        assert_eq!(report.sqls.len(), 3);
+        assert_eq!(report.sqls[2].dataset, "paid-orders");
+
+        let payload = report_view_render(shop_board(), datasets(), vec![shop, crm], None)
+            .await
+            .unwrap();
+        assert!(!payload.partial);
+        assert_eq!(payload.charts.len(), 3);
+        // KPI 不写 agg 就是 SUM：三城 150+80+70
+        assert_eq!(payload.charts[0].value, Some(Value::Float(300.0)));
+        // 柱状不写 agg 就原样画三行，不会悄悄压成一个点
+        assert_eq!(
+            payload.charts[1].categories,
+            vec!["SH".to_string(), "BJ".into(), "SZ".into()]
+        );
+        assert_eq!(
+            payload.charts[1].series[0].values,
+            vec![Value::Float(150.0), Value::Float(80.0), Value::Float(70.0)]
+        );
+        // 表格吃明细集：按 id 倒序取前 2
+        assert_eq!(payload.charts[2].columns, vec!["id", "amount"]);
+        assert_eq!(payload.charts[2].rows.len(), 2);
+        assert_eq!(payload.charts[2].rows[0][0], serde_json::json!(5));
+        // layout 留空 → 自动纵向堆叠，且互不重叠
+        assert_eq!(payload.layout.len(), 3);
+        assert_eq!(payload.datasets.len(), 2);
+        for pair in payload.layout.windows(2) {
+            assert!(pair[0].y + pair[0].h <= pair[1].y, "{:?}", payload.layout);
+        }
+        // 前端要能直接吃到这个结构，序列化不能失败
+        serde_json::to_string(&payload).expect("ViewPayload 可序列化");
+    }
+
+    /// AI 编了个不存在的度量：报错要指名道姓，而不是回一张空图
+    #[tokio::test]
+    async fn report_view_names_the_hallucinated_field() {
+        let db = temp_db();
+        let (shop, crm) = seed_shop_crm(&db).await;
+        let board = shop_board();
+        let mut broken = board.widgets[0].clone();
+        broken.encode = view::WidgetEncode {
+            y: Some("total_fee".into()),
+            ..Default::default()
+        };
+        let v = ViewSpec {
+            widgets: vec![broken],
+            ..board
+        };
+        let err = report_view_render(v, vec![city_gmv_spec()], vec![shop, crm], None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("total_fee"), "{}", err);
+        assert!(err.contains("kpi-gmv"), "{}", err);
     }
 }

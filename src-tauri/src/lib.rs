@@ -2446,6 +2446,8 @@ pub fn run() {
             report::source::report_dataset_sql,
             report::source::report_dataset_execute,
             report::source::report_describe_columns,
+            report::source::report_view_validate,
+            report::source::report_view_render,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
