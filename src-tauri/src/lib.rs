@@ -16,6 +16,7 @@ mod security;
 mod secrets;
 #[path = "agent_service.rs"]
 mod agent_service;
+pub mod report;
 
 // ================== 数据结构 ==================
 
