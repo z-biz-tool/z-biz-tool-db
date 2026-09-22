@@ -246,6 +246,15 @@ pub async fn save_history(history: &[QueryHistoryItem]) -> Result<(), String> {
     save_envelope(&history_path()?, &history.to_vec(), CURRENT_SCHEMA_VERSION)
 }
 
+/// T-035：追加单条历史记录（后端自动记录，无需前端手动调用）
+pub async fn append_history(item: QueryHistoryItem) -> Result<(), String> {
+    let mut history = load_history().await?;
+    history.insert(0, item);
+    // 保留最近 1000 条
+    history.truncate(1000);
+    save_history(&history).await
+}
+
 pub async fn load_history() -> Result<Vec<QueryHistoryItem>, String> {
     match load_envelope::<Vec<QueryHistoryItem>>(&history_path()?, CURRENT_SCHEMA_VERSION)? {
         Some(payload) => Ok(payload),

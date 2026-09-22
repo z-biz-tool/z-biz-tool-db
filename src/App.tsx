@@ -442,7 +442,7 @@ function App() {
       msgApi.success({
         content: `查询执行成功，总耗时 ${result.execution_time_ms}ms${
           result.timings && result.timings.total_ms > 0
-            ? `（分类 ${result.timings.queue_ms}ms / 执行 ${result.timings.execute_ms}ms）`
+            ? `（连接 ${result.timings.connect_ms}ms / 执行 ${result.timings.execute_ms}ms）`
             : ""
         }`,
         duration: 3,

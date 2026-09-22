@@ -114,6 +114,24 @@ pub fn new_timings(start: std::time::Instant) -> Timings {
     }
 }
 
+/// T-041：构建完整分段耗时
+fn build_timings(
+    queue_start: std::time::Instant,
+    connect_start: std::time::Instant,
+    exec_start: std::time::Instant,
+) -> Timings {
+    let now = std::time::Instant::now();
+    let connect_ms = connect_start.elapsed().as_millis() as u64;
+    let execute_ms = exec_start.elapsed().as_millis() as u64;
+    Timings {
+        connect_ms,
+        queue_ms: 0, // 队列等待在当前架构下不可单独测量
+        execute_ms,
+        fetch_ms: 0, // fetch_all 与 execute 合并，无法拆分
+        total_ms: queue_start.elapsed().as_millis() as u64,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableInfo {
     pub name: String,
@@ -1250,8 +1268,60 @@ async fn test_connection(config: DBConfig) -> Result<bool, String> {
 // - access_mode 默认 readOnly；S0 同时按词法分类器拒绝可疑绕过
 // - 写操作需要审批：S0 通过 approval_id 字串参数显式注入；缺失/过期/摘要不匹配均拒
 // - expected_generation 用于前后端防竞态校验（T-022）
+// - T-035：成功和失败都自动记录历史
 #[command]
 async fn execute_query(
+    sql: String,
+    config: DBConfig,
+    access_mode: Option<String>,
+    approval: Option<security::ApprovalGrant>,
+    expected_generation: Option<u32>,
+    max_rows: Option<u32>,
+) -> Result<QueryResult, String> {
+    let start = std::time::Instant::now();
+    let result = execute_query_inner(
+        sql.clone(),
+        config.clone(),
+        access_mode,
+        approval,
+        expected_generation,
+        max_rows,
+    )
+    .await;
+
+    // T-035：所有终态（成功或失败）都记录历史
+    match &result {
+        Ok(r) => {
+            let hist_item = QueryHistoryItem {
+                id: uuid::Uuid::new_v4().to_string(),
+                sql: sql.chars().take(500).collect(),
+                connection_id: config.id.clone(),
+                connection_name: config.name.clone(),
+                timestamp: chrono::Utc::now().timestamp(),
+                execution_time_ms: r.execution_time_ms,
+                success: true,
+                error: None,
+            };
+            let _ = queries::append_history(hist_item).await;
+        }
+        Err(e) => {
+            let hist_item = QueryHistoryItem {
+                id: uuid::Uuid::new_v4().to_string(),
+                sql: sql.chars().take(500).collect(),
+                connection_id: config.id.clone(),
+                connection_name: config.name.clone(),
+                timestamp: chrono::Utc::now().timestamp(),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+                success: false,
+                error: Some(e.chars().take(200).collect()),
+            };
+            let _ = queries::append_history(hist_item).await;
+        }
+    }
+    result
+}
+
+async fn execute_query_inner(
     sql: String,
     config: DBConfig,
     access_mode: Option<String>,
@@ -1304,10 +1374,62 @@ async fn execute_query(
         }
     }
 
+    // T-041：分段耗时 — 队列/连接/执行分别计时
     let start = std::time::Instant::now();
-    let (column_meta, mut rows, affected, is_query) = run_dispatch(&config, &sql).await?;
+    let db_type = dispatch_db_type(&config)?;
+    let connect_start = std::time::Instant::now();
+    let dispatch_result = match db_type {
+        "mysql" => {
+            let pool = mysql_pool(&config).await?;
+            let es = std::time::Instant::now();
+            mysql_run(&pool, &sql).await.map(|r| (r.0, r.1, r.2, r.3, es))
+        }
+        "postgresql" => {
+            let pool = pg_pool(&config).await?;
+            let es = std::time::Instant::now();
+            pg_run(&pool, &sql).await.map(|r| (r.0, r.1, r.2, r.3, es))
+        }
+        "sqlite" => {
+            let pool = sqlite_pool(&config).await?;
+            let es = std::time::Instant::now();
+            sqlite_run(&pool, &sql).await.map(|r| (r.0, r.1, r.2, r.3, es))
+        }
+        _ => return Err("不支持的数据库类型".to_string()),
+    };
+
+    let (column_meta, mut rows, affected, is_query, exec_start) = match dispatch_result {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
     // T-018：使用 UUID v4 作为请求标识
     let id = uuid::Uuid::new_v4().to_string();
+
+    // T-043：事务状态跟踪 — 检测 TxControl 语句并更新 registry
+    let reg = db::session::registry();
+    let tx_kind = db::sql_classify::classify(&sql).kind;
+    if matches!(tx_kind, db::sql_classify::StatementKind::TxControl) {
+        let upper = sql.trim().to_ascii_uppercase();
+        let conn_key = format!("{}:{}", config.id, expected_generation.unwrap_or(0));
+        if upper.starts_with("BEGIN") {
+            let _ = reg.insert(db::session::QueryJobInternal {
+                query_id: conn_key.clone(),
+                state: db::session::QueryState::Running,
+                state_msg: "事务已开始".into(),
+                cancel_requested: false,
+                start_time: std::time::Instant::now(),
+                batch_tx: tokio::sync::mpsc::channel(1).0,
+                transaction_state: db::session::TransactionState::Active,
+                generation: expected_generation.unwrap_or(0),
+                conflict_detected: false,
+                last_affected_rows: 0,
+            });
+        } else if upper.starts_with("COMMIT") {
+            reg.mark_committed(&conn_key);
+        } else if upper.starts_with("ROLLBACK") {
+            reg.mark_rolled_back(&conn_key);
+        }
+    }
+
     let columns: Vec<String> = column_meta.iter().map(|m| m.name.clone()).collect();
 
     // T-022 generation 透传：UI 可携带并比对
@@ -1321,7 +1443,7 @@ async fn execute_query(
         rows.truncate(max);
     }
 
-    Ok(QueryResult {
+    let mut result = QueryResult {
         id,
         columns,
         column_meta,
@@ -1329,14 +1451,12 @@ async fn execute_query(
         affected_rows: affected,
         execution_time_ms: start.elapsed().as_millis() as u64,
         is_query,
-        timings: crate::new_timings(start),
+        timings: build_timings(start, connect_start, exec_start),
         truncated,
         total_rows,
-    })
-    .map(|mut r| {
-        r.id = format!("gen{}|{}", generation, r.id);
-        r
-    })
+    };
+    result.id = format!("gen{}|{}", generation, result.id);
+    Ok(result)
 }
 
 // T-019 v2 IPC：metadata_list_v2
@@ -1874,8 +1994,31 @@ async fn explain_query(
         "" => format!("EXPLAIN {}", sql.trim()),
         other => format!("{}{}", other, sql.trim()),
     };
+    // T-041：分段耗时
     let start = std::time::Instant::now();
-    let (column_meta, rows, affected, is_query) = run_dispatch(&config, &prefixed).await?;
+    let db_type = dispatch_db_type(&config)?;
+    let connect_start = std::time::Instant::now();
+    let (column_meta, rows, affected, is_query, exec_start) = match db_type {
+        "mysql" => {
+            let pool = mysql_pool(&config).await?;
+            let es = std::time::Instant::now();
+            let r = mysql_run(&pool, &prefixed).await?;
+            (r.0, r.1, r.2, r.3, es)
+        }
+        "postgresql" => {
+            let pool = pg_pool(&config).await?;
+            let es = std::time::Instant::now();
+            let r = pg_run(&pool, &prefixed).await?;
+            (r.0, r.1, r.2, r.3, es)
+        }
+        "sqlite" => {
+            let pool = sqlite_pool(&config).await?;
+            let es = std::time::Instant::now();
+            let r = sqlite_run(&pool, &prefixed).await?;
+            (r.0, r.1, r.2, r.3, es)
+        }
+        _ => return Err("不支持的数据库类型".to_string()),
+    };
     Ok(QueryResult {
         id: uuid::Uuid::new_v4().to_string(),
         columns: column_meta.iter().map(|m| m.name.clone()).collect(),
@@ -1884,7 +2027,7 @@ async fn explain_query(
         affected_rows: affected,
         execution_time_ms: start.elapsed().as_millis() as u64,
         is_query,
-        timings: crate::new_timings(start),
+        timings: build_timings(start, connect_start, exec_start),
         truncated: false,
         total_rows: 0,
     })
@@ -2501,6 +2644,154 @@ mod tests {
         assert!(!r.rows.is_empty(), "EXPLAIN 应至少 1 行（plan id）");
         // SQLite EXPLAIN QUERY PLAN 输出列：id, parent, notused, detail
         assert!(r.column_meta.len() >= 1, "SQLite EXPLAIN QUERY PLAN 至少 1 列");
+    }
+
+    /// T-041 验收：分段耗时结构正确
+    #[tokio::test]
+    async fn segmented_timings_populated() {
+        let c = cfg("sqlite", "", 0, ":memory:");
+        let r = execute_query(
+            "SELECT 1".into(),
+            c,
+            Some("readOnly".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // connect_ms 包含 execute_ms 的时间范围
+        assert!(
+            r.timings.connect_ms >= r.timings.execute_ms,
+            "connect_ms({}) 应 >= execute_ms({})",
+            r.timings.connect_ms, r.timings.execute_ms
+        );
+        // total_ms 包含 connect_ms 的时间范围
+        assert!(
+            r.timings.total_ms >= r.timings.connect_ms,
+            "total_ms({}) 应 >= connect_ms({})",
+            r.timings.total_ms, r.timings.connect_ms
+        );
+    }
+
+    /// T-043 验收：BEGIN 语句执行后更新 registry 事务状态
+    #[tokio::test(flavor = "current_thread")]
+    async fn transaction_tracking_updates_registry() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-tx-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let old = std::env::var("Z_BIZ_TOOL_DB_DATA_DIR").ok();
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+
+        let c = cfg("sqlite", "", 0, ":memory:");
+        let gen = 42u32;
+
+        // BEGIN 需要 writable + approval
+        let begin_sql = "BEGIN TRANSACTION";
+        let grant = security::ApprovalGrant {
+            approval_id: uuid::Uuid::new_v4().to_string(),
+            sql_digest: security::digest_sql(begin_sql),
+            environment: "test".into(),
+            issued_at: 0,
+            expires_at: chrono::Utc::now().timestamp() + 60,
+            consumed: false,
+        };
+        let r = execute_query(
+            begin_sql.into(),
+            c.clone(),
+            Some("writable".into()),
+            Some(grant),
+            Some(gen),
+            None,
+        )
+        .await;
+        assert!(r.is_ok(), "BEGIN TRANSACTION 应成功: {:?}", r.err());
+
+        // 验证 registry 中事务状态为 Active
+        let reg = db::session::registry();
+        let conn_key = format!("{}:{}", c.id, gen);
+        let state = reg.get_transaction_state(&conn_key);
+        assert!(state.is_some(), "registry 中应有事务状态");
+        assert_eq!(
+            state.unwrap(),
+            db::session::TransactionState::Active,
+            "BEGIN 后事务状态应为 Active"
+        );
+
+        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
+        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
+    }
+
+    /// T-035 验收：execute_query 成功后自动写入历史
+    /// 注意：此测试修改 process-global env var，需单独运行 `cargo test --lib auto_history -- --ignored`
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn auto_history_recorded_on_success() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-hist-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let old = std::env::var("Z_BIZ_TOOL_DB_DATA_DIR").ok();
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+        let c = cfg("sqlite", "", 0, ":memory:");
+        let _r = execute_query(
+            "SELECT 42 AS answer".into(),
+            c,
+            Some("readOnly".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let history = queries::load_history().await.unwrap();
+        assert!(!history.is_empty(), "执行成功后应自动写入历史");
+        let item = &history[0];
+        assert!(item.sql.contains("SELECT 42"), "历史 SQL 应包含原始语句，实际: {}", item.sql);
+        assert!(item.success, "成功查询 success 应为 true");
+        assert!(item.error.is_none(), "成功查询 error 应为 None");
+        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
+        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
+    }
+
+    /// T-035 验收：execute_query 失败后也自动写入历史
+    /// 注意：此测试修改 process-global env var，需单独运行 `cargo test --lib auto_history -- --ignored`
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn auto_history_recorded_on_failure() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-hist-fail-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let old = std::env::var("Z_BIZ_TOOL_DB_DATA_DIR").ok();
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+        let c = cfg("sqlite", "", 0, ":memory:");
+        let err = execute_query(
+            "INVALID SQL SYNTAX !!!".into(),
+            c,
+            Some("readOnly".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let history = queries::load_history().await.unwrap();
+        assert!(!history.is_empty(), "执行失败后也应自动写入历史");
+        let item = &history[0];
+        assert!(!item.success, "失败查询 success 应为 false，实际: {:?}", item.success);
+        assert!(item.error.is_some(), "失败查询应有 error 信息");
+        assert!(item.error.as_ref().unwrap().len() <= 200, "error 信息应被截断");
+        let _ = err;
+        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
+        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
     }
 
     /// T-006 验收：默认只读拒绝写入
