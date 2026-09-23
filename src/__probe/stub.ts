@@ -175,6 +175,24 @@ function invoke(cmd: string, args: any): Promise<any> {
       );
     case "execute_query":
       return fail("探针不执行真实 SQL：请走 report_* 链路");
+    // ================== 四条 AI 解说链路 ==================
+    // 后端这四个命令都回纯文本；探针只验"参数键名与结构对不对"，
+    // 因为 Tauri v2 会把 Rust 形参 snake_case 映射成 camelCase 载荷键。
+    case "ai_optimize_sql":
+    case "ai_explain_sql":
+    case "ai_diagnose_error":
+    case "ai_explain_results": {
+      if (window.__PROBE_FLAG("aitextfail")) {
+        return fail('AI 服务返回 401 Unauthorized：{"error":{"message":"invalid api key"}}');
+      }
+      const note =
+        cmd === "ai_optimize_sql"
+          ? `（收到 tableSchema ${Array.isArray(a.tableSchema) ? a.tableSchema.length : "缺失"} 项）`
+          : cmd === "ai_explain_results"
+            ? `（收到 ${Array.isArray(a.results) ? a.results.length : "缺失"} 行样例）`
+            : "";
+      return Promise.resolve(`${cmd} 的回答${note}\n1. 摘要\n2. 建议`);
+    }
     default:
       return Promise.resolve(null);
   }

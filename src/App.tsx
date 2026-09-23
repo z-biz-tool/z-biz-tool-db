@@ -70,6 +70,7 @@ import { useAgentStore } from "./agent/AgentManager";
 import AgentPanel from "./agent/AgentPanel";
 import { ReportWorkbench } from "./report/ReportWorkbench";
 import { aiSqlGenerate, reportDescribeColumns } from "./report/api";
+import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
 import type { CatalogTable, SqlDraft } from "./report/types";
 
 // 渐变色主题常量
@@ -375,6 +376,8 @@ function App() {
   // 前端预检就没过（列清单读不出来）和后端本机校验打回是两件事，
   // 混成一个标题会让人以为模型编错了字段
   const [aiDraftPrecheck, setAiDraftPrecheck] = useState(false);
+  // 四条解说链路的失败原因，显示在弹窗里而不是只闪一句 toast
+  const [aiTextError, setAiTextError] = useState("");
 
   const [msgApi, msgContext] = message.useMessage();
 
@@ -632,24 +635,55 @@ function App() {
     }
   };
 
+  // 四条解说链路（优化/解释/诊断/结果）只回文字，不动数据：
+  // 会改库的那两条另有本机校验与审批门禁。
+  const runAiText = async (call: () => Promise<string>) => {
+    if (!aiConfig.baseUrl || !aiConfig.apiKey || !aiConfig.model) {
+      msgApi.warning("先配置 AI 服务地址、密钥与模型");
+      setShowAiConfigModal(true);
+      return;
+    }
+    setAiLoading(true);
+    setAiTextError("");
+    setAiResult("");
+    try {
+      setAiResult(await call());
+      msgApi.success("AI 已作答");
+    } catch (e: any) {
+      // 后端把 HTTP 状态码与响应原文一起带回来，别只留一句"服务错误"
+      setAiTextError(String(e));
+      msgApi.error("AI 没答上来");
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  // 索引建议得看得懂表：左侧选中了哪张表，就把它的真实字段结构一起给模型
+  const schemaForAi = async (): Promise<ColumnInfo[]> => {
+    if (!selectedConnection || !selectedTable) return [];
+    if (columns.length) return columns;
+    try {
+      const cols = await invoke<ColumnInfo[]>("get_table_structure", {
+        tableName: selectedTable,
+        config: toBackendConfig(selectedConnection),
+        schema: null,
+      });
+      setColumns(cols);
+      return cols;
+    } catch (e: any) {
+      msgApi.warning(`读 ${selectedTable} 的字段结构失败：${e}`);
+      return [];
+    }
+  };
+
   const handleAiOptimizeSql = async () => {
     if (!aiSqlForOptimize.trim()) {
       msgApi.warning("请输入要优化的 SQL");
       return;
     }
-
-    try {
-      const result = await useAgentStore.getState().optimize(aiSqlForOptimize);
-
-      if (result.success && result.sql) {
-        setAiResult(result.content);
-        setShowAiResultModal(true);
-      } else if (result.error) {
-        msgApi.error(`Agent 错误: ${result.error}`);
-      }
-    } catch (e: any) {
-      msgApi.error(`AI 服务错误: ${e}`);
-    }
+    const schema = await schemaForAi();
+    if (!schema.length) msgApi.warning("没带表结构，索引建议只能是泛泛而谈");
+    await runAiText(() => aiOptimizeSql(aiSqlForOptimize, schema, aiConfigForReport));
   };
 
   const handleAiExplainSql = async () => {
@@ -657,19 +691,7 @@ function App() {
       msgApi.warning("请输入要解释的 SQL");
       return;
     }
-
-    try {
-      const result = await useAgentStore.getState().optimize(aiSqlForExplain);
-
-      if (result.success) {
-        setAiResult(result.content);
-        setShowAiResultModal(true);
-      } else if (result.error) {
-        msgApi.error(`Agent 错误: ${result.error}`);
-      }
-    } catch (e: any) {
-      msgApi.error(`AI 服务错误: ${e}`);
-    }
+    await runAiText(() => aiExplainSql(aiSqlForExplain, aiConfigForReport));
   };
 
   const handleAiDiagnoseError = async () => {
@@ -677,19 +699,7 @@ function App() {
       msgApi.warning("请输入错误信息和 SQL");
       return;
     }
-
-    try {
-      const result = await useAgentStore.getState().diagnoseError(aiErrorMessage, aiSqlForError);
-
-      if (result.success) {
-        setAiResult(result.content);
-        setShowAiResultModal(true);
-      } else if (result.error) {
-        msgApi.error(`Agent 错误: ${result.error}`);
-      }
-    } catch (e: any) {
-      msgApi.error(`AI 服务错误: ${e}`);
-    }
+    await runAiText(() => aiDiagnoseError(aiErrorMessage, aiSqlForError, aiConfigForReport));
   };
 
   const handleAiExplainResults = async () => {
@@ -697,21 +707,20 @@ function App() {
       msgApi.warning("请先执行查询");
       return;
     }
-    // T-049：上下文授权提示前置——S2 将插入 Modal.confirm
-    // 截取前 100 行作为样例，最大 64 KiB；明示 NOT_CONFIGURED 边界
+    // T-049：只喂前 100 行样例，不把整张结果表交给模型
     const sample = queryResults.slice(0, 100);
-    try {
-      const result = await useAgentStore.getState().analyze(sqlCode, sample);
+    await runAiText(() => aiExplainResults(sqlCode, sample, aiConfigForReport));
+  };
 
-      if (result.success) {
-        setAiResult(result.content);
-        setShowAiResultModal(true);
-      } else if (result.error) {
-        msgApi.error(`Agent 错误: ${result.error}`);
-      }
-    } catch (e: any) {
-      msgApi.error(`AI 服务错误: ${e}`);
+  // 打开 AI 助手：三条 SQL 输入默认用编辑器当前内容，手抄一遍没有意义
+  const openAiAssistant = () => {
+    const cur = sqlCode.trim();
+    if (cur) {
+      setAiSqlForOptimize((v) => v || cur);
+      setAiSqlForExplain((v) => v || cur);
+      setAiSqlForError((v) => v || cur);
     }
+    setShowAiResultModal(true);
   };
 
   // 保存 AI 配置
@@ -1238,11 +1247,7 @@ function App() {
               />
               <Space>
                 <Tooltip title="AI 助手">
-                  <Button
-                    type="primary"
-                    icon={<RobotOutlined />}
-                    onClick={() => setShowAiResultModal(true)}
-                  />
+                  <Button type="primary" icon={<RobotOutlined />} onClick={openAiAssistant} />
                 </Tooltip>
                 <Tooltip title="AI 服务设置">
                   <SettingOutlined
@@ -1935,7 +1940,7 @@ function App() {
               label: (
                 <Space>
                   <RobotOutlined />
-                  Agent 对话
+                  Agent 对话（未接通）
                 </Space>
               ),
               children: (
@@ -2103,7 +2108,14 @@ function App() {
               children: (
                 <div style={{ marginTop: 16 }}>
                   <Form layout="vertical">
-                    <Form.Item label="要优化的 SQL">
+                    <Form.Item
+                      label="要优化的 SQL"
+                      help={
+                        selectedTable
+                          ? `会带上左侧选中表 ${selectedTable} 的 ${columns.length} 个真实字段，索引建议才落到实处`
+                          : "先在左侧选中一张表，否则模型看不到表结构，索引建议只能泛泛而谈"
+                      }
+                    >
                       <TextArea
                         value={aiSqlForOptimize}
                         onChange={(e) => setAiSqlForOptimize(e.target.value)}
@@ -2225,6 +2237,22 @@ function App() {
             },
           ]}
         />
+
+        {aiTextError && (
+          <Alert
+            type="error"
+            showIcon
+            closable
+            onClose={() => setAiTextError("")}
+            style={{ marginTop: 16 }}
+            title="这一条没答上来"
+            description={
+              <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
+                {aiTextError}
+              </div>
+            }
+          />
+        )}
 
         {aiResult && (
           <Card
