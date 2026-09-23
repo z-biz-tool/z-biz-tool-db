@@ -3,6 +3,8 @@
 // 一条链路：选表 → 组目录 → ai_report_draft（模型只写语义规格，本机校验挡住幻觉）
 // → report_view_render（跨库取数 + 内存算子链）→ 看板。
 // 用户全程不写 SQL，但每一步都能看到下了哪些 SQL、走了哪些算子。
+// 跑通的一稿可以「存入报表簿」（save_report）：存规格而不是结果，
+// 下次点开即重新取数，看到的永远是库里当下的数字。
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -13,6 +15,9 @@ import {
   Collapse,
   Empty,
   Input,
+  List,
+  Modal,
+  Popconfirm,
   Select,
   Space,
   Spin,
@@ -25,21 +30,34 @@ import {
 import {
   BulbOutlined,
   CheckCircleOutlined,
+  DeleteOutlined,
+  FolderOpenOutlined,
   ReloadOutlined,
   RobotOutlined,
+  SaveOutlined,
   ThunderboltOutlined,
 } from "@ant-design/icons";
 import {
   aiReportDraft,
+  deleteReport,
   listTables,
+  loadReports,
   reportDescribeColumns,
   reportViewRender,
   reportViewValidate,
+  saveReport,
   type AIConfig,
   type BackendConfig,
   type TableSummary,
 } from "./api";
-import type { CatalogTable, DraftResult, ViewPayload, ViewSpec, DatasetSpec } from "./types";
+import type {
+  CatalogTable,
+  DatasetSpec,
+  DraftResult,
+  SavedReport,
+  ViewPayload,
+  ViewSpec,
+} from "./types";
 import { ReportBoard, SqlList } from "./ReportBoard";
 
 const { Text, Title } = Typography;
@@ -77,7 +95,26 @@ export function ReportWorkbench({
   // 只校验用自己的 loading：它不取数、比渲染便宜，共用一个开关会让
   // "取数并渲染"在检查期间转圈并吞掉点击，看起来像卡住。
   const [checking, setChecking] = useState(false);
-  const [error, setError] = useState<string>("");
+  // 失败分两段：标题说"哪一步拒的"，详情留后端原文。只给一句大字符串的话，
+  // 缺连接和幻觉字段会顶同一个标题，用户分不出该去补表还是该改问题。
+  const [error, setError] = useState<{ title: string; detail: string } | null>(null);
+  const [tab, setTab] = useState("board");
+
+  // 报表簿
+  const [reports, setReports] = useState<SavedReport[]>([]);
+  // 读失败与"读到了但一条没有"必须分开：把损坏的 reports.json 显示成
+  // "报表簿还是空的"，用户会以为存过的东西消失了。
+  const [reportsError, setReportsError] = useState("");
+  const [reportsLoading, setReportsLoading] = useState(false);
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveName, setSaveName] = useState("");
+  const [saveDesc, setSaveDesc] = useState("");
+  // 当前工作台里这份稿子对应报表簿里的哪一条（空 = 还没存过）
+  const [openId, setOpenId] = useState("");
+  const [openName, setOpenName] = useState("");
+  // 打开/保存那一刻的 spec 原文，用来判断"改过没有"，决定按钮该写更新还是已存
+  const [savedSpecText, setSavedSpecText] = useState("");
 
   // 与查询链路同一套防竞态：晚到的响应不能盖掉新结果
   const runId = useRef(0);
@@ -112,6 +149,24 @@ export function ReportWorkbench({
       cancelled = true;
     };
   }, [configs]);
+
+  const refreshReports = async () => {
+    setReportsLoading(true);
+    try {
+      setReports((await loadReports()) || []);
+      setReportsError("");
+    } catch (e) {
+      // 读不出来说明落盘文件坏了，得让用户看见，而不是给一个空列表以为没存过
+      setReportsError(String(e));
+      msgApi.error(`报表簿读取失败：${e}`);
+    } finally {
+      setReportsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshReports();
+  }, []);
 
   const catalog: CatalogTable[] = useMemo(() => {
     const byId = new Map(configs.map((c) => [c.id, c]));
@@ -163,6 +218,10 @@ export function ReportWorkbench({
     setDraft(d);
     setPayload(null);
     setSpecText(JSON.stringify({ datasets: d.datasets, view: d.view }, null, 2));
+    // 新草稿与之前打开的那条没关系了，保存必须落到新条目上
+    setOpenId("");
+    setOpenName("");
+    setSavedSpecText("");
   };
 
   const onDraft = async () => {
@@ -176,7 +235,7 @@ export function ReportWorkbench({
     }
     const id = ++runId.current;
     setDrafting(true);
-    setError("");
+    setError(null);
     try {
       const d = await aiReportDraft(question, catalog, aiConfig);
       if (id !== runId.current) return;
@@ -186,7 +245,7 @@ export function ReportWorkbench({
       );
     } catch (e) {
       if (id !== runId.current) return;
-      setError(String(e));
+      setError({ title: "本机拒绝了这一稿", detail: String(e) });
       msgApi.error("生成失败");
     } finally {
       if (id === runId.current) setDrafting(false);
@@ -203,26 +262,32 @@ export function ReportWorkbench({
     }
   }, [specText]);
 
-  const onRender = async () => {
-    if (!spec.view || !spec.datasets) {
-      msgApi.warning(spec.parseError || "先有一份合法的草稿 JSON");
-      return;
-    }
+  /** 抽出来是为了"打开报表即取数"：那时 specText 的 state 还没落地，不能走 onRender */
+  const runRender = async (view: ViewSpec, datasets: DatasetSpec[]) => {
     const id = ++runId.current;
     setRendering(true);
-    setError("");
+    setError(null);
     try {
-      const p = await reportViewRender(spec.view, spec.datasets, configs);
+      const p = await reportViewRender(view, datasets, configs);
       if (id !== runId.current) return;
       setPayload(p);
       msgApi.success(`${p.charts.length} 个组件 · ${p.elapsed_ms} ms`);
     } catch (e) {
       if (id !== runId.current) return;
-      setError(String(e));
+      // 这一段是真的下了 SQL 到库上，拒因多半来自数据库而不是语义层，标题别说反
+      setError({ title: "取数失败", detail: String(e) });
       msgApi.error("渲染失败");
     } finally {
       if (id === runId.current) setRendering(false);
     }
+  };
+
+  const onRender = async () => {
+    if (!spec.view || !spec.datasets) {
+      msgApi.warning(spec.parseError || "先有一份合法的草稿 JSON");
+      return;
+    }
+    await runRender(spec.view, spec.datasets);
   };
 
   /** 只跑计划不取数：改完 JSON 先自检一次，比直接渲染便宜得多 */
@@ -233,17 +298,124 @@ export function ReportWorkbench({
     }
     const id = ++runId.current;
     setChecking(true);
-    setError("");
+    setError(null);
     try {
       const r = await reportViewValidate(spec.view, spec.datasets, configs);
       if (id !== runId.current) return;
       msgApi.success(`校验通过：${r.steps.length} 步算子链，${r.sqls.length} 条下推 SQL`);
     } catch (e) {
       if (id !== runId.current) return;
-      setError(String(e));
+      setError({ title: "本机拒绝了这一稿", detail: String(e) });
       msgApi.error("校验未通过");
     } finally {
       if (id === runId.current) setChecking(false);
+    }
+  };
+
+  // ================== 报表簿 ==================
+
+  const specReady = Boolean(spec.view && spec.datasets) && !spec.parseError;
+  const dirty = Boolean(openId) && specText !== savedSpecText;
+
+  const openSaveDialog = () => {
+    if (!specReady) {
+      msgApi.warning(spec.parseError || "先有一份合法的草稿 JSON");
+      return;
+    }
+    setSaveName(openName || spec.view?.name || question.trim().slice(0, 30) || "未命名报表");
+    setSaveDesc(reports.find((r) => r.id === openId)?.description || "");
+    setSaveOpen(true);
+  };
+
+  /** asNew = 另存一份；否则有 openId 就更新那一条 */
+  const onSave = async (asNew: boolean) => {
+    if (!spec.view || !spec.datasets) return;
+    const name = saveName.trim();
+    if (!name) {
+      msgApi.warning("给报表起个名字，不然报表簿里认不出它");
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const id = asNew || !openId ? crypto.randomUUID() : openId;
+    const item: SavedReport = {
+      id,
+      name,
+      description: saveDesc.trim() || null,
+      question,
+      datasets: spec.datasets,
+      // 视图名跟着报表名走，否则看板标题还是模型起的那句
+      view: { ...spec.view, name },
+      created_at: now,
+      updated_at: now,
+    };
+    setSaving(true);
+    try {
+      await saveReport(item);
+      setOpenId(id);
+      setOpenName(name);
+      setSavedSpecText(specText);
+      setSaveOpen(false);
+      await refreshReports();
+      msgApi.success(asNew || !openId ? "已另存为新报表" : "报表已更新");
+    } catch (e) {
+      // 后端存前会做一次结构体检（布局越栏、组件挂空数据集），拒因要看得见
+      msgApi.error(`保存失败：${e}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const onOpenReport = async (r: SavedReport) => {
+    const text = JSON.stringify({ datasets: r.datasets, view: r.view }, null, 2);
+    const keys = [
+      ...new Set(
+        r.datasets.flatMap((d) =>
+          d.sources.map((s) =>
+            keyOf({ connection_id: s.connection_id, schema: s.schema || "", table: s.table })
+          )
+        )
+      ),
+    ];
+    setSpecText(text);
+    setSavedSpecText(text);
+    setQuestion(r.question || "");
+    setPicked(keys);
+    setDraft(null);
+    setPayload(null);
+    setOpenId(r.id);
+    setOpenName(r.name);
+    setTab("board");
+    keys.forEach(ensureColumns);
+    runId.current += 1; // 让可能在飞的草稿/渲染响应作废
+
+    // 连接被删过就别去取数：后端只会回一句"找不到连接"，
+    // 用户看不出该回去补哪张表
+    const need = [...new Set(r.datasets.flatMap((d) => d.sources.map((s) => s.connection_id)))];
+    const gone = need.filter((id) => !configs.some((c) => c.id === id));
+    if (gone.length) {
+      setError({
+        title: "报表需要的连接不在本机",
+        detail: `这张报表用到的连接已不存在：${gone.join("、")}。\n请在左侧重新选表，或改规格 JSON 里的 connection_id 后再取数。`,
+      });
+      msgApi.warning("缺少连接，已载入规格但未取数");
+      return;
+    }
+    await runRender(r.view, r.datasets);
+  };
+
+  const onDeleteReport = async (r: SavedReport) => {
+    try {
+      await deleteReport(r.id);
+      // 删的正是当前打开的那条：清掉 openId，否则下一次"保存"会把已删条目复活
+      if (openId === r.id) {
+        setOpenId("");
+        setOpenName("");
+        setSavedSpecText("");
+      }
+      await refreshReports();
+      msgApi.success(`已从报表簿移除「${r.name}」`);
+    } catch (e) {
+      msgApi.error(`删除失败：${e}`);
     }
   };
 
@@ -378,12 +550,12 @@ export function ReportWorkbench({
             type="error"
             showIcon
             closable
-            onClose={() => setError("")}
+            onClose={() => setError(null)}
             style={{ marginBottom: 12 }}
-            title="本机拒绝了这一稿"
+            title={error.title}
             description={
               <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
-                {error}
+                {error.detail}
               </div>
             }
           />
@@ -406,6 +578,18 @@ export function ReportWorkbench({
           >
             只校验
           </Button>
+          <Tooltip
+            title={
+              openId
+                ? `当前稿对应报表簿里的「${openName}」。存的是规格（数据集 + 视图），不是这一次跑出来的数字。`
+                : "存的是规格（数据集 + 视图），不是这一次跑出来的数字"
+            }
+          >
+            {/* 名字放 tooltip 而不是按钮上：报表名是用户手打的，写进文案里会把这一排按钮挤没 */}
+            <Button icon={<SaveOutlined />} disabled={!specReady} onClick={openSaveDialog}>
+              {openId ? (dirty ? "更新报表（改过）" : "已存入报表") : "存入报表簿"}
+            </Button>
+          </Tooltip>
           {payload && (
             <Button
               icon={<ReloadOutlined />}
@@ -414,6 +598,9 @@ export function ReportWorkbench({
                 setDraft(null);
                 setSpecText("");
                 setQuestion("");
+                setOpenId("");
+                setOpenName("");
+                setSavedSpecText("");
                 runId.current += 1;
               }}
             >
@@ -424,6 +611,8 @@ export function ReportWorkbench({
         </Space>
         {/* Tabs 始终在：空态文案让用户"切到规格 JSON 手搓"，就不能先把手搓那条路藏起来 */}
         <Tabs
+          activeKey={tab}
+          onChange={setTab}
           items={[
             {
               key: "board",
@@ -439,13 +628,120 @@ export function ReportWorkbench({
                   <Empty
                     description={
                       <Space orientation="vertical">
-                        <Text>还没有草稿。左侧选表并描述需求，或者直接切到「规格 JSON」手搓。</Text>
+                        <Text>
+                          还没有草稿。左侧选表并描述需求，切到「规格 JSON」手搓，或者从「报表簿
+                          {reports.length ? `（${reports.length} 张）` : ""}」打开上次存下的报表。
+                        </Text>
                         <Text type="secondary" style={{ fontSize: 12 }}>
                           跨库报表在本机内存里 join：不同连接的表可以进同一张图，SQL 只按单表下推。
                         </Text>
                       </Space>
                     }
                     style={{ marginTop: 60 }}
+                  />
+                ),
+            },
+            {
+              key: "book",
+              label: reportsError ? "报表簿（异常）" : `报表簿 ${reports.length}`,
+              children: reportsError ? (
+                // 读失败绝不能退化成"报表簿还是空的"：那会让用户以为存过的东西没了
+                <Alert
+                  type="error"
+                  showIcon
+                  title="报表簿读不出来"
+                  description={
+                    <Space orientation="vertical" style={{ width: "100%" }}>
+                      <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
+                        {reportsError}
+                      </div>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        落盘文件是 reports.json（带校验和）。真损坏了就删掉这个文件重新开始，
+                        存过的报表规格不会自动找回。
+                      </Text>
+                      <Button size="small" icon={<ReloadOutlined />} onClick={refreshReports}>
+                        重试
+                      </Button>
+                    </Space>
+                  }
+                />
+              ) : reportsLoading && reports.length === 0 ? (
+                <Spin style={{ display: "block", margin: "60px auto" }} />
+              ) : reports.length === 0 ? (
+                  <Empty
+                    description="报表簿还是空的。跑通一稿后点「存入报表簿」，下次直接点开就能重跑。"
+                    style={{ marginTop: 60 }}
+                  />
+                ) : (
+                  <List
+                    dataSource={reports}
+                    renderItem={(r) => {
+                      const conns = [
+                        ...new Set(
+                          r.datasets.flatMap((d) => d.sources.map((s) => s.connection_id))
+                        ),
+                      ];
+                      const named = conns.map((id) => configs.find((c) => c.id === id)?.name || id);
+                      return (
+                        <List.Item
+                          key={r.id}
+                          actions={[
+                            <Button
+                              key="open"
+                              size="small"
+                              type="primary"
+                              ghost
+                              icon={<FolderOpenOutlined />}
+                              onClick={() => onOpenReport(r)}
+                            >
+                              打开并取数
+                            </Button>,
+                            <Popconfirm
+                              key="del"
+                              title={`移除「${r.name}」？`}
+                              description="只删本地这一条报表规格，不会动库里的数据。"
+                              okText="移除"
+                              // 应用没有挂 zh_CN 的 ConfigProvider，不显式给就是英文 Cancel
+                              cancelText="取消"
+                              okButtonProps={{ danger: true }}
+                              onConfirm={() => onDeleteReport(r)}
+                            >
+                              <Button size="small" danger type="text" icon={<DeleteOutlined />} />
+                            </Popconfirm>,
+                          ]}
+                        >
+                          <List.Item.Meta
+                            title={
+                              <Space size={6} wrap>
+                                <Text strong>{r.name}</Text>
+                                {r.id === openId && <Tag color="processing">当前</Tag>}
+                                <Tag color={conns.length > 1 ? "purple" : "default"}>
+                                  {conns.length > 1 ? `跨 ${conns.length} 库` : `单库`}
+                                </Tag>
+                                <Tag>{r.datasets.length} 数据集</Tag>
+                                <Tag>{r.view.widgets.length} 组件</Tag>
+                                <Text type="secondary" style={{ fontSize: 12 }}>
+                                  {new Date(r.updated_at * 1000).toLocaleString()}
+                                </Text>
+                              </Space>
+                            }
+                            description={
+                              <Space orientation="vertical" size={2} style={{ width: "100%" }}>
+                                {r.description && <Text>{r.description}</Text>}
+                                <Text type="secondary" style={{ fontSize: 12 }} ellipsis>
+                                  连接：{named.join(" + ")}
+                                </Text>
+                                {r.question && (
+                                  <Text type="secondary" style={{ fontSize: 12 }} ellipsis>
+                                    问题：{r.question}
+                                  </Text>
+                                )}
+                              </Space>
+                            }
+                          />
+                        </List.Item>
+                      );
+                    }}
                   />
                 ),
             },
@@ -498,6 +794,49 @@ export function ReportWorkbench({
           ]}
         />
       </div>
+
+      <Modal
+        open={saveOpen}
+        title={openId ? `保存到报表簿 · ${openName}` : "存入报表簿"}
+        width={520}
+        onCancel={() => setSaveOpen(false)}
+        footer={[
+          <Button key="cancel" onClick={() => setSaveOpen(false)}>
+            取消
+          </Button>,
+          // 已经在报表簿里一条上：给一条不改原稿的岔路，改名不再是"覆盖旧报表"
+          ...(openId
+            ? [
+                <Button key="fork" loading={saving} onClick={() => onSave(true)}>
+                  另存为新报表
+                </Button>,
+              ]
+            : []),
+          <Button key="ok" type="primary" loading={saving} onClick={() => onSave(false)}>
+            保存
+          </Button>,
+        ]}
+      >
+        <Space orientation="vertical" style={{ width: "100%" }}>
+          <Input
+            autoFocus
+            value={saveName}
+            onChange={(e) => setSaveName(e.target.value)}
+            placeholder="报表名称，例：月度 GMV（商城库 × 客户库）"
+            onPressEnter={() => onSave(false)}
+          />
+          <TextArea
+            rows={2}
+            value={saveDesc}
+            onChange={(e) => setSaveDesc(e.target.value)}
+            placeholder="备注（可选）：口径、过滤条件为什么这么写"
+          />
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            存的是规格：数据集定义与视图布局。每次打开仍会重新取数，看到的永远是库里当下的数字；
+            连接被删过会在载入时点出来，不会静默给一张空看板。
+          </Text>
+        </Space>
+      </Modal>
     </div>
   );
 }

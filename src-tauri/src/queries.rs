@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
-use crate::{QueryHistoryItem, SavedQuery, ConnectionRecord};
+use crate::{ConnectionRecord, QueryHistoryItem, SavedQuery, SavedReport};
 
 /// 数据目录获取
 /// S0 修复：失败时返回 Err 而非静默 `.ok()`（DB-09）。
@@ -40,6 +40,10 @@ fn history_path() -> Result<PathBuf, String> {
 
 fn saved_queries_path() -> Result<PathBuf, String> {
     Ok(data_dir()?.join("saved_queries.json"))
+}
+
+fn reports_path() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join("reports.json"))
 }
 
 /// 当前 schema 版本号；后续迁移递增
@@ -298,6 +302,74 @@ pub async fn delete_saved_query(id: &str) -> Result<(), String> {
     let mut all = load_saved_queries_inner().await?;
     all.retain(|q| q.id != id);
     save_envelope(&saved_queries_path()?, &all, CURRENT_SCHEMA_VERSION)
+}
+
+// ================== 报表簿 ==================
+
+/// 保存前的一次纯结构体检：不碰数据库，所以查不了列名，但布局越栏、
+/// 组件挂空数据集这类"存进去就注定打不开"的问题能当场拦住，
+/// 免得报表簿里攒下一堆点开就报错的条目。
+fn check_report_shape(item: &SavedReport) -> Result<(), String> {
+    if item.name.trim().is_empty() {
+        return Err("报表缺少名称".into());
+    }
+    if item.datasets.is_empty() {
+        return Err("报表没有任何数据集，存进来也跑不出东西".into());
+    }
+    let ids: Vec<&str> = item.datasets.iter().map(|d| d.id.as_str()).collect();
+    if ids.len() != ids.iter().collect::<std::collections::HashSet<_>>().len() {
+        return Err("数据集 id 有重复，同名数据集无法区分".into());
+    }
+    for w in &item.view.widgets {
+        if !ids.contains(&w.dataset.as_str()) {
+            return Err(format!(
+                "组件 {} 绑定的数据集 {} 不存在（现有：{}）",
+                w.id,
+                w.dataset,
+                ids.join(", ")
+            ));
+        }
+    }
+    crate::report::view::resolve_layout(&item.view).map_err(|e| format!("布局不合法：{e}"))?;
+    Ok(())
+}
+
+pub async fn save_report(item: SavedReport) -> Result<(), String> {
+    check_report_shape(&item)?;
+    let mut all = load_reports_inner().await?;
+    let mut item = item;
+    if let Some(old) = all.iter().find(|r| r.id == item.id) {
+        // 首次落盘时间由后端定，之后不管前端传什么都不作数：
+        // 否则用户改一次名字，"创建于"就被刷成现在。
+        if old.created_at > 0 {
+            item.created_at = old.created_at;
+        }
+    }
+    all.retain(|r| r.id != item.id);
+    all.push(item);
+    save_envelope(&reports_path()?, &all, CURRENT_SCHEMA_VERSION)
+}
+
+/// 载入报表簿，按最近修改排序。
+/// 存储顺序是"追加在后"，改一次就跳到最后；列表按这个顺序会把
+/// 用户刚编辑的那张埋进底部，所以在这里排一次。
+pub async fn load_reports() -> Result<Vec<SavedReport>, String> {
+    let mut all = load_reports_inner().await?;
+    all.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+    Ok(all)
+}
+
+async fn load_reports_inner() -> Result<Vec<SavedReport>, String> {
+    match load_envelope::<Vec<SavedReport>>(&reports_path()?, CURRENT_SCHEMA_VERSION)? {
+        Some(payload) => Ok(payload),
+        None => Ok(Vec::new()),
+    }
+}
+
+pub async fn delete_report(id: &str) -> Result<(), String> {
+    let mut all = load_reports_inner().await?;
+    all.retain(|r| r.id != id);
+    save_envelope(&reports_path()?, &all, CURRENT_SCHEMA_VERSION)
 }
 
 // ================== 连接配置 ==================

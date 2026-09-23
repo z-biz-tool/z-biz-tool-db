@@ -204,3 +204,16 @@ export interface DraftResult {
   /** 模型被本机校验打回了几次 */
   repairs: number;
 }
+
+/** 报表簿条目：存的是 spec 而不是结果，落盘在后端 queries.rs */
+export interface SavedReport {
+  id: string;
+  name: string;
+  description?: string | null;
+  /** 起草时的自然语言问题，重新起草时回填 */
+  question: string;
+  datasets: DatasetSpec[];
+  view: ViewSpec;
+  created_at: number;
+  updated_at: number;
+}

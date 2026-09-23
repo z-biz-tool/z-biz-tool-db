@@ -10,6 +10,7 @@ import type {
   DatasetPayload,
   DatasetSpec,
   DraftResult,
+  SavedReport,
   SqlPreview,
   ValidationReport,
   ViewPayload,
@@ -95,3 +96,14 @@ export const reportDescribeColumns = (
 
 export const listTables = (config: BackendConfig): Promise<TableSummary[]> =>
   invoke<TableSummary[]>("get_tables", { config });
+
+// ================== 报表簿 ==================
+// 存的是 spec 而不是结果：结果依赖库里当下的数据，spec 才是明天还能重跑的东西。
+
+export const saveReport = (item: SavedReport): Promise<void> =>
+  invoke<void>("save_report", { item });
+
+/** 后端按 updated_at 倒序返回，刚改过的排在最前 */
+export const loadReports = (): Promise<SavedReport[]> => invoke<SavedReport[]>("load_reports");
+
+export const deleteReport = (id: string): Promise<void> => invoke<void>("delete_report", { id });

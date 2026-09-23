@@ -173,6 +173,23 @@ pub struct SavedQuery {
     pub updated_at: i64,
 }
 
+/// 报表簿条目：存的是 spec（数据集定义 + 视图布局），不是查询结果。
+/// 结果依赖库里当下的数据，spec 才是次日还能重跑的那份东西。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedReport {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// 起草时用的自然语言问题；重新起草时回填
+    #[serde(default)]
+    pub question: String,
+    pub datasets: Vec<crate::report::dataset::DatasetSpec>,
+    pub view: crate::report::view::ViewSpec,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportedConnection {
     pub name: String,
@@ -2260,6 +2277,22 @@ async fn delete_saved_query(id: String) -> Result<(), String> {
     queries::delete_saved_query(&id).await
 }
 
+// 报表簿
+#[command]
+async fn save_report(item: SavedReport) -> Result<(), String> {
+    queries::save_report(item).await
+}
+
+#[command]
+async fn load_reports() -> Result<Vec<SavedReport>, String> {
+    queries::load_reports().await
+}
+
+#[command]
+async fn delete_report(id: String) -> Result<(), String> {
+    queries::delete_report(&id).await
+}
+
 // ================== Tauri 启动 ==================
 
 // T-021：连接池生命周期管理
@@ -2423,6 +2456,9 @@ pub fn run() {
             report::source::report_view_validate,
             report::source::report_view_render,
             report::ai::ai_report_draft,
+            save_report,
+            load_reports,
+            delete_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -3145,5 +3181,300 @@ mod tests {
         let (host, port) = split_host_port("[::1]", 5432);
         assert_eq!(host, "[::1]");
         assert_eq!(port, 5432);
+    }
+
+    // ================== T-064 报表簿 ==================
+
+    fn rep_source(alias: &str, conn: &str, table: &str) -> report::dataset::SourceRef {
+        report::dataset::SourceRef {
+            alias: alias.into(),
+            connection_id: conn.into(),
+            database_type: "mysql".into(),
+            schema: String::new(),
+            table: table.into(),
+            columns: vec![],
+        }
+    }
+
+    fn rep_dataset(id: &str, conn: &str, table: &str) -> report::dataset::DatasetSpec {
+        let mut d = report::dataset::DatasetSpec::new(id, id, id);
+        // base 指的是 sources 里的别名，不是表名
+        d.sources = vec![rep_source(id, conn, table)];
+        d
+    }
+
+    fn rep_widget(id: &str, ds: &str) -> report::view::WidgetSpec {
+        report::view::WidgetSpec {
+            id: id.into(),
+            kind: report::view::ChartType::Kpi,
+            title: id.into(),
+            dataset: ds.into(),
+            encode: Default::default(),
+            agg: Default::default(),
+            filters: vec![],
+            limit: None,
+        }
+    }
+
+    fn rep_record(id: &str, name: &str, created: i64, updated: i64) -> SavedReport {
+        SavedReport {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            question: "各月 GMV".into(),
+            datasets: vec![rep_dataset("orders", "c1", "orders")],
+            view: report::view::ViewSpec {
+                id: format!("v-{id}"),
+                name: name.into(),
+                version: 1,
+                widgets: vec![rep_widget("k1", "orders")],
+                layout: vec![],
+            },
+            created_at: created,
+            updated_at: updated,
+        }
+    }
+
+    /// 报表簿落盘走的是同一套信封；这里验往返、按 id 覆盖、列表排序与删除
+    #[tokio::test(flavor = "current_thread")]
+    async fn report_book_roundtrip_upsert_and_order() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-report-book-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let old = std::env::var("Z_BIZ_TOOL_DB_DATA_DIR").ok();
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+
+        // 两条：跨库（orders 在 c1、users 在 c2），修改时间一先一后
+        let mut r1 = rep_record("r1", "月度 GMV", 50, 100);
+        r1.datasets.push(rep_dataset("users", "c2", "users"));
+        r1.view.widgets.push(rep_widget("k2", "users"));
+        let r2 = rep_record("r2", "周度转化", 70, 300);
+        queries::save_report(r1.clone()).await.unwrap();
+        queries::save_report(r2.clone()).await.unwrap();
+
+        let all = queries::load_reports().await.unwrap();
+        assert_eq!(all.len(), 2, "应存下两条报表");
+        assert_eq!(
+            all.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r2", "r1"],
+            "列表应按最近修改倒序，刚编辑过的不能沉底"
+        );
+        // 跨库结构必须原样回来：两个数据集、两个不同连接
+        let back = all.iter().find(|r| r.id == "r1").unwrap();
+        assert_eq!(back.datasets.len(), 2);
+        assert_eq!(back.datasets[1].sources[0].connection_id, "c2");
+        assert_eq!(back.view.widgets.len(), 2);
+        assert_eq!(back.question, "各月 GMV");
+        assert_eq!(back.created_at, 50);
+        assert!(tmp.join("reports.json").exists(), "落盘文件名应为 reports.json");
+
+        // 改名再存：只应覆盖，不应追加；created_at 由后端留旧值
+        let mut edited = back.clone();
+        edited.name = "月度 GMV（改）".into();
+        edited.created_at = 0; // 前端传什么都不作数
+        edited.updated_at = 400;
+        queries::save_report(edited).await.unwrap();
+
+        let all = queries::load_reports().await.unwrap();
+        assert_eq!(all.len(), 2, "同 id 覆盖后仍应是两条");
+        assert_eq!(all[0].id, "r1", "刚改过的应排最前");
+        assert_eq!(all[0].name, "月度 GMV（改）");
+        assert_eq!(all[0].created_at, 50, "created_at 应保留首次落盘时间");
+        // 数据集没动过，不能因为改名就丢
+        assert_eq!(all[0].datasets.len(), 2);
+
+        queries::delete_report("r2").await.unwrap();
+        let all = queries::load_reports().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "r1", "删除只应移掉目标条目");
+
+        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
+        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
+    }
+
+    /// 存进去就注定打不开的稿子要当场拒掉，并且一条都不能落盘
+    #[tokio::test(flavor = "current_thread")]
+    async fn report_book_rejects_unopenable_specs() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-report-shape-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let old = std::env::var("Z_BIZ_TOOL_DB_DATA_DIR").ok();
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+
+        // 先证明这套断言不空转：合规的一份应能存下
+        let ok = rep_record("ok", "正常报表", 1, 1);
+        queries::save_report(ok).await.unwrap();
+        assert_eq!(queries::load_reports().await.unwrap().len(), 1);
+
+        // 组件挂了个不存在的数据集
+        let mut dangling = rep_record("d", "悬空组件", 1, 1);
+        dangling.view.widgets.push(rep_widget("ghost", "no-such-ds"));
+        let e = queries::save_report(dangling).await.unwrap_err();
+        assert!(e.contains("no-such-ds"), "应点出缺失的数据集 id: {e}");
+
+        // 布局越栏
+        let mut overflow = rep_record("o", "越栏", 1, 1);
+        overflow.view.layout = vec![report::view::WidgetLayout {
+            widget: "k1".into(),
+            x: 8,
+            y: 0,
+            w: 6,
+            h: 6,
+        }];
+        let e = queries::save_report(overflow).await.unwrap_err();
+        assert!(e.contains("布局不合法"), "应说明是布局问题: {e}");
+
+        // 重复数据集 id
+        let mut dup = rep_record("dup", "重名数据集", 1, 1);
+        dup.datasets.push(rep_dataset("orders", "c2", "orders"));
+        let e = queries::save_report(dup).await.unwrap_err();
+        assert!(e.contains("重复"), "应拒绝同名数据集: {e}");
+
+        // 空数据集
+        let mut empty = rep_record("e", "空报表", 1, 1);
+        empty.datasets.clear();
+        empty.view.widgets.clear();
+        assert!(queries::save_report(empty).await.unwrap_err().contains("数据集"));
+
+        // 无名
+        let mut anon = rep_record("a", "月度报表", 1, 1);
+        anon.name = "   ".into();
+        assert!(queries::save_report(anon).await.unwrap_err().contains("名称"));
+
+        let all = queries::load_reports().await.unwrap();
+        assert_eq!(all.len(), 1, "被拒的稿子不能留下任何一条");
+        assert_eq!(all[0].id, "ok");
+
+        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
+        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
+    }
+
+    /// 浏览器探针里 onSave 真实打给 save_report 的报文原文（一字未改）：
+    /// 跨库两数据集 + 三组件，带 null 的 encode、空 layout、空 computed。
+    const FRONTEND_WIRE_REPORT: &str = r#"{"id":"rb-cross","name":"成交看板（商城库 × 客户库）","description":"按城市看 GMV，跨两个连接","question":"按城市统计已支付订单的 GMV，并列出金额最高的 5 笔订单","datasets":[{"aggregates":[{"column":"amount","func":"Sum","output":"gmv"},{"column":null,"func":"Count","output":"cnt"}],"base":"o","computed":[],"fields":[],"filters":["status = 'paid'"],"group_by":["city"],"id":"city-gmv","joins":[{"kind":"Inner","on":[{"left":"user_id","right":"id"}],"source":"u"}],"limit":null,"max_rows":null,"name":"城市成交额","post_computed":[],"sort":[{"column":"gmv","desc":true}],"sources":[{"alias":"o","columns":[],"connection_id":"shop","database_type":"sqlite","schema":"","table":"orders"},{"alias":"u","columns":[],"connection_id":"crm","database_type":"sqlite","schema":"","table":"users"}]},{"aggregates":[],"base":"o","computed":[],"fields":["id","amount"],"filters":["status = 'paid'"],"group_by":[],"id":"paid-orders","joins":[],"limit":2,"max_rows":null,"name":"已支付订单明细","post_computed":[],"sort":[{"column":"id","desc":true}],"sources":[{"alias":"o","columns":[],"connection_id":"shop","database_type":"sqlite","schema":"","table":"orders"}]}],"view":{"id":"shop-board","layout":[],"name":"成交看板（商城库 × 客户库）","version":1,"widgets":[{"agg":"RAW","dataset":"city-gmv","encode":{"category":null,"columns":[],"series":null,"value":null,"x":null,"y":"gmv"},"filters":[],"id":"kpi-gmv","limit":null,"title":"kpi-gmv","type":"KPI"},{"agg":"RAW","dataset":"city-gmv","encode":{"category":null,"columns":[],"series":null,"value":null,"x":"city","y":"gmv"},"filters":[],"id":"bar-city","limit":null,"title":"bar-city","type":"BAR"},{"agg":"RAW","dataset":"paid-orders","encode":{"category":null,"columns":["id","amount"],"series":null,"value":null,"x":null,"y":null},"filters":[],"id":"tbl-orders","limit":null,"title":"tbl-orders","type":"TABLE"}]},"created_at":1790122647,"updated_at":1790122647}"#;
+
+    /// 契约测试：TS 侧 `SavedReport` 的形状必须能被 Rust 侧原样吃下。
+    /// 用真实抓来的报文而不是测试自己的构造函数，是为了让"两边字段名/枚举对不上"
+    /// 这类错在这里炸掉，而不是等用户点保存才发现。
+    #[tokio::test(flavor = "current_thread")]
+    async fn report_book_accepts_real_frontend_payload() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-report-wire-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let old = std::env::var("Z_BIZ_TOOL_DB_DATA_DIR").ok();
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+
+        // 先钉住报文形状，也就是 src/report/types.ts 里的那个 interface
+        let v: serde_json::Value = serde_json::from_str(FRONTEND_WIRE_REPORT).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "created_at",
+                "datasets",
+                "description",
+                "id",
+                "name",
+                "question",
+                "updated_at",
+                "view"
+            ]
+        );
+
+        let item: SavedReport = serde_json::from_str(FRONTEND_WIRE_REPORT)
+            .expect("前端报文应能被后端 SavedReport 反序列化");
+        assert_eq!(item.id, "rb-cross");
+        assert_eq!(item.datasets.len(), 2);
+        assert_eq!(item.view.widgets.len(), 3);
+        // 跨库：同一数据集里两个源落在两个不同连接，join 与聚合都得在
+        assert_eq!(item.datasets[0].sources[0].connection_id, "shop");
+        assert_eq!(item.datasets[0].sources[1].connection_id, "crm");
+        assert_eq!(item.datasets[0].joins.len(), 1);
+        assert_eq!(item.datasets[0].aggregates.len(), 2);
+        assert_eq!(item.datasets[1].limit, Some(2));
+        assert_eq!(
+            item.description.as_deref(),
+            Some("按城市看 GMV，跨两个连接")
+        );
+        assert!(!item.question.is_empty(), "重新起草要能拿回原问题");
+
+        queries::save_report(item.clone())
+            .await
+            .expect("前端这一稿应通过存前结构体检");
+        let all = queries::load_reports().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&all[0]).unwrap(),
+            serde_json::to_value(&item).unwrap(),
+            "存进去再读出来必须逐字段相等"
+        );
+        // 再序列化一次仍要能被前端那套类型吃下（往返稳定）
+        let again: SavedReport =
+            serde_json::from_str(&serde_json::to_string(&all[0]).unwrap()).unwrap();
+        assert_eq!(again.datasets.len(), 2);
+
+        // —— 下面是反证：把报文改坏，确认前面的"通过"不是空转 ——
+        let mut no_view = v.clone();
+        no_view.as_object_mut().unwrap().remove("view");
+        assert!(
+            serde_json::from_value::<SavedReport>(no_view).is_err(),
+            "缺 view 必须解析失败"
+        );
+
+        let mut no_ds = v.clone();
+        no_ds.as_object_mut().unwrap().remove("datasets");
+        assert!(
+            serde_json::from_value::<SavedReport>(no_ds).is_err(),
+            "缺 datasets 必须解析失败"
+        );
+
+        // 图表类型是枚举，前端写错大小写或造一个不存在的类型不能被吞掉
+        let mut bad_kind = v.clone();
+        bad_kind["view"]["widgets"][0]["type"] = serde_json::json!("SCATTER");
+        assert!(
+            serde_json::from_value::<SavedReport>(bad_kind).is_err(),
+            "未知 ChartKind 必须被拒"
+        );
+
+        // 源别名写错类型（前端把 connection_id 打成数字）也必须被拒
+        let mut bad_conn = v.clone();
+        bad_conn["datasets"][0]["sources"][0]["connection_id"] = serde_json::json!(7);
+        assert!(
+            serde_json::from_value::<SavedReport>(bad_conn).is_err(),
+            "connection_id 类型不符必须被拒"
+        );
+
+        // 备注留空：前端发的是 null，这边必须是 None 而不是报错
+        let mut null_desc = v.clone();
+        null_desc["description"] = serde_json::Value::Null;
+        let parsed = serde_json::from_value::<SavedReport>(null_desc).expect("备注留空要能存");
+        assert_eq!(parsed.description, None);
+
+        // 组件挂到不存在的数据集：解析得过，但存前体检必须拦下来
+        let mut ghost = v.clone();
+        ghost["view"]["widgets"][2]["dataset"] = serde_json::json!("no-such-ds");
+        let ghost_item: SavedReport = serde_json::from_value(ghost).unwrap();
+        let e = queries::save_report(ghost_item).await.unwrap_err();
+        assert!(e.contains("no-such-ds"), "应点出缺失的数据集 id: {e}");
+
+        let all = queries::load_reports().await.unwrap();
+        assert_eq!(all.len(), 1, "被拒的报文不能落盘");
+        assert_eq!(all[0].id, "rb-cross");
+
+        if let Some(v) = old {
+            std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
+        } else {
+            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+        }
     }
 }
