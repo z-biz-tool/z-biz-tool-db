@@ -24,6 +24,8 @@ window.__PROBE_DELETE = [];
 
 // 报表簿的"磁盘"：内存里模拟，可被保存/删除改动
 let reports: any[] = JSON.parse(JSON.stringify((fixture as any).reports));
+// descfailonce 已经失败过哪几张表
+const failedOnce = new Set<string>();
 
 function push(cmd: string, args: any) {
   window.__PROBE_CALLS.push({ cmd, args });
@@ -82,6 +84,12 @@ function invoke(cmd: string, args: any): Promise<any> {
       const t = String(a.table || "");
       // ?colslow=600 让列清单慢到"起草时还没落地"，用来验前置闸真的在等
       const slow = Number(window.__PROBE_ARG("colslow") || 0);
+      // ?descfailonce=users 只失败第一次： transient 故障下"重读"该转好，
+      // 用来验红标签真的能点回蓝色（只用 descfail 的话重试永远红，量不出闭环）
+      if (window.__PROBE_ARG("descfailonce") === t && !failedOnce.has(t)) {
+        failedOnce.add(t);
+        return fail(`读取列清单失败：注入（表 ${t}，第 1 次）`);
+      }
       const body = () => {
         if (window.__PROBE_ARG("descfail") === t) {
           return fail(`读取列清单失败：注入（表 ${t}）`);

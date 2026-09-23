@@ -180,23 +180,31 @@ export function ReportWorkbench({
   const splitPicked = (colMap: Record<string, string[]>) => {
     const byId = new Map(configs.map((c) => [c.id, c]));
     const ready: CatalogTable[] = [];
-    const unusable: { key: string; table: string; conn: string; why: string }[] = [];
+    const unusable: {
+      key: string;
+      table: string;
+      conn: string;
+      why: string;
+      retry: boolean;
+    }[] = [];
     for (const k of picked) {
       const [connId, schema, table] = k.split("\u0000");
       const cfg = byId.get(connId);
       if (!cfg) {
-        // 连接被删过就只剩这个 id 了，截一段出来至少能对上当初配的是哪个
+        // 连接被删过就只剩这个 id 了，截一段出来至少能对上当初配的是哪个。
+        // 这一类重读没意义（没地方可读），所以不给重试入口。
         unusable.push({
           key: k,
           table,
           conn: `${connId.slice(0, 8)}…`,
           why: "所在连接已不在本机",
+          retry: false,
         });
         continue;
       }
       const cols = colMap[k] || [];
       if (!cols.length) {
-        unusable.push({ key: k, table, conn: cfg.name || cfg.id, why: "列清单没读到" });
+        unusable.push({ key: k, table, conn: cfg.name || cfg.id, why: "列清单没读到", retry: true });
         continue;
       }
       ready.push({
@@ -538,9 +546,17 @@ export function ReportWorkbench({
         {unusable
           .filter((u) => !colBusy.includes(u.key))
           .map((u) => (
-            <Tooltip key={u.key} title={`${u.conn}：${u.why}`}>
-              <Tag color="red" style={{ margin: "4px 4px 0 0" }}>
-                {u.table} 进不了目录
+            <Tooltip
+              key={u.key}
+              title={`${u.conn}：${u.why}${u.retry ? "，点这里只重读这一张表" : "，请回去补连接或改勾别的表"}`}
+            >
+              <Tag
+                color="red"
+                icon={u.retry ? <ReloadOutlined /> : undefined}
+                style={{ margin: "4px 4px 0 0", cursor: u.retry ? "pointer" : "default" }}
+                onClick={u.retry ? () => ensureColumns(u.key) : undefined}
+              >
+                {u.table} 进不了目录{u.retry ? " · 重读" : ""}
               </Tag>
             </Tooltip>
           ))}
