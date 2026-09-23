@@ -1056,6 +1056,20 @@ mod tests {
     }
 
     #[test]
+    fn unknown_table_verdict_keeps_the_shape_the_ui_parses() {
+        // App.tsx 的 unknownTablesOfVerdict 就按这句从拒因里认表（多张用、相连），
+        // 认出名字后才能去别的连接问一句"这张在你那儿吗"，把跨库死路指到 AI 报表。
+        // 改这句式不会让本机校验出错，只会让那条提示静默失灵——所以在这里钉住。
+        let two = check_sql("SELECT * FROM invoicez JOIN userz ON 1=1", &catalog()).unwrap_err();
+        assert!(
+            two.contains("SQL 里的表 invoicez、userz 不在本次目录里（可用："),
+            "{two}"
+        );
+        let one = check_sql("SELECT * FROM invoicez", &catalog()).unwrap_err();
+        assert!(one.contains("SQL 里的表 invoicez 不在本次目录里"), "{one}");
+    }
+
+    #[test]
     fn check_ignores_dots_inside_string_literals() {
         let out = check_sql(
             "SELECT id FROM orders WHERE city = 'a.b' AND status <> 'x.y'",

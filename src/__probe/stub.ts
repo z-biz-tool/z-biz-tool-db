@@ -218,6 +218,10 @@ function invoke(cmd: string, args: any): Promise<any> {
   switch (cmd) {
     case "get_tables": {
       const cfg = a.config || {};
+      // ?notables=crm 让某个连接的表清单读不到：跨库提示不能因此就说死"别的库里也没有"
+      if (String(window.__PROBE_ARG("notables") || "").split(",").includes(String(cfg.id))) {
+        return fail(`读取表清单失败：注入（连接 ${cfg.id}）`);
+      }
       return Promise.resolve((fixture as any).tables[cfg.id] || []);
     }
     case "report_describe_columns": {
@@ -267,6 +271,21 @@ function invoke(cmd: string, args: any): Promise<any> {
         return fail({
           error: "重试 3 次后仍未通过本机校验：模型没给出 SQL，只回了一段说明",
           sql: null,
+        });
+      }
+      // ?sqlx=users 注入"模型引用了一张本腿目录里没有的表"（可逗号列多张）：
+      // 表名撞在别的连接里时，错误卡要把那个连接点名出来并给出 AI 报表入口；
+      // 哪个连接都没有时只能提示"这是模型编的"，两半靠注入不同的名字分开量。
+      if (window.__PROBE_ARG("sqlx")) {
+        const names = String(window.__PROBE_ARG("sqlx"))
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        return fail({
+          error:
+            `重试 3 次后仍未通过本机校验：SQL 里的表 ${names.join("、")} 不在本次目录里（可用：` +
+            `${catalog.map((t) => t.table).sort().join(", ")}）`,
+          sql: `SELECT * FROM ${names.join(", ")}`,
         });
       }
       // ?sqlgenfail=1 注入"模型编了一张不存在的表、且怎么改都改不对"：
@@ -493,7 +512,15 @@ function invoke(cmd: string, args: any): Promise<any> {
     }
     // ================== SQL 工作台（App）启动所需 ==================
     case "load_connections":
-      return Promise.resolve((fixture as any).connections);
+      // ?onlyconn=shop 让工作区里只剩一条连接：这时"表在别的库里吗"根本无从问起，
+      // 那块跨库提示必须整块不出现（没有别的连接也硬问一句，就是白刷一次库）
+      return Promise.resolve(
+        window.__PROBE_ARG("onlyconn")
+          ? (fixture as any).connections.filter(
+              (c: any) => String(c.id) === window.__PROBE_ARG("onlyconn")
+            )
+          : (fixture as any).connections
+      );
     case "get_ai_config":
       // ?noaicfg=1 当成"还没配过 AI"：没有这条注入，前端那道
       // "先配置 AI 服务地址、密钥与模型"的闸在探针里删掉也量不出来

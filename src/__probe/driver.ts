@@ -385,8 +385,28 @@ export function installDriver() {
       w.__PROBE_CLICK(o);
       await sleep(200);
     },
-    tags: () => Array.from(document.querySelectorAll(".ant-tag")).map((t) => (t.textContent || "").trim()),
-    alerts: () =>
+    /** 「生成 SQL」错误卡里那块跨库提示：null = 根本没这块。
+     *  出口按钮另算——表在别的库里时只说"这条路走不通"不给入口，等于让用户自己想去哪。 */
+    crossDbCard: () => {
+      const box = document.querySelector(".ai-cross-db");
+      if (!box) return null;
+      const btn = Array.from(box.querySelectorAll("button")).find(
+        (b) => (b.textContent || "").trim() === "去 AI 报表跨库出图"
+      );
+      return `${(box.textContent || "").trim().replace(/\s+/g, " ")}||${btn ? "有入口" : "没有入口"}`;
+    },
+    /** 页面上各处 Segmented 当前选中的哪一项（顶栏那条是 SQL 查询/AI 报表）。
+     *  按 -selected 这个 class 认不靠得住：切换之后两个项上都没有它，
+     *  而原生 radio 的 checked 才是"当前是哪一项"的真凭据。 */
+    segmentedSelected: () =>
+      Array.from(document.querySelectorAll(".ant-segmented")).map((s) => {
+        const items = Array.from(s.querySelectorAll(".ant-segmented-item"));
+        const sel = items.find(
+          (i) => (i.querySelector("input") as HTMLInputElement | null)?.checked
+        );
+        return (sel?.textContent || "").trim() || "?";
+      }),
+    tags: () => Array.from(document.querySelectorAll(".ant-tag")).map((t) => (t.textContent || "").trim()),    alerts: () =>
       Array.from(document.querySelectorAll(".ant-alert")).map((a) =>
         (a.textContent || "").trim().replace(/\s+/g, " ").slice(0, 160)
       ),

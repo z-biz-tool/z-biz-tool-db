@@ -70,9 +70,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAgentStore } from "./agent/AgentManager";
 import AgentPanel from "./agent/AgentPanel";
 import { ReportWorkbench } from "./report/ReportWorkbench";
-import { aiSqlGenerate, catalogColumns, reportDescribeColumns } from "./report/api";
+import { aiSqlGenerate, catalogColumns, listTables, reportDescribeColumns } from "./report/api";
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
-import type { BackendConfig } from "./report/api";
+import type { BackendConfig, TableSummary } from "./report/api";
 import type { CatalogTable, SqlDraft, SqlReject } from "./report/types";
 import type { AgentAskContext, AgentIntent, AgentResponse } from "./agent/types";
 
@@ -97,6 +97,18 @@ type SqlFix = { question: string; error: string; sql: string };
 const asSqlReject = (e: unknown): SqlReject => {
   if (e && typeof e === "object" && typeof (e as SqlReject).error === "string") return e as SqlReject;
   return { error: String(e), sql: null };
+};
+
+/** 从本机拒因里挑出"不认得的表"。句式来自 ai_sql.rs 的 check_sql
+ *  （`SQL 里的表 A、B 不在本次目录里`，多个名字用、相连，与 ai_sql.rs 的同名测试一起改）。
+ *  句式变了这里只会抽不到名字、少一句提示——不会拿别的文字去认表，所以不做模糊兜底。 */
+const unknownTablesOfVerdict = (verdict: string): string[] => {
+  const m = /SQL 里的表 (.+?) 不在本次目录里/.exec(verdict);
+  if (!m) return [];
+  return m[1]
+    .split("、")
+    .map((s) => s.trim())
+    .filter(Boolean);
 };
 
 // 类型定义
@@ -393,6 +405,14 @@ function App() {
   >(null);
   // 四条解说链路的失败原因，显示在弹窗里而不是只闪一句 toast
   const [aiTextError, setAiTextError] = useState("");
+  // 挡下的一稿点名的表如果其实在别的连接里，这一腿怎么改都补不上——一条 SQL 只能进一个库。
+  // 这种时候该给用户的是另一条腿的入口，不是"再改一轮"。missing 是问遍了也没找到的那些，
+  // failed 是没问到的那些连接（问不到就不能断言"别的库里也没有"）。
+  const [crossDb, setCrossDb] = useState<{
+    found: { table: string; connection: string }[];
+    missing: string[];
+    failed: string[];
+  } | null>(null);
 
   const [msgApi, msgContext] = message.useMessage();
 
@@ -728,6 +748,57 @@ function App() {
       setAiLoading(false);
     }
   };
+
+  // 错误卡立起来之后，去别的连接问一遍表清单：只在真撞上"表不认得"且确实有别的连接时才多
+  // 这一趟，平时不开这个口。清单是异步回来的，用户可能在这段时间里又生成了一稿或关了卡片，
+  // 所以要拿序号认回最新那一轮，别让上一轮的结论挂在新卡片上。
+  const crossDbSeq = useRef(0);
+  useEffect(() => {
+    if (!aiDraftError) {
+      crossDbSeq.current += 1;
+      setCrossDb(null);
+      return;
+    }
+    const names = unknownTablesOfVerdict(aiDraftError.detail);
+    const others = connections.filter((c) => c.id !== selectedConnection?.id);
+    if (!names.length || !others.length) {
+      crossDbSeq.current += 1;
+      setCrossDb(null);
+      return;
+    }
+    const seq = ++crossDbSeq.current;
+    (async () => {
+      const found: { table: string; connection: string }[] = [];
+      const failed: string[] = [];
+      const hit = new Set(names.map((n) => n.toLowerCase()));
+      for (const c of others) {
+        let list: TableSummary[] = [];
+        try {
+          list = await listTables(toBackendConfig(c));
+        } catch {
+          failed.push(c.name);
+          continue;
+        }
+        for (const t of list) {
+          const qualified = t.schema ? `${t.schema}.${t.name}` : t.name;
+          for (const n of names) {
+            if (!hit.has(n.toLowerCase())) continue;
+            if (
+              t.name.toLowerCase() === n.toLowerCase() ||
+              qualified.toLowerCase() === n.toLowerCase()
+            ) {
+              hit.delete(n.toLowerCase());
+              found.push({ table: n, connection: c.name || c.database || c.id });
+            }
+          }
+        }
+      }
+      if (crossDbSeq.current !== seq) return;
+      const missing = names.filter((n) => !found.some((f) => f.table === n));
+      // 一张都没点到、也没哪个连接问失败——那就是"哪儿都没有"，模型编的，改稿那条腿才对症
+      setCrossDb(found.length || failed.length ? { found, missing, failed } : null);
+    })();
+  }, [aiDraftError, connections, selectedConnection]);
 
   // 四条解说链路（优化/解释/诊断/结果）只回文字，不动数据：
   // 会改库的那两条另有本机校验与审批门禁。
@@ -2211,11 +2282,70 @@ function App() {
                       style={{ marginTop: 12 }}
                       title={aiDraftError.title}
                       description={
-                        <div
-                          style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}
-                        >
-                          {aiDraftError.detail}
-                        </div>
+                        <>
+                          <div
+                            style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}
+                          >
+                            {aiDraftError.detail}
+                          </div>
+                          {/* 点名的表在别的连接里时，"照着错误再改一轮"这条腿是走不通的：
+                              本腿的目录只装得下当前连接的表。这时必须给出另一条腿的入口。 */}
+                          {crossDb && (
+                            <div
+                              className="ai-cross-db"
+                              style={{
+                                marginTop: 8,
+                                padding: "8px 10px",
+                                borderRadius: 6,
+                                borderLeft: "3px solid #1677ff",
+                                background: "rgba(22,119,255,0.08)",
+                                fontSize: 12,
+                              }}
+                            >
+                              {crossDb.found.length > 0 && (
+                                <div>
+                                  {/* 中文句子中间换行会被 JSX 折成一个真空格，所以长句按段拼 */}
+                                  {crossDb.found
+                                    .map((f) => `${f.table} 在连接「${f.connection}」里`)
+                                    .join("；") +
+                                    "。这一腿只把当前连接的表交给模型，而一条 SQL 也只能进一个库——" +
+                                    "这张表进不了本次目录，改多少轮都会以同样的理由被挡下。"}
+                                </div>
+                              )}
+                              {crossDb.missing.length > 0 && (
+                                <div style={{ marginTop: crossDb.found.length ? 4 : 0 }}>
+                                  {(crossDb.found.length ? "另外点名的 " : "点名的 ") +
+                                    crossDb.missing.join("、") +
+                                    (crossDb.failed.length
+                                      ? ` 在已问到的连接里没有，而 ${crossDb.failed.join(
+                                          "、"
+                                        )} 的表清单没读到——问不到不等于不存在。`
+                                      : " 在所有连接里都没有，那是模型编出来的字段名。")}
+                                </div>
+                              )}
+                              {crossDb.found.length > 0 && (
+                                <>
+                                  <Text type="secondary" style={{ display: "block", marginTop: 4 }}>
+                                    {"不同库的表要进同一张结果，走 AI 报表：每个库各自取数，" +
+                                      "在本机内存里 join。"}
+                                  </Text>
+                                  <Button
+                                    size="small"
+                                    type="primary"
+                                    icon={<DashboardOutlined />}
+                                    style={{ marginTop: 6 }}
+                                    onClick={() => {
+                                      setShowAiResultModal(false);
+                                      setMode("report");
+                                    }}
+                                  >
+                                    去 AI 报表跨库出图
+                                  </Button>
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </>
                       }
                       action={
                         aiDraftError.fix ? (
