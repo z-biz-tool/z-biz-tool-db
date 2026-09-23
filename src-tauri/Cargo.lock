@@ -6406,6 +6406,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs 5.0.1",
+ "futures-util",
  "getrandom 0.2.17",
  "regex",
  "reqwest 0.12.28",

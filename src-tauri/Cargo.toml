@@ -42,3 +42,7 @@ anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+# 只在测试里用：把 sqlx 的 fetch() 流按"取够就停"的方式消费（T-031 的判据）
+futures-util = "0.3"

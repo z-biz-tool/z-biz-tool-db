@@ -3326,4 +3326,73 @@ mod tests {
             let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
         }
     }
+
+    /// T-031 的判据，不是生产路径：sqlx 0.8 上"边取边停"到底省不省后面的活，
+    /// 以及提前丢掉流之后连接还能不能用（池化复用最怕这个）。
+    /// 先量出来再决定要不要把 fetch_all 换掉——否则就是凭感觉改执行链。
+    #[tokio::test]
+    async fn early_stop_streaming_saves_the_rest_of_the_fetch() {
+        use futures_util::TryStreamExt;
+        use sqlx::Row;
+        use std::str::FromStr;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!("zdb-stream-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.sqlite");
+        let opts = SqliteConnectOptions::from_str(&file.to_string_lossy())
+            .unwrap()
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+
+        // 每行一个查询时才生成的 200KB blob：整批取回要在客户端物化约 40MB，
+        // 只取前 5 行则 1MB —— 用耗时差把"是不是真惰性"量出来
+        const ROWS: usize = 200;
+        sqlx::query(&format!(
+            "CREATE TABLE src AS WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {}) SELECT n AS id FROM c",
+            ROWS
+        ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let heavy = "SELECT id, randomblob(200000) AS b FROM src";
+
+        let t0 = Instant::now();
+        let all = sqlx::query(heavy).fetch_all(&pool).await.unwrap();
+        let full_ms = t0.elapsed().as_millis().max(1);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let t1 = Instant::now();
+        let mut stream = sqlx::query(heavy).fetch(&mut *conn);
+        let mut few = Vec::new();
+        while few.len() < 5 {
+            few.push(stream.try_next().await.unwrap().unwrap());
+        }
+        drop(stream); // 提前丢掉：这就是"截断"要依赖的行为
+        let stop_ms = t1.elapsed().as_millis().max(1);
+
+        assert_eq!(all.len(), ROWS, "整批取回的行数");
+        assert_eq!(few.len(), 5);
+        // 只要真的惰性，这条就成立；不成立说明 sqlx 仍把整批读了，那就不该改生产路径
+        assert!(
+            stop_ms * 4 < full_ms,
+            "取 5 行用了 {}ms，取全部 {} 行用了 {}ms：没看出提前停止省了后面的活",
+            stop_ms,
+            ROWS,
+            full_ms
+        );
+
+        // 归还连接后再取一次：提前丢掉没读完的流，不能把池化连接弄脏成下次拿不到结果
+        drop(conn);
+        let again = sqlx::query("SELECT count(*) AS c FROM src").fetch_one(&pool).await.unwrap();
+        let total: i64 = again.get(0);
+        assert_eq!(total, ROWS as i64, "丢掉流之后这条连接查出来的行数不对");
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
