@@ -106,6 +106,8 @@ export function ReportBoard({
   /** 缺数那张卡上的就地重试：重跑的是整张报表的取数，不是只补那几张，文案别写歪 */
   onRetry,
   retryBusy,
+  partialOf,
+  onNotice,
   limitPlans,
   onRaiseLimit,
 }: {
@@ -113,6 +115,9 @@ export function ReportBoard({
   datasetNameOf?: (widgetId: string) => string | undefined;
   onRetry?: () => void;
   retryBusy?: boolean;
+  /** 这张图的上游数据集是否撞上取数上限（导 CSV 时要把这句话说在前面） */
+  partialOf?: (widgetId: string) => boolean;
+  onNotice?: (kind: "success" | "warning", text: string) => void;
   /** 数据集 id → 撞闸后"翻倍到多少"的计划；到硬顶的就只说，不给假按钮 */
   limitPlans?: Record<string, { from: number; to: number; atCeiling: boolean }>;
   onRaiseLimit?: (datasetId: string) => void;
@@ -222,6 +227,8 @@ export function ReportBoard({
                 chart={chart}
                 datasetName={datasetNameOf?.(l.widget)}
                 height={l.h * ROW_UNIT}
+                partial={partialOf?.(l.widget)}
+                onNotice={onNotice}
               />
             </div>
           );
@@ -240,7 +247,13 @@ export function ReportBoard({
               boxSizing: "border-box",
             }}
           >
-            <ChartCard chart={c} datasetName={datasetNameOf?.(c.widget)} height={6 * ROW_UNIT} />
+            <ChartCard
+              chart={c}
+              datasetName={datasetNameOf?.(c.widget)}
+              height={6 * ROW_UNIT}
+              partial={partialOf?.(c.widget)}
+              onNotice={onNotice}
+            />
           </div>
         ))}
       </div>

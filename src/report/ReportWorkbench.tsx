@@ -955,6 +955,13 @@ export function ReportWorkbench({
     await runRender(spec.view, datasets);
   };
 
+  /** 组件 → 它的数据集是否撞上取数上限：导出与提示都按这张图自己的上游说，不整板一刀切 */
+  const partialOfWidget = (widgetId: string) => {
+    const w = (spec.view?.widgets || []).find((x) => x.id === widgetId);
+    if (!w) return false;
+    return (payload?.datasets || []).some((d) => d.id === w.dataset && d.partial);
+  };
+
   const onRender = async () => {
     if (!spec.view || !spec.datasets) {
       msgApi.warning(spec.parseError || "先有一份合法的草稿 JSON");
@@ -1640,6 +1647,8 @@ export function ReportWorkbench({
                     <ReportBoard
                     payload={payload}
                     datasetNameOf={datasetNameOf}
+                    partialOf={partialOfWidget}
+                    onNotice={(kind, text) => msgApi[kind](text)}
                     onRetry={() => void onRender()}
                     retryBusy={rendering}
                     limitPlans={limitPlans}

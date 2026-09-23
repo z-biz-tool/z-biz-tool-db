@@ -71,6 +71,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAgentStore } from "./agent/AgentManager";
 import AgentPanel from "./agent/AgentPanel";
 import { ReportWorkbench } from "./report/ReportWorkbench";
+import { csvDoc, downloadCsv, stampName } from "./report/csv";
 import { aiSqlGenerate, catalogColumns, listTables, reportDescribeColumns } from "./report/api";
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
 import type { BackendConfig, TableSummary } from "./report/api";
@@ -333,29 +334,17 @@ function App() {
       return;
     }
     try {
-      const headers = resultColumns.map((c) => c.title);
-      const csvRows = queryResults.map((row) => {
-        return row.map((cell) => {
+      // 列标题是 React 元素（名字 + 类型标签），以前直接 join 出去的就是 "[object Object]"
+      const headers = queryColumnsMeta.map((m) => m.name);
+      // 转义与公式防护在 report/csv.ts 里只有一份，看板导出走的是同一条
+      const rows = queryResults.map((row) =>
+        row.map((cell) => {
           if (cell.__kind === "null") return "NULL";
           if (cell.__kind === "binary") return "[BINARY]";
-          const val = String(cell.value ?? "");
-          // CSV 公式防护：字段以 = + - @ \t \n 开头时加前缀单引号
-          if (/^[=+\-@\t\n]/.test(val)) return "'" + val;
-          // 含逗号或引号时用双引号包裹
-          if (val.includes(",") || val.includes('"')) {
-            return '"' + val.replace(/"/g, '""') + '"';
-          }
-          return val;
-        });
-      });
-      const csv = [headers.join(","), ...csvRows.map((r) => r.join(","))].join("\n");
-      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `query_results_${new Date().toISOString().slice(0, 10)}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
+          return String(cell.value ?? "");
+        })
+      );
+      downloadCsv(stampName("query_results"), csvDoc(headers, rows));
       // 截断过就必须说清导的是"画出来的那一段"，不是整批结果——
       // 否则用户拿这份 CSV 去对账，少的行没人认领
       msgApi.success(
@@ -1843,7 +1832,15 @@ function App() {
                               style={{ marginRight: 4 }}
                             />
                           </Tooltip>
-                          <Tooltip title="界面行数上限：只把前 N 行送进表格与 CSV（0 = 不限）。后端仍会取完这一次结果，真要少取请在语句里自己收口。">
+                          <Tooltip
+                            title={
+                              "界面行数上限：只把前 N 行送进表格与 CSV（0 = 不限）。" +
+                              (selectedConnection?.type === "sqlite"
+                                ? "sqlite 这条是取到上限就停，库后面的行没取。"
+                                : "这个引擎仍是整批取回后截断，总行数给得准。") +
+                              "要全量请在语句里自己收口。"
+                            }
+                          >
                             <Space size={2}>
                               <InputNumber
                                 size="small"

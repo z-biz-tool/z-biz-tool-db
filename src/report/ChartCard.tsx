@@ -3,8 +3,9 @@
 // 后端已经把 categories / series / rows / value 摊平好了，前端只负责画，
 // 不再二次聚合——两边各算一遍统计口径，迟早算出两个数。
 
-import { Alert, Card, Empty, Statistic, Table, Tag, Tooltip, Typography } from "antd";
-import { WarningOutlined } from "@ant-design/icons";
+import { Alert, Button, Card, Empty, Statistic, Table, Tag, Tooltip, Typography } from "antd";
+import { WarningOutlined, DownloadOutlined } from "@ant-design/icons";
+import { csvDoc, downloadCsv, stampName } from "./csv";
 import {
   Bar,
   BarChart,
@@ -164,15 +165,44 @@ function TableBlock({ chart }: { chart: ChartData }) {
   );
 }
 
+/** 这张图画出来的那些数 → CSV 的行列。图上是什么就导什么，不做二次加工。 */
+export function chartCsv(chart: ChartData): { headers: string[]; rows: string[][] } {
+  if (chart.kind === "TABLE") {
+    const headers = chart.columns.length
+      ? chart.columns
+      : (chart.rows[0] || []).map((_, i) => `列${i + 1}`);
+    return { headers, rows: chart.rows.map((r) => r.map((v) => scalarText(v))) };
+  }
+  if (chart.kind === "KPI") {
+    return {
+      headers: ["指标", "值"],
+      rows: [[chart.title || chart.widget, scalarText(chart.value)]],
+    };
+  }
+  // 柱/折/饼：x 轴是 categories，每条 series 一列。不复用 toSeriesTable——
+  // 那份是给 recharts 画图用的，键名（__name）漏进表头就是给人看的脏数据
+  const headers = ["类别", ...chart.series.map((s, i) => s.name || `系列${i + 1}`)];
+  const rows = chart.categories.map((c, i) => [
+    scalarText(c),
+    ...chart.series.map((s) => scalarText(s.values[i] ?? null)),
+  ]);
+  return { headers, rows };
+}
+
 export function ChartCard({
   chart,
   datasetName,
   height,
+  partial,
+  onNotice,
 }: {
   chart: ChartData;
   /** 这张图吃的是哪个数据集，出错时至少要能对上号 */
   datasetName?: string;
   height: number;
+  /** 上游数据集撞上取数上限：导出的也只是已取回那部分，得说出来 */
+  partial?: boolean;
+  onNotice?: (kind: "success" | "warning", text: string) => void;
 }) {
   const empty =
     chart.kind === "TABLE"
@@ -192,6 +222,30 @@ export function ChartCard({
         </span>
       }
       extra={
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <Tooltip title="导出这张图为 CSV。导的是图上这些数（已聚合、已截断的口径），不是库里的原始行。">
+          <Button
+            size="small"
+            type="text"
+            icon={<DownloadOutlined />}
+            onClick={() => {
+              const { headers, rows } = chartCsv(chart);
+              if (!headers.length && !rows.length) {
+                onNotice?.("warning", "这张图没有可导出的数");
+                return;
+              }
+              downloadCsv(stampName(`报表_${chart.title || chart.widget}`), csvDoc(headers, rows));
+              if (partial) {
+                onNotice?.(
+                  "warning",
+                  "上游数据集撞上取数上限：这张图和刚导出的 CSV 只覆盖已取回的部分"
+                );
+              } else {
+                onNotice?.("success", "已导出这张图的数");
+              }
+            }}
+          />
+        </Tooltip>
         <Tooltip title={chart.warnings.join("\n")}>
           <Text type="secondary" style={{ fontSize: 11 }}>
             {chart.warnings.length > 0 && (
@@ -202,6 +256,7 @@ export function ChartCard({
               : `${chart.categories.length} 类`}
           </Text>
         </Tooltip>
+        </span>
       }
     >
       {chart.warnings.length > 0 && (
