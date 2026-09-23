@@ -536,6 +536,10 @@ function invoke(cmd: string, args: any): Promise<any> {
         .split(",")
         .map((x) => x.trim())
         .filter(Boolean);
+      // ?junktitle=1 造一个带路径分隔符/冒号/点的标题：导出文件名的清洗要靠它量
+      if (window.__PROBE_FLAG("junktitle")) {
+        out.charts[0].title = "上级/目录\\..:炸弹*?";
+      }
       if (trunc.length) {
         const want = (a.datasets || []).find((d: any) => trunc.includes(d.id));
         const cap = Number(want?.max_rows ?? 50000);
