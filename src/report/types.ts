@@ -170,6 +170,16 @@ export interface ChartData {
   warnings: string[];
 }
 
+/** 没取到数的数据集：整张报表照常渲染，但挂在它上面的组件会被摘掉 */
+export interface DatasetFailure {
+  id: string;
+  name: string;
+  /** 后端原话：连不上、表读不出列、引擎拒绝 SQL */
+  error: string;
+  /** 因为这张集没数而没画出来的组件 id */
+  widgets: string[];
+}
+
 export interface ViewPayload {
   steps: string[];
   layout: WidgetLayout[];
@@ -177,6 +187,7 @@ export interface ViewPayload {
   datasets: DatasetRunStat[];
   generated_sql: SqlPreview[];
   partial: boolean;
+  failed: DatasetFailure[];
   elapsed_ms: number;
 }
 

@@ -465,6 +465,16 @@ pub struct DatasetRunStat {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DatasetFailure {
+    pub id: String,
+    pub name: String,
+    /// 连不上、列读不出、引擎拒绝 SQL —— 原样带出，让用户知道该回去修哪一条连接
+    pub error: String,
+    /// 因为这张集没数而画不出来的组件
+    pub widgets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ViewPayload {
     /// 视图算子链（组件 × 编码 × 布局），前端"执行计划"面板直接列出来
     pub steps: Vec<String>,
@@ -474,12 +484,26 @@ pub struct ViewPayload {
     pub generated_sql: Vec<SqlPreview>,
     /// 任一数据集被 max_rows 截断 → 整张报表标"不完整"，UI 不许当均值画
     pub partial: bool,
+    /// 没取到数的数据集：跨库报表里一条连接断了不该让整张板白屏，
+    /// 但少画的那几张图必须点名，不能悄悄当没有。
+    pub failed: Vec<DatasetFailure>,
     pub elapsed_ms: u64,
 }
 
-/// 回填方言 → 探列 → 出计划，一行数据都不取。返回（数据集 id → 输出列、
-/// 源 SQL、按连接真实方言补齐后的 spec）。
-/// 校验只需要这三样：让"检查字段"顺手扫一遍库，是白付一次跨库取数。
+/// 单个数据集：回填方言 → 探列 → 出计划，一行数据都不取。
+/// 出错就是一条错误串，由调用方决定整单打回（只校验）还是记下来继续跑别的集。
+async fn plan_one(
+    ds: &DatasetSpec,
+    source: &DbSource,
+    provided: Option<&SchemaCache>,
+) -> Result<(DatasetSpec, Vec<String>, Vec<SqlPreview>), String> {
+    let ds = align_dialects(ds, source)?;
+    let cache = build_schemas(&ds, source, provided).await?;
+    let plan = dataset::plan_dataset(&ds, &cache)?;
+    let sqls = previews(&ds, source)?;
+    Ok((ds, plan.columns, sqls))
+}
+
 async fn plan_datasets(
     datasets: &[DatasetSpec],
     source: &DbSource,
@@ -489,26 +513,32 @@ async fn plan_datasets(
     let mut sqls: Vec<SqlPreview> = Vec::new();
     let mut aligned: Vec<DatasetSpec> = Vec::new();
     for ds in datasets {
-        if ds.id.trim().is_empty() {
-            return Err("数据集缺少 id".into());
-        }
-        if cols.contains_key(&ds.id) {
-            return Err(format!("数据集 id {} 重复", ds.id));
-        }
-        let ds = align_dialects(ds, source)?;
-        let owned = provided.and_then(|p| p.get(&ds.id));
-        let cache = build_schemas(&ds, source, owned).await?;
-        let plan = dataset::plan_dataset(&ds, &cache)?;
-        sqls.extend(previews(&ds, source)?);
-        cols.insert(ds.id.clone(), plan.columns);
+        check_spec_ids(&cols, ds)?;
+        let (ds, plan_cols, ds_sqls) = plan_one(ds, source, provided.and_then(|p| p.get(&ds.id))).await?;
+        sqls.extend(ds_sqls);
+        cols.insert(ds.id.clone(), plan_cols);
         aligned.push(ds);
     }
     Ok((cols, sqls, aligned))
 }
 
+/// id 空或重复是整份规格的错，不是某张集自己跑挂了，不能按数据集降级
+fn check_spec_ids(seen: &HashMap<String, Vec<String>>, ds: &DatasetSpec) -> Result<(), String> {
+    if ds.id.trim().is_empty() {
+        return Err("数据集缺少 id".into());
+    }
+    if seen.contains_key(&ds.id) {
+        return Err(format!("数据集 id {} 重复", ds.id));
+    }
+    Ok(())
+}
+
 /// 逐个数据集：先出计划，再真取数。返回计划、结果表与生成的 SQL。
 /// 计划里的列清单与结果表的列清单同源（plan_dataset 有回归测试锁住），
 /// 所以视图校验报错指向的列一定是用户看得见的列。
+///
+/// 单张集失败（连接断了、表被删了、引擎拒了）不往上抛：跨库报表里
+/// 一条链路坏了不该把其余几张集的图一起带走，失败按数据集记下来。
 async fn run_datasets(
     datasets: &[DatasetSpec],
     source: &DbSource,
@@ -520,29 +550,60 @@ async fn run_datasets(
         Vec<DatasetRunStat>,
         Vec<SqlPreview>,
         bool,
+        Vec<DatasetFailure>,
     ),
     String,
 > {
     let mut tables: HashMap<String, Table> = HashMap::new();
-    let (cols, sqls, aligned) = plan_datasets(datasets, source, provided).await?;
+    let mut cols: HashMap<String, Vec<String>> = HashMap::new();
+    let mut sqls: Vec<SqlPreview> = Vec::new();
     let mut stats: Vec<DatasetRunStat> = Vec::new();
+    let mut failed: Vec<DatasetFailure> = Vec::new();
     let mut partial = false;
-    for ds in &aligned {
-        let start = std::time::Instant::now();
-        let run = dataset::execute_dataset(ds, source).await?;
-        partial |= run.is_partial();
-        stats.push(DatasetRunStat {
-            id: ds.id.clone(),
-            name: ds.name.clone(),
-            rows: run.table.len(),
-            columns: cols[&ds.id].clone(),
-            truncated: run.truncated.clone(),
-            partial: run.is_partial(),
-            elapsed_ms: start.elapsed().as_millis() as u64,
+    let fail = |id: &str, name: &str, e: String, failed: &mut Vec<DatasetFailure>| {
+        failed.push(DatasetFailure {
+            id: id.into(),
+            name: name.into(),
+            error: e,
+            widgets: Vec::new(),
         });
-        tables.insert(ds.id.clone(), run.table);
+    };
+    for ds in datasets {
+        check_spec_ids(&cols, ds)?;
+        let owned = provided.and_then(|p| p.get(&ds.id));
+        let (ds, plan_cols, ds_sqls) = match plan_one(ds, source, owned).await {
+            Ok(v) => v,
+            Err(e) => {
+                fail(&ds.id, &ds.name, e, &mut failed);
+                continue;
+            }
+        };
+        sqls.extend(ds_sqls);
+        cols.insert(ds.id.clone(), plan_cols);
+        let start = std::time::Instant::now();
+        match dataset::execute_dataset(&ds, source).await {
+            Err(e) => {
+                // 没有结果表，组件也就画不出来：列清单一起撤掉，
+                // 留着它 validate_view 会以为这张集还在。
+                cols.remove(&ds.id);
+                fail(&ds.id, &ds.name, e, &mut failed);
+            }
+            Ok(run) => {
+                partial |= run.is_partial();
+                stats.push(DatasetRunStat {
+                    id: ds.id.clone(),
+                    name: ds.name.clone(),
+                    rows: run.table.len(),
+                    columns: cols[&ds.id].clone(),
+                    truncated: run.truncated.clone(),
+                    partial: run.is_partial(),
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                });
+                tables.insert(ds.id.clone(), run.table);
+            }
+        }
     }
-    Ok((tables, cols, stats, sqls, partial))
+    Ok((tables, cols, stats, sqls, partial, failed))
 }
 
 /// 只校验不出数：AI 生成完整报表后先用它自检，能省下一次全量取数
@@ -564,7 +625,11 @@ pub async fn report_view_validate(
     })
 }
 
-/// 出数并渲染成图表结构
+/// 出数并渲染成图表结构。
+///
+/// 跨库报表里一条连接断了不该把整张板带走：跑挂的数据集按 id 记进 `failed`，
+/// 只把挂在它上面的组件摘掉，其余图照常出。全部集都跑挂才报错（那时确实没东西可画），
+/// 错误里逐条点名，比"渲染失败"四个字有用。
 #[tauri::command]
 pub async fn report_view_render(
     view: ViewSpec,
@@ -574,8 +639,61 @@ pub async fn report_view_render(
 ) -> Result<ViewPayload, String> {
     let start = std::time::Instant::now();
     let source = DbSource::new(&configs);
-    let (tables, cols, stats, sqls, partial) =
+    let (tables, cols, stats, sqls, partial, mut failed) =
         run_datasets(&datasets, &source, schemas.as_ref()).await?;
+    for f in failed.iter_mut() {
+        f.widgets = view
+            .widgets
+            .iter()
+            .filter(|w| w.dataset == f.id)
+            .map(|w| w.id.clone())
+            .collect();
+    }
+    let dead: Vec<&str> = failed.iter().map(|f| f.id.as_str()).collect();
+    // 一张图都留不下就别画空板面：这时用户要的是逐条失败原因，不是"渲染成功、0 张图"
+    if !failed.is_empty() && !view.widgets.is_empty() {
+        let survivors = view
+            .widgets
+            .iter()
+            .filter(|w| !dead.contains(&w.dataset.as_str()))
+            .count();
+        if survivors == 0 {
+            return Err(format!(
+                "{} 个数据集全部没取到数：{}",
+                failed.len(),
+                failed
+                    .iter()
+                    .map(|f| format!("「{}」({})：{}", f.name, f.id, f.error))
+                    .collect::<Vec<_>>()
+                    .join("；")
+            ));
+        }
+    }
+    let view = if dead.is_empty() {
+        view
+    } else {
+        let widgets: Vec<view::WidgetSpec> = view
+            .widgets
+            .iter()
+            .filter(|w| !dead.contains(&w.dataset.as_str()))
+            .cloned()
+            .collect();
+        // 布局要么整份为空（自动堆叠），要么每个组件恰好一条：摘了组件就得一起摘布局，
+        // 否则 resolve_layout 会拿"组件 X 缺少布局"顶掉真正的失败原因。
+        let layout = view
+            .layout
+            .iter()
+            .filter(|l| widgets.iter().any(|w| w.id == l.widget))
+            .cloned()
+            .collect();
+        ViewSpec {
+            id: view.id.clone(),
+            name: view.name.clone(),
+            version: view.version,
+            widgets,
+            layout,
+        }
+    };
     let steps = view::validate_view(&view, &cols)?;
     let layout = view::resolve_layout(&view)?;
     let charts = view::render_view(&view, &tables)?;
@@ -586,6 +704,7 @@ pub async fn report_view_render(
         datasets: stats,
         generated_sql: sqls,
         partial,
+        failed,
         elapsed_ms: start.elapsed().as_millis() as u64,
     })
 }
@@ -1058,6 +1177,139 @@ mod tests {
             serde_json::json!([150.0, 80.0, 70.0])
         );
         assert_eq!(wire["charts"][2]["rows"][0][0], serde_json::json!(5));
+        assert!(wire["failed"].as_array().unwrap().is_empty());
+    }
+
+    /// 跨库报表的降级：crm 那条连接读不到，只该带走吃它的那张集，
+    /// 商城库自己的明细表照常出图，少画的组件按数据集点名。
+    #[tokio::test]
+    async fn one_dead_connection_only_takes_the_datasets_that_need_it() {
+        let db = temp_db();
+        let (shop, _) = seed_shop_crm(&db).await;
+        let ghost = sqlite_cfg("crm", "/tmp/definitely-not-here-zdb-42/crm.sqlite");
+        let payload = report_view_render(
+            shop_board(),
+            vec![city_gmv_spec(), paid_orders_spec()],
+            vec![shop, ghost],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(payload.failed.len(), 1, "{:?}", payload.failed);
+        let f = &payload.failed[0];
+        assert_eq!(f.id, "city-gmv");
+        assert_eq!(f.name, "城市成交额");
+        assert!(f.error.contains("SQLite 文件不存在"), "{}", f.error);
+        assert_eq!(f.widgets, vec!["kpi-gmv".to_string(), "bar-city".into()]);
+        // 活下来的那张图照旧出真数据，不是空板面
+        assert_eq!(payload.charts.len(), 1);
+        assert_eq!(payload.charts[0].columns, vec!["id", "amount"]);
+        assert_eq!(payload.charts[0].rows.len(), 2);
+        assert_eq!(payload.datasets.len(), 1);
+        assert_eq!(payload.datasets[0].id, "paid-orders");
+        // 布局跟着摘，不然前端要为一个画不出来的组件留一块空位
+        assert_eq!(payload.layout.len(), 1);
+        assert_eq!(payload.layout[0].widget, "tbl-orders");
+        // 失败的集不给源 SQL（计划都没过），只给活下来的
+        assert_eq!(payload.generated_sql.len(), 1);
+        assert_eq!(payload.generated_sql[0].dataset, "paid-orders");
+        let wire = serde_json::to_value(&payload).unwrap();
+        assert_eq!(wire["failed"][0]["widgets"].as_array().unwrap().len(), 2);
+    }
+
+    /// 表被删了（列清单探不出来）同样只降级那一张集，另一张集不受牵连。
+    #[tokio::test]
+    async fn a_missing_table_degrades_only_its_own_dataset() {
+        let db = temp_db();
+        let (shop, crm) = seed_shop_crm(&db).await;
+        let mut broken = paid_orders_spec();
+        broken.sources[0].table = "orders_v2".into();
+        let payload = report_view_render(
+            shop_board(),
+            vec![city_gmv_spec(), broken],
+            vec![shop, crm],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(payload.charts.len(), 2, "{:?}", payload.charts);
+        assert_eq!(payload.failed.len(), 1, "{:?}", payload.failed);
+        assert_eq!(payload.failed[0].id, "paid-orders");
+        assert_eq!(payload.failed[0].widgets, vec!["tbl-orders".to_string()]);
+        assert!(
+            payload.failed[0].error.contains("orders_v2"),
+            "报错要指出是哪张表读不出列：{}",
+            payload.failed[0].error
+        );
+        assert_eq!(payload.datasets.len(), 1);
+        assert_eq!(payload.datasets[0].id, "city-gmv");
+    }
+
+    /// 计划过了、真去库里取数时才炸（生产里就是连接抖一下、表被 DBA 删了）：
+    /// 这一路同样只降级那张集，且没结果的集不许留在执行概况里。
+    #[tokio::test]
+    async fn a_failure_during_fetch_degrades_only_its_own_dataset() {
+        let db = temp_db();
+        let (shop, crm) = seed_shop_crm(&db).await;
+        let mut broken = paid_orders_spec();
+        // 自带列清单 → 计划阶段不探库，直接过（清单得含 status，否则过滤器先在计划阶段被打回）；
+        // 真取数时才发现表根本不在
+        broken.sources[0].columns = vec!["id".into(), "user_id".into(), "amount".into(), "status".into()];
+        broken.sources[0].table = "orders_archive".into();
+        let payload = report_view_render(
+            shop_board(),
+            vec![city_gmv_spec(), broken],
+            vec![shop, crm],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(payload.charts.len(), 2, "{:?}", payload.charts);
+        assert_eq!(payload.failed.len(), 1, "{:?}", payload.failed);
+        assert_eq!(payload.failed[0].id, "paid-orders");
+        assert_eq!(payload.failed[0].widgets, vec!["tbl-orders".to_string()]);
+        assert!(
+            payload.failed[0].error.contains("orders_archive"),
+            "{}",
+            payload.failed[0].error
+        );
+        // 计划出的列清单不能当"这张集有结果"：执行概况里只能有真出数的
+        assert_eq!(payload.datasets.len(), 1);
+        assert_eq!(payload.datasets[0].id, "city-gmv");
+    }
+
+    /// 一张图都留不下时不画空板面：错误里逐条点名，用户才知道该回去修哪两条连接。
+    #[tokio::test]
+    async fn render_reports_every_failure_when_nothing_survives() {
+        let ghost_shop = sqlite_cfg("shop", "/tmp/definitely-not-here-zdb-42/shop.sqlite");
+        let ghost_crm = sqlite_cfg("crm", "/tmp/definitely-not-here-zdb-42/crm.sqlite");
+        let err = report_view_render(
+            shop_board(),
+            vec![city_gmv_spec(), paid_orders_spec()],
+            vec![ghost_shop, ghost_crm],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("全部没取到数"), "{}", err);
+        assert!(err.contains("city-gmv") && err.contains("paid-orders"), "{}", err);
+        assert!(err.contains("城市成交额") && err.contains("已支付订单明细"), "{}", err);
+    }
+
+    /// id 空或重复是整份规格的错，不许被"按数据集降级"糊过去
+    #[tokio::test]
+    async fn duplicate_dataset_ids_still_reject_the_whole_run() {
+        let db = temp_db();
+        let (shop, crm) = seed_shop_crm(&db).await;
+        let err = report_view_render(
+            shop_board(),
+            vec![city_gmv_spec(), city_gmv_spec()],
+            vec![shop, crm],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("重复"), "{}", err);
     }
 
     /// AI 编了个不存在的度量：报错要指名道姓，而不是回一张空图

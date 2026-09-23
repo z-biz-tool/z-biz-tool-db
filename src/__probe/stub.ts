@@ -266,6 +266,39 @@ function invoke(cmd: string, args: any): Promise<any> {
           }
         }
       }
+      // 镜像 report_view_render 的按数据集降级：?dsfail=city-gmv 让那张集取数失败，
+      // 挂在它上面的组件被摘掉、其余照常出；全部摘光时后端是整单报错而不是回空板面。
+      const raw = String((window as any).__PROBE_RUNFAIL ?? window.__PROBE_ARG("dsfail") ?? "");
+      if (cmd === "report_view_render" && raw.trim()) {
+        const dead = raw.split(",").map((s) => s.trim()).filter(Boolean);
+        const specs: any[] = a.datasets || [];
+        const known = new Set(specs.map((d: any) => d.id));
+        const bogus = dead.filter((d) => !known.has(d));
+        if (bogus.length) return fail(`注入的数据集 id 不在规格里：${bogus.join(",")}（现有：${[...known].join(",")}）`);
+        const r = JSON.parse(JSON.stringify((fixture as any).render));
+        const widgetsOf = (id: string) =>
+          ((a.view || {}).widgets || []).filter((w: any) => w.dataset === id).map((w: any) => w.id);
+        const lost = new Set(dead.flatMap(widgetsOf));
+        const total = ((a.view || {}).widgets || []).length;
+        if (total > 0 && lost.size >= total) {
+          return fail(
+            `${dead.length} 个数据集全部没取到数：${dead
+              .map((id) => `「${specs.find((s: any) => s.id === id).name}」(${id})：注入的取数失败`)
+              .join("；")}`
+          );
+        }
+        r.failed = dead.map((id) => ({
+          id,
+          name: specs.find((s: any) => s.id === id).name,
+          error: "注入的取数失败：SQLite 文件不存在",
+          widgets: widgetsOf(id),
+        }));
+        r.charts = r.charts.filter((c: any) => !lost.has(c.widget));
+        r.layout = r.layout.filter((l: any) => !lost.has(l.widget));
+        r.datasets = r.datasets.filter((d: any) => !dead.includes(d.id));
+        r.steps = r.steps.filter((s: string) => !dead.some((id) => s.includes(`dataset=${id}`)));
+        return Promise.resolve(r);
+      }
       return Promise.resolve(
         cmd === "report_view_render" ? (fixture as any).render : (fixture as any).validate
       );

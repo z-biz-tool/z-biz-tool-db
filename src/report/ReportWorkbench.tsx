@@ -492,7 +492,14 @@ export function ReportWorkbench({
       const p = await reportViewRender(view, datasets, configs);
       if (id !== runId.current) return;
       setPayload(p);
-      msgApi.success(`${p.charts.length} 个组件 · ${p.elapsed_ms} ms`);
+      // 有数据集没取到数就不报绿：这块板现在是"缺了几张图"的状态，
+      // 一条"2 个组件 · 31 ms"的绿色提示会让人以为图本来就只该有这两张。
+      if (p.failed.length > 0) {
+        const lost = p.failed.reduce((n, f) => n + f.widgets.length, 0);
+        msgApi.warning(`已出 ${p.charts.length} 个组件，${p.failed.length} 个数据集没取到数（${lost} 个组件没画）`);
+      } else {
+        msgApi.success(`${p.charts.length} 个组件 · ${p.elapsed_ms} ms`);
+      }
     } catch (e) {
       if (id !== runId.current) return;
       // 这一段是真的下了 SQL 到库上，拒因多半来自数据库而不是语义层，标题别说反

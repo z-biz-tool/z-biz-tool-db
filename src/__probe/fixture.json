@@ -116,6 +116,7 @@
         "y": 12
       }
     ],
+    "failed": [],
     "partial": false,
     "steps": [
       "WIDGET kpi-gmv KPI [SUM(gmv)] dataset=city-gmv",

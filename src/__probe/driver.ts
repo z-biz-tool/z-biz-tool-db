@@ -160,6 +160,41 @@ export function installDriver() {
       const kind = cls.includes("ant-alert-warning") ? "warning" : cls.includes("ant-alert-info") ? "info" : "other";
       return `${kind}|${(a.textContent || "").trim()}`;
     },
+    /** 报表板上"某张集没取到数"那张卡：按标题里的说法认，返回 kind|全文 */
+    failedCard: () => {
+      const a = Array.from(document.querySelectorAll(".ant-alert")).find((x) =>
+        (x.textContent || "").includes("没取到数")
+      );
+      if (!a) return null;
+      const cls = a.className;
+      const kind = cls.includes("ant-alert-warning")
+        ? "warning"
+        : cls.includes("ant-alert-error")
+          ? "error"
+          : "other";
+      return `${kind}|${(a.textContent || "").trim().replace(/\s+/g, " ")}`;
+    },
+    /** 画布上现在挂着哪几张图（按图卡标题认，没标题时 ChartCard 回退到组件 id） */
+    chartTitles: () =>
+      Array.from(document.querySelectorAll(".ant-card-head-title")).map((t) =>
+        (t.textContent || "").trim().replace(/\s+/g, " ")
+      ),
+    /** 最近一条 toast，带成功/警告/报错色（只看文本不够：缺数据集时误报绿色成功，
+     *  文案可以照抄，颜色骗不了人）。antd 把类型打在 notice 自己的 class 上。 */
+    lastToast: () => {
+      const n = Array.from(document.querySelectorAll(".ant-message-notice"));
+      const last = n[n.length - 1] as HTMLElement | undefined;
+      if (!last) return "";
+      const cls = last.className;
+      const kind = cls.includes("ant-message-notice-success")
+        ? "success"
+        : cls.includes("ant-message-notice-warning")
+          ? "warning"
+          : cls.includes("ant-message-notice-error")
+            ? "error"
+            : "other";
+      return `${kind}|${(last.textContent || "").trim().replace(/\s+/g, " ")}`;
+    },
     /** 当前规格 JSON 编辑器内容（按含 connection_id 的那一栏找，避开问题输入框） */
     specValue: () =>
       Array.from(document.querySelectorAll("textarea"))

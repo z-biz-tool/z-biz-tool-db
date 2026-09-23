@@ -118,9 +118,30 @@ export function ReportBoard({
     .map(
       (d) => `${d.name}（${d.id}）${d.truncated.length ? ` 的源 ${d.truncated.join("、")}` : ""}`
     );
+  const failed = payload.failed;
 
   return (
     <Space orientation="vertical" size={12} style={{ width: "100%" }}>
+      {/* 跨库报表里一条连接断了不该白屏，但少画的图必须点名说，
+          否则用户会把"三张图变一张"当成数据本来就长这样。 */}
+      {failed.length > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          title={`${failed.length} 个数据集没取到数，${failed.reduce((n, f) => n + f.widgets.length, 0)} 个组件没画出来`}
+          description={
+            <Space orientation="vertical" size={2} style={{ fontSize: 12 }}>
+              {failed.map((f) => (
+                <div key={f.id}>
+                  · {f.name}（{f.id}）：{f.error}
+                  {f.widgets.length > 0 ? ` —— 受影响组件 ${f.widgets.join("、")}` : ""}
+                </div>
+              ))}
+              <div style={{ opacity: 0.75 }}>其余数据集已照常取数；补上连接或改好表名后再点一次「取数并渲染」。</div>
+            </Space>
+          }
+        />
+      )}
       {payload.partial && (
         <Alert
           type="warning"
