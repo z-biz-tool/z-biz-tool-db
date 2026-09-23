@@ -51,15 +51,26 @@ export type SchemaStore = Record<string, Record<string, string[]>>;
 
 /** 自然语言 → 一整张报表的规格。
  *  prior 是上一版设计：追问式改稿时把工作台上当前的 spec 带回去，后端会在提示词里
- *  请模型在它基础上改，改出来的设计过的还是同一套本机校验（旧稿里的编造字段照样会被拦下）。 */
+ *  请模型在它基础上改，改出来的设计过的还是同一套本机校验（旧稿里的编造字段照样会被拦下）。
+ *  feedback 是上一稿被本机挡下的原因（DraftReject.error）：点「让 AI 照这条错误改」时，
+ *  前端会把那个 error 和被挡下的 draft 一起带回来，缺任何一半模型都是在凭空重画。
+ *  被拒时后端 reject 的是 DraftReject 对象而不是纯文本，见 types.ts。 */
 export const aiReportDraft = (
   question: string,
   catalog: CatalogTable[],
   config: AIConfig,
   maxRepairs?: number,
-  prior?: PriorReport | null
+  prior?: PriorReport | null,
+  feedback?: string | null
 ): Promise<DraftResult> =>
-  invoke<DraftResult>("ai_report_draft", { question, catalog, config, maxRepairs, prior: prior ?? null });
+  invoke<DraftResult>("ai_report_draft", {
+    question,
+    catalog,
+    config,
+    maxRepairs,
+    prior: prior ?? null,
+    feedback: feedback ?? null,
+  });
 
 /** 自然语言 → 一条 SQL。表与列由本机目录限定，编出来的字段会被后端打回。
  *  prior 是上一稿：追问式改稿时带上，后端会在提示词里请模型在旧稿上改，

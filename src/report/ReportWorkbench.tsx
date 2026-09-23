@@ -57,8 +57,10 @@ import type {
   CatalogTable,
   ColumnInfo,
   DatasetSpec,
+  DraftReject,
   DraftResult,
   PriorReport,
+  ReportDraft,
   SavedReport,
   ViewPayload,
   ViewSpec,
@@ -68,6 +70,19 @@ import { describeDiff, diffSpec, type SpecSide } from "./diffSpec";
 
 const { Text, Title } = Typography;
 const { TextArea } = Input;
+
+/** 起草被本机挡下后，错误卡上留着的那张"错误单"：
+ *  被拒的那一稿 + 拒它的原因 + 当时那句需求，够再发一次 ai_report_draft。 */
+type DraftFix = { question: string; error: string; draft: ReportDraft };
+
+/** 后端 ai_report_draft 挡稿时 reject 的是 DraftReject 对象，别的命令仍是纯文本；
+ *  探针/旧链路也可能是文本。两种都认，否则错误卡上只会显示 [object Object]。 */
+const asDraftReject = (e: unknown): DraftReject => {
+  if (e && typeof e === "object" && typeof (e as DraftReject).error === "string") {
+    return e as DraftReject;
+  }
+  return { error: String(e), draft: null };
+};
 
 /** 目录项的稳定键：连接 + schema + 表 */
 const keyOf = (t: { connection_id: string; schema?: string; table: string }) =>
@@ -141,7 +156,9 @@ export function ReportWorkbench({
   const [checking, setChecking] = useState(false);
   // 失败分两段：标题说"哪一步拒的"，详情留后端原文。只给一句大字符串的话，
   // 缺连接和幻觉字段会顶同一个标题，用户分不出该去补表还是该改问题。
-  const [error, setError] = useState<{ title: string; detail: string } | null>(null);
+  const [error, setError] = useState<{ title: string; detail: string; fix?: DraftFix } | null>(
+    null
+  );
   const [tab, setTab] = useState("board");
   // 缺连接的改绑入口：规格里的死连接 id → 本机现有连接 id
   const [remap, setRemap] = useState<Record<string, string>>({});
@@ -349,7 +366,8 @@ export function ReportWorkbench({
     setSavedSpecText("");
   };
 
-  const onDraft = async () => {
+  /** fix 是"让 AI 照这条错误改"：带着上一次的被拒稿和它的拒因再来一轮。 */
+  const onDraft = async (fix?: DraftFix) => {
     if (!aiReady) {
       onOpenAiSettings();
       return;
@@ -367,7 +385,8 @@ export function ReportWorkbench({
     // 起草会整份覆盖编辑器里的规格，所以"要不要把这份设计当上一版带给模型"
     // 得先问一句它读不读得懂。JSON 坏在这里拦住，比让后端在反序列化上炸、
     // 顶个"本机拒绝了这一稿"的标题（像在说模型编错了字段）诚实得多。
-    if (spec.parseError) {
+    // 照错误改这一路不看编辑器：底稿是错误卡里那张被拒稿，这份 JSON 坏不坏都与它无关。
+    if (!fix && spec.parseError) {
       setError({
         title: "现有设计的 JSON 读不懂，这一稿根本没发给模型",
         detail: `${spec.parseError}\n\n要么修好它，要么点「清空」后从零起草。`,
@@ -384,7 +403,13 @@ export function ReportWorkbench({
     const sameAsk = remembered.trim() !== "" && remembered.trim() === question.trim();
     const before: SpecSide | null =
       spec.view && spec.datasets ? { datasets: spec.datasets, view: spec.view } : null;
-    const prior: PriorReport | null = before && !sameAsk ? { question: remembered, draft: before } : null;
+    // 照错误改时底稿是被拒的那一稿：错误里点名的组件只存在于那一稿里，
+    // 拿编辑器里那份旧设计当底稿，模型对着"组件 w1 的数据集 d1 不存在"改的是一个根本没有 w1 的版本。
+    const prior: PriorReport | null = fix
+      ? { question: fix.question, draft: fix.draft }
+      : before && !sameAsk
+        ? { question: remembered, draft: before }
+        : null;
     const id = ++runId.current;
     setDrafting(true);
     setError(null);
@@ -408,7 +433,7 @@ export function ReportWorkbench({
             .join("、")}`
         );
       }
-      const d = await aiReportDraft(question, ready, aiConfig, undefined, prior);
+      const d = await aiReportDraft(question, ready, aiConfig, undefined, prior, fix?.error ?? null);
       if (id !== runId.current) return;
       applyDraft(d, question.trim());
       // "在上一版基础上改"是对模型的请求，本机校验只查引用合法性，模型少写两个组件照样过。
@@ -428,27 +453,41 @@ export function ReportWorkbench({
       const asked = prior?.question.trim() || "";
       // 报表簿里存的需求可以很长，截断要让人看出来是被截了，不是需求本来就这么说
       const brief = asked.length > 18 ? `${asked.slice(0, 18)}…` : asked;
-      const base = prior
-        ? brief
-          ? `在上一版（${brief}）的设计上改`
-          : "在现有设计上改"
-        : sameAsk
-          ? "同一句需求，不带上一版整份重写"
-          : "现有设计没带上，这一稿是从零起草的";
+      const base = fix
+        ? "照本机拒因在被拒的那一稿上改"
+        : prior
+          ? brief
+            ? `在上一版（${brief}）的设计上改`
+            : "在现有设计上改"
+          : sameAsk
+            ? "同一句需求，不带上一版整份重写"
+            : "现有设计没带上，这一稿是从零起草的";
       const counts = diff ? ` · 数据集 ${diff.ds.from}→${diff.ds.to}、组件 ${diff.w.from}→${diff.w.to}` : "";
       msgApi.success(
         `${base}；${d.repairs > 0 ? `本机校验打回 ${d.repairs} 次后通过` : "已通过本机校验"}${counts}`
       );
     } catch (e) {
       if (id !== runId.current) return;
+      const rej = asDraftReject(e);
+      // 只有把被拒的那一稿一起带回来，才谈得上"照这条错误改"：模型是单发的，
+      // 只喂错误原文，拒因里点名的数据集和组件它一句都对不上。
+      const gone = rej.draft;
+      const next: DraftFix | undefined =
+        gone && (gone.datasets?.length || gone.view?.widgets?.length)
+          ? { question: question.trim(), error: rej.error, draft: gone }
+          : undefined;
+      const hint = fix
+        ? "\n\n（这一稿是拿上一版被拒的设计、照着上面的错误单改的；还卡在同一处就清空编辑器从零起草）"
+        : prior
+          ? "\n\n（这一稿是拿编辑器里现有设计当底稿改的；反复卡在同一处就清空后从零起草）"
+          : "";
       setError({
         title: "本机拒绝了这一稿",
         // 带着上一版设计时，后端也可能是在解这份设计时就拒了，不全是模型编错字段
-        detail: prior
-          ? `${e}\n\n（这一稿是拿编辑器里现有设计当底稿改的；反复卡在同一处就清空后从零起草）`
-          : String(e),
+        detail: `${rej.error}${hint}`,
+        fix: next,
       });
-      msgApi.error("生成失败");
+      msgApi.error(next ? "没过本机校验，可以照这条错误改" : "生成失败");
     } finally {
       if (id === runId.current) setDrafting(false);
     }
@@ -793,7 +832,9 @@ export function ReportWorkbench({
             icon={<RobotOutlined />}
             loading={drafting}
             disabled={!aiReady && !question.trim()}
-            onClick={onDraft}
+            // 不能直接 onClick={onDraft}：它现在收一个"照错误改"的参数，
+            // 把点击事件递进去就等于凭空开了一个改稿轮
+            onClick={() => onDraft()}
           >
             {drafting ? "生成中（每次尝试最长 60 秒）" : "AI 生成报表草稿"}
           </Button>
@@ -859,6 +900,23 @@ export function ReportWorkbench({
             onClose={() => setError(null)}
             style={{ marginBottom: 12 }}
             title={error.title}
+            // 本机拒因是这一稿唯一的"模型下一轮该改什么"的信息，丢掉就得让用户自己
+            // 从错误里挑列名重讲一遍需求；被拒稿一并带回去，模型才认得出错误里点名的组件
+            action={
+              error.fix ? (
+                <Tooltip title="把上面的拒因和那一稿一起回喂给模型，让它改完再过一遍本机校验">
+                  <Button
+                    size="small"
+                    danger
+                    icon={<ThunderboltOutlined />}
+                    loading={drafting}
+                    onClick={() => onDraft(error.fix)}
+                  >
+                    让 AI 照这条错误改
+                  </Button>
+                </Tooltip>
+              ) : null
+            }
             description={
               <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
                 {error.detail}

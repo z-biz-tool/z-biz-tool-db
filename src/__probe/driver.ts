@@ -79,6 +79,21 @@ export function installDriver() {
           const d = p.draft || {};
           return `${p.question}||${(d.datasets || []).length}/${((d.view || {}).widgets || []).length}`;
         }),
+    /** 从某个下标起，起草有没有把本机拒因回喂：'拒因长度…拒因结尾||底稿数据集数/组件数||底稿里有没有被点名的那一列'。
+     *  'null' = 前端判定不该带（普通重试或从零起草），'undefined' = 连键都没上 wire。
+     *  只看 feedback 分不清"喂了错误却没喂被拒稿"——模型是单发的，缺哪一半都是在凭空重画。 */
+    draftFeedbackSent: (from: number) =>
+      (w.__PROBE_CALLS as any[])
+        .slice(from)
+        .filter((c: any) => c.cmd === "ai_report_draft")
+        .map((c: any) => {
+          const fb = c.args.feedback;
+          if (fb == null) return String(fb);
+          const d = (c.args.prior || {}).draft || {};
+          return `${String(fb).length}…${String(fb).slice(-18)}||${(d.datasets || []).length}/${
+            ((d.view || {}).widgets || []).length
+          }||${JSON.stringify(d).includes("profit_zz")}`;
+        }),
     /** 写规格 JSON 编辑器（手搓/写坏都走这条）。按 placeholder 认栏，别按内容认：
      *  写坏之后内容里就没有 connection_id 了。 */
     setSpec: async (text: string) => {

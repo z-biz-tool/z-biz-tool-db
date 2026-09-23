@@ -249,6 +249,15 @@ export interface PriorReport {
   draft: ReportDraft;
 }
 
+/** ai_report_draft 被本机挡下时的回执（后端 DraftReject）。
+ *  draft 是被挡下的那一稿：模型是单发的，下一轮看不见自己上一轮写了什么，
+ *  只回错误原文的话，"组件 w1 绑定的数据集 d1 不存在"里的 d1 它根本对不上。
+ *  模型回复连 JSON 都解不开、或请求没发出去时没有底稿可带。 */
+export interface DraftReject {
+  error: string;
+  draft?: ReportDraft | null;
+}
+
 /** 报表簿条目：存的是 spec 而不是结果，落盘在后端 queries.rs */
 export interface SavedReport {
   id: string;

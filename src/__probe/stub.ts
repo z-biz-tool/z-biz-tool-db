@@ -31,7 +31,9 @@ function push(cmd: string, args: any) {
   window.__PROBE_CALLS.push({ cmd, args });
 }
 
-function fail(msg: string) {
+/** 后端 reject 出来的可能是纯文本，也可能是 DraftReject 那样的结构体，
+ *  两种形状都要能注入——前端对这两者的处理路径不一样。 */
+function fail(msg: string | object) {
   return Promise.reject(msg);
 }
 
@@ -367,6 +369,36 @@ function invoke(cmd: string, args: any): Promise<any> {
         return fail(
           `重试 3 次后仍未通过本机校验：数据集 ds1：源 ${hole.table} 未声明列清单，也无法从 schema 缓存取到`
         );
+      }
+      // ?draftbroken=1 注入"模型压根没吐出可解析的 JSON"：这种拒没有底稿可带
+      // （DraftReject.draft 是 null），错误卡上就不该再挂「照这条错误改」。
+      if (window.__PROBE_FLAG("draftbroken")) {
+        return fail("重试 3 次后仍未通过本地校验：回复里找不到 JSON 对象（模型回复被截断了）");
+      }
+      // ?draftreject=1 注入"模型编了字段、本机把这一稿挡下来"：
+      // 拒因里点名的那一列只在被拒的那一稿里存在，所以回执必须是 {error, draft} 两半，
+      // 与后端 DraftReject 同形。探针里要靠这条腿量两件事：
+      //   1. 错误卡上有没有「让 AI 照这条错误改」这个入口
+      //   2. 点它之后 wire 上有没有同时出现错误原文和被拒的那一稿
+      // 判"改对了"的条件也收紧到这两半都对上：只把 feedback 塞成任意非空字符串、
+      // 或者拿编辑器里那份干净设计当底稿，都还是过不了。
+      if (window.__PROBE_FLAG("draftreject")) {
+        const d = JSON.parse(JSON.stringify((fixture as any).reports[0]));
+        const bad = d.view.widgets.find((x: any) => x.type === "BAR");
+        bad.encode.y = "profit_zz";
+        const ticket = String(a.feedback || "");
+        const base = ((a.prior || {}).draft || {}) as any;
+        const baseHasBad = (base.view?.widgets || []).some((x: any) => x.encode?.y === "profit_zz");
+        if (!ticket.includes("profit_zz") || !baseHasBad) {
+          return fail({
+            error:
+              `重试 3 次后仍未通过本机校验：组件 ${bad.id}（数据集 ${bad.dataset}）：` +
+              `y 列 profit_zz 不在数据集输出里（可用列：${
+                ((fixture as any).validate.schemas[bad.dataset] || []).join(", ") || "-"
+              }）`,
+            draft: { datasets: d.datasets, view: d.view },
+          });
+        }
       }
       // DraftResult.datasets 是 DatasetSpec[]（sources/aggregates/joins…）。
       // 这里曾误取 render.datasets —— 那是取数后的结果形状，没有 sources，

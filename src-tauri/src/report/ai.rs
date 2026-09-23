@@ -63,6 +63,24 @@ pub struct PriorReport {
     pub draft: ReportDraft,
 }
 
+/// 起草被本机挡下时的回执：错误原文 + 被挡下的那一稿。
+///
+/// 模型是单发的，下一轮看不见自己上一轮写了什么。只把"组件 w2 的 y 列 uv 不在输出里"
+/// 喂回去，它连 w2 指的是哪个组件都对不上，所以错误原文要连同被拒稿一起交出去。
+#[derive(Debug, Clone, Serialize)]
+pub struct DraftReject {
+    pub error: String,
+    /// 被挡下的最后一稿设计。请求没发出去、或模型回复连 JSON 都解不开时没有
+    pub draft: Option<ReportDraft>,
+}
+
+impl DraftReject {
+    /// 还没见到模型输出就被拒（空问题、请求发不出去）：没有底稿可带
+    fn of(error: impl Into<String>) -> Self {
+        DraftReject { error: error.into(), draft: None }
+    }
+}
+
 /// 通过本地校验后的草稿：可以直接拿去 report_view_render
 #[derive(Debug, Clone, Serialize)]
 pub struct DraftResult {
@@ -726,26 +744,34 @@ impl Model for HttpModel {
 /// 起草：问一次 → 本地校验 → 不通过就把错误原文回喂，最多 repairs 次。
 /// 校验全在本地跑，所以模型再怎么胡说也不会变成打到库上的查询。
 /// prior 是上一版设计，追问式改稿时带上；改出来的设计照样过同一套本地校验。
+/// feedback 是用户手里那条本机拒因：从第一轮就摆在提示词里，配上 prior
+/// （通常就是被拒的那一稿）等于把一张错误单直接递到模型眼前。
 pub async fn draft(
     model: &dyn Model,
     question: &str,
     catalog: &[CatalogTable],
     repairs: u8,
     prior: Option<&PriorReport>,
-) -> Result<DraftResult, String> {
+    feedback: Option<&str>,
+) -> Result<DraftResult, DraftReject> {
     if question.trim().is_empty() {
-        return Err("请先描述你想要什么报表".into());
+        return Err(DraftReject::of("请先描述你想要什么报表"));
     }
     // 空白的上一版只会往提示词里塞噪音，当作没带
     let prior =
         prior.filter(|p| !p.draft.datasets.is_empty() || !p.draft.view.widgets.is_empty());
     let rounds = repairs.min(MAX_REPAIRS);
-    let mut feedback: Option<String> = None;
+    // 空白错误单和没带一样
+    let mut feedback = feedback
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let mut last = String::new();
+    let mut rejected: Option<ReportDraft> = None;
     for round in 0..=rounds {
         let raw = model
             .complete(prompt(question, catalog, prior, feedback.as_deref()))
-            .await?;
+            .await
+            .map_err(DraftReject::of)?;
         let parsed = match parse_draft(&raw) {
             Ok(d) => d,
             Err(e) => {
@@ -754,7 +780,7 @@ pub async fn draft(
                 continue;
             }
         };
-        match check_draft(parsed, catalog) {
+        match check_draft(parsed.clone(), catalog) {
             Ok(mut out) => {
                 out.repairs = round;
                 return Ok(out);
@@ -762,14 +788,16 @@ pub async fn draft(
             Err(e) => {
                 last = e;
                 feedback = Some(last.clone());
+                // 攒下的是模型自己写的那一稿，不是校验器修好的那份：
+                // 回喂时要让它认得出错误里点名的组件
+                rejected = Some(parsed);
             }
         }
     }
-    Err(format!(
-        "重试 {} 次后仍未通过本地校验：{}",
-        rounds + 1,
-        last
-    ))
+    Err(DraftReject {
+        error: format!("重试 {} 次后仍未通过本地校验：{}", rounds + 1, last),
+        draft: rejected,
+    })
 }
 
 /// 从模型回复里挖出 JSON 并反序列化成草稿
@@ -782,6 +810,8 @@ pub fn parse_draft(raw: &str) -> Result<ReportDraft, String> {
 
 /// 自然语言 → 一整张报表草稿（数据集 + 组件），已经过本地校验。
 /// 出数仍要走 report_view_render，由用户带着连接配置点一次"执行"。
+/// feedback 是上一稿被本机挡下的原因：前端「让 AI 照这条错误改」把它和被拒稿一起带回来，
+/// 校验口径不变，改出来的稿子照样要过同一套本机校验。
 #[tauri::command]
 pub async fn ai_report_draft(
     question: String,
@@ -789,14 +819,16 @@ pub async fn ai_report_draft(
     config: AIConfig,
     max_repairs: Option<u8>,
     prior: Option<PriorReport>,
-) -> Result<DraftResult, String> {
-    let model = HttpModel::new(config)?;
+    feedback: Option<String>,
+) -> Result<DraftResult, DraftReject> {
+    let model = HttpModel::new(config).map_err(DraftReject::of)?;
     draft(
         &model,
         &question,
         &catalog,
         max_repairs.unwrap_or(2),
         prior.as_ref(),
+        feedback.as_deref(),
     )
     .await
 }
@@ -1433,7 +1465,9 @@ mod tests {
             ),
             format!("```json\n{}\n```", draft_of(&[city_gmv()], &[widget("d1", "BAR")])),
         ]);
-        let out = draft(&model, "各城市成交额", &catalog(), 3, None).await.unwrap();
+        let out = draft(&model, "各城市成交额", &catalog(), 3, None, None)
+            .await
+            .unwrap();
         assert_eq!(out.repairs, 2);
         let prompts = model.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 3);
@@ -1444,17 +1478,23 @@ mod tests {
     #[tokio::test]
     async fn draft_gives_up_with_the_last_local_error() {
         let model = scripted(vec![]);
-        let err = draft(&model, "各城市成交额", &catalog(), 1, None).await.unwrap_err();
-        assert!(err.contains("重试 2 次"), "{}", err);
-        assert!(err.contains("找不到 JSON"), "{}", err);
+        let err = draft(&model, "各城市成交额", &catalog(), 1, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.error.contains("重试 2 次"), "{}", err.error);
+        assert!(err.error.contains("找不到 JSON"), "{}", err.error);
+        // 模型一句 JSON 都没吐出来，就没有底稿可带
+        assert!(err.draft.is_none());
         assert_eq!(model.prompts.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn draft_refuses_an_empty_question_without_calling_the_model() {
         let model = scripted(vec![draft_of(&[city_gmv()], &[widget("d1", "BAR")])]);
-        let err = draft(&model, "   ", &catalog(), 2, None).await.unwrap_err();
-        assert!(err.contains("描述"), "{}", err);
+        let err = draft(&model, "   ", &catalog(), 2, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.error.contains("描述"), "{}", err.error);
         assert!(model.prompts.lock().unwrap().is_empty());
     }
 
@@ -1494,7 +1534,7 @@ mod tests {
     async fn draft_ignores_an_empty_prior_design() {
         let model = scripted(vec![draft_of(&[city_gmv()], &[widget("d1", "BAR")])]);
         let empty = prior("上次的需求串", &draft_of(&[], &[]));
-        let out = draft(&model, "各城市成交额", &catalog(), 1, Some(&empty))
+        let out = draft(&model, "各城市成交额", &catalog(), 1, Some(&empty), None)
             .await
             .unwrap();
         assert_eq!(out.datasets.len(), 1);
@@ -1518,7 +1558,7 @@ mod tests {
         );
         let model = scripted(vec![bad.clone(), draft_of(&[city_gmv()], &[widget("d1", "BAR")])]);
         let p = prior("各城市成交额", &bad);
-        let out = draft(&model, "把金额换成税前的", &catalog(), 3, Some(&p))
+        let out = draft(&model, "把金额换成税前的", &catalog(), 3, Some(&p), None)
             .await
             .unwrap();
         assert_eq!(out.repairs, 1);
@@ -1548,12 +1588,96 @@ mod tests {
         );
         let model = scripted(vec![stale.clone(), stale.clone()]);
         let p = prior("各城市成交额", &stale);
-        let e = draft(&model, "再加一个饼图", &catalog(), 1, Some(&p))
+        let e = draft(&model, "再加一个饼图", &catalog(), 1, Some(&p), None)
             .await
             .unwrap_err();
-        assert!(e.contains("重试 2 次"), "{e}");
-        assert!(e.contains("invoicez"), "{e}");
+        assert!(e.error.contains("重试 2 次"), "{}", e.error);
+        assert!(e.error.contains("invoicez"), "{}", e.error);
         assert_eq!(model.prompts.lock().unwrap().len(), 2);
+    }
+
+    // ==================== 照着本机拒因改稿 ====================
+
+    /// 模型是单发的：下一轮看不见自己上一轮写了什么。只把"组件 w2 …"喂回去，
+    /// 它连 w2 指哪个组件都对不上，所以被拒的那一稿必须随拒因一起交出去。
+    #[tokio::test]
+    async fn a_rejected_draft_comes_back_with_the_verdict() {
+        let bad = draft_of(
+            &[spec(
+                "d1",
+                "o",
+                r#"[{"alias":"o","connection_id":"shop","table":"invoicez"}]"#,
+                r#""limit":10"#,
+            )],
+            &[widget("d1", "BAR")],
+        );
+        let model = scripted(vec![bad.clone(), bad.clone()]);
+        let e = draft(&model, "各城市成交额", &catalog(), 1, None, None)
+            .await
+            .unwrap_err();
+        let rejected = e.draft.as_ref().expect("被拒的那一稿要能带回去当底稿");
+        assert_eq!(rejected.view.widgets.len(), 1);
+        assert_eq!(rejected.view.widgets[0].id, "w1");
+        // 带的是模型自己写的那一份：校验器修好的列清单没进里面
+        assert_eq!(rejected.datasets[0].sources[0].table, "invoicez");
+        // 前端把整个回执当 JSON 收，键名要稳
+        let wire = serde_json::to_value(&e).unwrap();
+        assert_eq!(wire["draft"]["datasets"].as_array().unwrap().len(), 1);
+        assert!(wire["error"].as_str().unwrap().contains("invoicez"));
+    }
+
+    /// 用户点「照这条错误改」：错误原文要在第一轮就出现，且和被拒稿同时在场——
+    /// 少任何一半，模型都是在凭空重画整张报表。
+    #[tokio::test]
+    async fn the_verdict_and_the_rejected_design_reach_the_first_round_together() {
+        let bad = draft_of(
+            &[spec(
+                "d1",
+                "o",
+                r#"[{"alias":"o","connection_id":"shop","table":"invoicez"}]"#,
+                r#""limit":10"#,
+            )],
+            &[widget("d1", "BAR")],
+        );
+        // 前两条是上一次起草的两轮（都没过），第三条才是"照错误改"这一轮的回答
+        let model = scripted(vec![
+            bad.clone(),
+            bad.clone(),
+            draft_of(&[city_gmv()], &[widget("d1", "BAR")]),
+        ]);
+        let e = draft(&model, "各城市成交额", &catalog(), 1, None, None)
+            .await
+            .unwrap_err();
+        let rejected = e.draft.clone().unwrap();
+        let p = PriorReport { question: "各城市成交额".into(), draft: rejected.clone() };
+        let out = draft(&model, "各城市成交额", &catalog(), 1, Some(&p), Some(&e.error))
+            .await
+            .unwrap();
+        // 改好了就是 repairs 0：这是新一轮的第一稿，不是上一轮的第三稿
+        assert_eq!(out.repairs, 0);
+        let ps = model.prompts.lock().unwrap();
+        // 前两轮是上一次起草的往返，第三轮才是"照错误改"的第一轮
+        assert_eq!(ps.len(), 3);
+        let fix = &ps[2];
+        assert!(fix.contains("上一稿没有通过本机校验"), "{fix}");
+        assert!(fix.contains("invoicez"), "{fix}");
+        assert!(fix.contains("请在它基础上按新需求改"), "{fix}");
+        assert!(fix.contains("\"id\": \"d1\""), "{fix}");
+        // 措辞不能退回"只修正这个问题"：校验一次列全，那样等于叫模型只改第一条
+        assert!(fix.contains("每一处"), "{fix}");
+    }
+
+    /// 空白错误单等于没带：不能往提示词里塞一段"原因：（空）"
+    #[tokio::test]
+    async fn a_blank_verdict_is_not_seeded_into_the_prompt() {
+        let model = scripted(vec![draft_of(&[city_gmv()], &[widget("d1", "BAR")])]);
+        let out = draft(&model, "各城市成交额", &catalog(), 1, None, Some("   "))
+            .await
+            .unwrap();
+        assert_eq!(out.repairs, 0);
+        let ps = model.prompts.lock().unwrap();
+        assert_eq!(ps.len(), 1);
+        assert!(!ps[0].contains("上一稿没有通过本机校验"), "{}", ps[0]);
     }
 
     #[test]
