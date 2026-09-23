@@ -279,7 +279,12 @@ export function ReportWorkbench({
   /** 目录按"能不能拿去起草"分成两堆：连接已删、列清单为空的表都不能进目录。
    *  空列清单比缺连接更阴：后端 normalize_sources 会把它原样写进 schema 缓存，
    *  之后每次引用该表都报"未声明列清单"，三轮自我修正全烧在这上面。 */
-  const splitPicked = (colMap: Record<string, ColumnInfo[]>) => {
+  /** list 默认用当前目录；一键补表 / 挑表那条链会把"刚补上、还没进渲染"的键显式带进来，
+   *  省得依赖 React 什么时候提交那一次渲染。 */
+  const splitPicked = (
+    colMap: Record<string, ColumnInfo[]>,
+    list: string[] = pickedRef.current
+  ) => {
     const byId = new Map(configs.map((c) => [c.id, c]));
     const ready: CatalogTable[] = [];
     const unusable: {
@@ -289,7 +294,7 @@ export function ReportWorkbench({
       why: string;
       retry: boolean;
     }[] = [];
-    for (const k of pickedRef.current) {
+    for (const k of list) {
       const [connId, schema, table] = k.split("\u0000");
       const cfg = byId.get(connId);
       if (!cfg) {
@@ -353,10 +358,11 @@ export function ReportWorkbench({
   };
 
   /** 起草前的前置闸：把在飞的列清单等完，缺的补读一次，然后重新分组 */
-  const readyCatalogForDraft = async () => {
-    const keys = pickedRef.current.filter((k) => !(columnsRef.current[k] || []).length);
+  const readyCatalogForDraft = async (extra: string[] = []) => {
+    const list = Array.from(new Set([...pickedRef.current, ...extra]));
+    const keys = list.filter((k) => !(columnsRef.current[k] || []).length);
     if (keys.length) await Promise.allSettled(keys.map(ensureColumns));
-    return splitPicked(columnsRef.current);
+    return splitPicked(columnsRef.current, list);
   };
 
   const tableOptions = configs.map((c) => ({
@@ -430,7 +436,7 @@ export function ReportWorkbench({
         return;
       }
       msgApi.success(`${t.conn}.${u.table} 已进目录（${cols.length} 列）`);
-      if (fix) await onDraft(fix);
+      if (fix) await onDraft(fix, [t.key]);
     } finally {
       setAddingTable("");
     }
@@ -467,20 +473,26 @@ export function ReportWorkbench({
   const [picking, setPicking] = useState(false);
   const [pickError, setPickError] = useState<{ error: string; answer?: string } | null>(null);
   const [pickNote, setPickNote] = useState("");
+  // 这一次挑表是不是"链条"的一部分（挑好接着起草）：被挡下之后再点「照这条错误再挑一次」，
+  // 用户要的还是那张图，不能悄悄退化成"只挑表"
+  const chainDraft = useRef(false);
   // 挑表与起草各自一条链：别共用水位，否则点一下挑表会把在飞的起草当"过期结果"丢掉
   const pickRun = useRef(0);
 
   /** 让 AI 跨库挑表：挑中的直接并进报表目录，并按张去读列清单（列清单是起草的前置条件）。
    *  fix 是「照这条错误再挑一次」：错误原文连同被挡下的那份答案一起回喂——模型是单发的。 */
-  const onPickTables = async (fix?: { error: string; answer?: string }) => {
+  const onPickTables = async (
+    fix?: { error: string; answer?: string },
+    opts?: { thenDraft?: boolean }
+  ): Promise<boolean> => {
     const asked = question.trim();
     if (!asked) {
       msgApi.warning("先说要查什么，才知道要挑哪些表");
-      return;
+      return false;
     }
     if (!aiReady) {
       onOpenAiSettings();
-      return;
+      return false;
     }
     if (!tableCandidates.candidates.length) {
       msgApi.warning(
@@ -488,8 +500,10 @@ export function ReportWorkbench({
           ? `各连接的表清单还没读到：${tableCandidates.skipped.join("、")}`
           : "本机没读到任何表，先连上数据库"
       );
-      return;
+      return false;
     }
+    if (opts?.thenDraft) chainDraft.current = true;
+    else if (!fix) chainDraft.current = false;
     const id = ++pickRun.current;
     setPicking(true);
     setPickError(null);
@@ -502,7 +516,7 @@ export function ReportWorkbench({
         fix?.error ?? null,
         fix?.answer ?? null
       );
-      if (id !== pickRun.current) return;
+      if (id !== pickRun.current) return false;
       const keys = res.picked.map((t) => keyOf(t));
       setPicked((p) => {
         const next = [...p];
@@ -513,7 +527,7 @@ export function ReportWorkbench({
       });
       // 列清单要一张一张问库：不等它们落地就起草，那张表会被前置闸当"零列"丢掉
       await Promise.allSettled(keys.map(ensureColumns));
-      if (id !== pickRun.current) return;
+      if (id !== pickRun.current) return false;
       const noCols = res.picked.filter((t) => !(columnsRef.current[keyOf(t)] || []).length);
       const conns = new Set(res.picked.map((t) => t.connection_id));
       setPickNote(
@@ -529,11 +543,16 @@ export function ReportWorkbench({
         );
       }
       for (const w of res.warnings) msgApi.warning(w);
+      // 链条：挑表成了才起草。目录显式带上刚挑中的那几张，
+      // 不靠"React 这会儿该渲染完了"这种时机（补表在 await 里，picked 还是旧快照）
+      if (chainDraft.current) await onDraft(undefined, keys);
+      return true;
     } catch (e) {
-      if (id !== pickRun.current) return;
+      if (id !== pickRun.current) return false;
       const rej = asPickReject(e);
       setPickError({ error: rej.error, answer: rej.answer || undefined });
       msgApi.error(rej.answer ? "挑表没过本机核对，可以照这条错误再挑一次" : "挑表失败");
+      return false;
     } finally {
       if (id === pickRun.current) setPicking(false);
     }
@@ -570,7 +589,7 @@ export function ReportWorkbench({
   };
 
   /** fix 是"让 AI 照这条错误改"：带着上一次的被拒稿和它的拒因再来一轮。 */
-  const onDraft = async (fix?: DraftFix) => {
+  const onDraft = async (fix?: DraftFix, extraKeys?: string[]) => {
     if (!aiReady) {
       onOpenAiSettings();
       return;
@@ -581,7 +600,9 @@ export function ReportWorkbench({
       msgApi.warning("先说要查什么，模型只能照着问题去挑表和字段");
       return;
     }
-    if (!pickedRef.current.length) {
+    // 链条上刚挑中的表还没进渲染（pickedRef 是上一次渲染的快照），
+    // 只看它就会把"挑完接着起草"判成"一张表都没选"
+    if (!pickedRef.current.length && !(extraKeys ?? []).length) {
       msgApi.warning("先选至少一张表，模型没有目录就只能编字段");
       return;
     }
@@ -617,7 +638,7 @@ export function ReportWorkbench({
     setDrafting(true);
     setError(null);
     try {
-      const { ready, unusable } = await readyCatalogForDraft();
+      const { ready, unusable } = await readyCatalogForDraft(extraKeys ?? []);
       if (id !== runId.current) return;
       // 读不到列清单的表要点名丢掉：没有列清单，后端的列校验对那张表形同虚设，
       // 留着只会让模型自由发挥、三轮修复全烧在"未声明列清单"上。
@@ -1002,7 +1023,12 @@ export function ReportWorkbench({
             }
             action={
               pickError.answer ? (
-                <Tooltip title="把这条拒因和模型那份答案一起回喂，让它改完再对着本机清单核一遍">
+                <Tooltip
+                  title={
+                    "把这条拒因和模型那份答案一起回喂，让它改完再对着本机清单核一遍" +
+                    (chainDraft.current ? "；这一次是链条上的一环，挑好就接着起草" : "")
+                  }
+                >
                   <Button
                     size="small"
                     danger
@@ -1094,6 +1120,23 @@ export function ReportWorkbench({
           >
             {drafting ? "生成中（每次尝试最长 60 秒）" : "AI 生成报表草稿"}
           </Button>
+          {/* 一句需求到出图之间隔着两步：先挑表（可以跨连接），再起草。
+              挑表没过本机核对就不起草——目录里还是没那些表，起草只会撞回同一条拒因。 */}
+          <Tooltip title="先让 AI 从本机各连接的表里挑这次要用的，挑中了接着起草这张报表；挑表没过本机核对就停下来。">
+            <Button
+              block
+              icon={<ThunderboltOutlined />}
+              loading={picking || drafting}
+              disabled={!question.trim()}
+              onClick={() => void onPickTables(undefined, { thenDraft: true })}
+            >
+              {picking
+                ? "正在跨库挑表…"
+                : drafting
+                  ? "挑好了，正在起草…"
+                  : "先跨库挑表，再出图"}
+            </Button>
+          </Tooltip>
           {!aiReady && (
             <Button size="small" block onClick={onOpenAiSettings}>
               先配置 AI 服务地址与密钥

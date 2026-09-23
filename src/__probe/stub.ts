@@ -397,6 +397,13 @@ function invoke(cmd: string, args: any): Promise<any> {
           answer,
         });
       }
+      // 改完还是没有任何一张表落在本机清单里：那还是没挑出可用的表，不能当成功放过去
+      if (unknown.length && !known.length) {
+        return fail({
+          error: `本机核对没通过：清单里没有连接 ${[...new Set(unknown.map((x) => x.split(".")[0]))].join("、")}（可用连接：${[...new Set(cands.map((c) => c.connection_id))].sort().join(", ")}）`,
+          answer,
+        });
+      }
       if (!unknown.length && !tables.length) {
         return fail({
           error: "本机核对没通过：模型一张表都没挑出来：换个说法，或者手工勾选",
