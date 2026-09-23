@@ -2241,8 +2241,14 @@ mod tests {
         assert_eq!(chat(&cfg, "各城市成交额").await.unwrap(), "这是回答");
         let seen = ai.seen.lock().unwrap();
         let req = seen.first().expect("假服务端要收到一次请求");
-        assert!(req.starts_with("POST /v1/chat/completions HTTP/1.1"), "{}", req);
-        assert!(req.contains("Authorization: Bearer sk-test-key"), "{}", req);
+        // 头名大小写不作数（hyper 一律发小写；不同平台/版本的 reqwest 写法不该进断言）
+        let lowered = req.to_lowercase();
+        assert!(lowered.starts_with("post /v1/chat/completions http/1.1"), "{}", req);
+        assert!(
+            lowered.contains("authorization: bearer sk-test-key"),
+            "鉴权头没发出去：{}",
+            req
+        );
         assert!(req.contains("\"probe-model\""), "{}", req);
         assert!(req.contains("各城市成交额"), "{}", req);
     }
