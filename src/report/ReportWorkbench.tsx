@@ -623,8 +623,10 @@ export function ReportWorkbench({
         // 按钮写的是"再出图"就得真出图：起草成了就接着取数渲染。
         // 认引用变化而不是读 draft state——那是 await 之前的快照。
         if (!d || d === beforeDraft) opts?.onDone?.("起草被挡下");
-        else if (await runRender(d.view, d.datasets)) opts?.onDone?.("已出图");
-        else opts?.onDone?.("取数没成功");
+        else {
+          const r = await runRender(d.view, d.datasets);
+          opts?.onDone?.(r === "full" ? "已出图" : r === "partial" ? "出了但有缺口" : "取数没成功");
+        }
       } else {
         opts?.onDone?.("只挑了表");
       }
@@ -822,7 +824,11 @@ export function ReportWorkbench({
   );
 
   /** 抽出来是为了"打开报表即取数"：那时 specText 的 state 还没落地，不能走 onRender */
-  const runRender = async (view: ViewSpec, datasets: DatasetSpec[]): Promise<boolean> => {
+  /** full = 全部取到数；partial = 板子画出来了但有集没数；failed = 没画成 */
+  const runRender = async (
+    view: ViewSpec,
+    datasets: DatasetSpec[]
+  ): Promise<"full" | "partial" | "failed"> => {
     // 取数前先挡一遍缺连接：后端那句"源 o 引用的连接 … 不在本会话已解锁的连接里"
     // 只点得到别名 o，点不到是哪张表、哪个数据集，而且这一挡省掉一次注定失败的 IPC 往返。
     const missNow = findMissingConns(datasets, aliveConnIds);
@@ -832,31 +838,31 @@ export function ReportWorkbench({
         detail: `${describeMissing(missNow)}\n\n规格已载入，未下推任何 SQL。用下面的入口把它改绑到一条现有连接，或先按原名重建连接。`,
       });
       msgApi.warning("缺少连接，已载入规格但未取数");
-      return false;
+      return "failed";
     }
     const id = ++runId.current;
     setRendering(true);
     setError(null);
     try {
       const p = await reportViewRender(view, datasets, configs);
-      if (id !== runId.current) return false;
+      if (id !== runId.current) return "failed";
       setPayload(p);
       // 有数据集没取到数就不报绿：这块板现在是"缺了几张图"的状态，
       // 一条"2 个组件 · 31 ms"的绿色提示会让人以为图本来就只该有这两张。
       if (p.failed.length > 0) {
         const lost = p.failed.reduce((n, f) => n + f.widgets.length, 0);
         msgApi.warning(`已出 ${p.charts.length} 个组件，${p.failed.length} 个数据集没取到数（${lost} 个组件没画）`);
-        // 缺图的板子不算成功：链条要把这件事原样告诉用户
-        return false;
+        // 缺图的板子不能当好结果，但也不能说"没出图"：链条按 partial 回话
+        return "partial";
       }
       msgApi.success(`${p.charts.length} 个组件 · ${p.elapsed_ms} ms`);
-      return true;
+      return "full";
     } catch (e) {
-      if (id !== runId.current) return false;
+      if (id !== runId.current) return "failed";
       // 这一段是真的下了 SQL 到库上，拒因多半来自数据库而不是语义层，标题别说反
       setError({ title: "取数失败", detail: String(e) });
       msgApi.error("渲染失败");
-      return false;
+      return "failed";
     } finally {
       if (id === runId.current) setRendering(false);
     }
