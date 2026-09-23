@@ -421,6 +421,31 @@ function invoke(cmd: string, args: any): Promise<any> {
         warnings: [],
       });
     }
+    // 镜像 ai_report_explain：先核材料，再要模型名；行数据不该出现在材料里
+    case "ai_report_explain": {
+      const b = a.brief || {};
+      const ds = b.datasets || [];
+      const failed = b.failed || [];
+      if (!ds.length && !failed.length) {
+        return fail("这张报表还没有可解释的材料：先点一次「取数并渲染」");
+      }
+      if (!String((a.config || {}).model || "").trim()) {
+        return fail("请先在设置中填写 AI 模型名");
+      }
+      const sqls = ds.flatMap((d: any) => (d.sqls || []).map((q: any) => `${q.connection}:${q.sql}`));
+      if (!sqls.length) return fail("材料里没有一条下推 SQL：这样讲出来的口径是编的");
+      // ?explainfail=1 当成模型侧失败：错误要能在看板上看见，不能只闪一句 toast
+      if (window.__PROBE_FLAG("explainfail")) return fail("AI 服务 500：模型侧炸了（注入）");
+      const trunc = ds.filter((d: any) => (d.truncated || []).length).map((d: any) => d.id);
+      return Promise.resolve(
+        [
+          `这张图由 ${ds.length} 个数据集算出来，一共下推了 ${sqls.length} 条 SQL：${sqls.join(" | ")}`,
+          `问的是：${b.question || "（没带需求）"}`,
+          `算子链 ${((b.steps || []).length)} 步`,
+          trunc.length ? `其中 ${trunc.join("、")} 撞上取数上限，数只是取回的那部分` : "没有数据集撞取数上限",
+        ].join("\n")
+      );
+    }
     case "load_reports":
       if (window.__PROBE_FLAG("loadfail")) {
         return fail(
@@ -501,8 +526,12 @@ function invoke(cmd: string, args: any): Promise<any> {
         r.steps = r.steps.filter((s: string) => !dead.some((id) => s.includes(`dataset=${id}`)));
         return Promise.resolve(r);
       }
+      // 取数每次回的都是新的一份（真后端每次重新组包）。复用同一个对象会让
+      // "payload 变了没"这种判断在探针里失灵——旧解释该不该作废就量不出来
       return Promise.resolve(
-        cmd === "report_view_render" ? (fixture as any).render : (fixture as any).validate
+        cmd === "report_view_render"
+          ? JSON.parse(JSON.stringify((fixture as any).render))
+          : (fixture as any).validate
       );
     }
     case "ai_report_draft": {

@@ -1093,6 +1093,142 @@ pub async fn pick(
     })
 }
 
+// ==================== 讲清一张已经出图的报表 ====================
+
+/// 一个源实际下推的那条 SQL（跨库报表里一个数据集会有好几条，分属不同库）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BriefSql {
+    pub alias: String,
+    #[serde(default)]
+    pub connection: String,
+    #[serde(default)]
+    pub database_type: String,
+    pub sql: String,
+}
+
+/// 一个数据集的"怎么算出来的"材料
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BriefDataset {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub rows: i64,
+    #[serde(default)]
+    pub columns: Vec<String>,
+    /// 撞上取数上限的源别名：这些数只是已取回的那部分
+    #[serde(default)]
+    pub truncated: Vec<String>,
+    #[serde(default)]
+    pub sqls: Vec<BriefSql>,
+}
+
+/// 没取到数的数据集：它会让几张图没画出来，讲图时不能当没事
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BriefFailure {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub widgets: Vec<String>,
+}
+
+/// 一张已经画出来的报表的材料单。**不带行数据**：要解释的是结构与口径，
+/// 数字用户自己能在图上看，把整张结果搬给模型既烧 token 又会让它去复述假数。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReportBrief {
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub widgets: Vec<String>,
+    #[serde(default)]
+    pub datasets: Vec<BriefDataset>,
+    #[serde(default)]
+    pub failed: Vec<BriefFailure>,
+    #[serde(default)]
+    pub steps: Vec<String>,
+}
+
+impl ReportBrief {
+    fn has_material(&self) -> bool {
+        !self.datasets.is_empty() || !self.failed.is_empty()
+    }
+}
+
+pub fn explain_prompt(b: &ReportBrief) -> Result<String, String> {
+    if !b.has_material() {
+        return Err("这张报表还没有可解释的材料：先点一次「取数并渲染」".into());
+    }
+    let mut s = String::from(
+        "用户在桌面数据库工具里要了一张报表，已经画出来了。请用中文讲清这张图是怎么算出来的：\n\
+         1. 每个数据集从哪个库下推了什么 SQL，跨库的部分是怎么在本机内存里拼起来的；\n\
+         2. 过滤、分组、聚合、排序、join 各发生在哪一段（看算子链）；\n\
+         3. 图上哪些数是缺的、哪些只是取回了一部分——这种数不能当全量读。\n\
+         只按下面给的材料讲，不要编造库里没给的东西，也不用把整段 SQL 再抄一遍。\n",
+    );
+    if !b.question.trim().is_empty() {
+        s.push_str(&format!("当初那句需求：{}\n", b.question.trim()));
+    }
+    if !b.widgets.is_empty() {
+        s.push_str(&format!("图上的组件：{}\n", b.widgets.join("；")));
+    }
+    for d in &b.datasets {
+        s.push_str(&format!(
+            "\n数据集 {}（{}）：取回 {} 行，输出列 [{}]\n",
+            d.id,
+            if d.name.trim().is_empty() { "（没名字）" } else { d.name.trim() },
+            d.rows,
+            d.columns.join(", ")
+        ));
+        if !d.truncated.is_empty() {
+            s.push_str(&format!(
+                "  撞上取数上限的源：{}——这张集的聚合与排序只覆盖了已取回的部分\n",
+                d.truncated.join("、")
+            ));
+        }
+        for q in &d.sqls {
+            s.push_str(&format!(
+                "  源 {} @ {}（{}）下推：{}\n",
+                q.alias,
+                if q.connection.trim().is_empty() { "连接名未知" } else { q.connection.trim() },
+                if q.database_type.trim().is_empty() { "方言未知" } else { q.database_type.trim() },
+                q.sql.trim()
+            ));
+        }
+    }
+    for f in &b.failed {
+        s.push_str(&format!(
+            "\n没取到数的数据集 {}：{}{}\n",
+            if f.name.trim().is_empty() { "（没名字）" } else { f.name.trim() },
+            f.error.trim(),
+            if f.widgets.is_empty() {
+                String::new()
+            } else {
+                format!("（因此没画出来的组件：{}）", f.widgets.join("、"))
+            }
+        ));
+    }
+    if !b.steps.is_empty() {
+        s.push_str("\n算子链（按执行顺序）：\n");
+        for st in &b.steps {
+            s.push_str(&format!("· {st}\n"));
+        }
+    }
+    Ok(s)
+}
+
+/// 把这张报表讲一遍。只读材料、不碰库，所以模型再怎么发挥也变不出一次取数。
+#[tauri::command]
+pub async fn ai_report_explain(
+    brief: ReportBrief,
+    config: AIConfig,
+) -> Result<String, String> {
+    let prompt = explain_prompt(&brief)?;
+    let model = HttpModel::new(config)?;
+    model.complete(prompt).await.map(|t| t.trim().to_string())
+}
+
 // ==================== Tauri 命令 ====================
 
 /// 自然语言 → 一整张报表草稿（数据集 + 组件），已经过本地校验。
@@ -2168,6 +2304,74 @@ mod tests {
         let out = pick(&model, "全部都要", &many, 2, None, None).await.unwrap();
         assert_eq!(out.picked.len(), MAX_PICKED);
         assert!(out.warnings.iter().any(|w| w.contains("只留前 6 张")), "{:?}", out.warnings);
+    }
+
+    fn brief() -> ReportBrief {
+        ReportBrief {
+            question: "各城市成交额，带上客户渠道".into(),
+            widgets: vec!["w1 · 柱图 · 城市成交额".into()],
+            datasets: vec![BriefDataset {
+                id: "city-gmv".into(),
+                name: "城市成交额".into(),
+                rows: 4,
+                columns: vec!["city".into(), "gmv".into()],
+                truncated: vec!["u".into()],
+                sqls: vec![
+                    BriefSql {
+                        alias: "o".into(),
+                        connection: "商城库".into(),
+                        database_type: "mysql".into(),
+                        sql: "SELECT id, city, amount FROM orders WHERE status = 'paid'".into(),
+                    },
+                    BriefSql {
+                        alias: "u".into(),
+                        connection: "客户库".into(),
+                        database_type: "sqlite".into(),
+                        sql: "SELECT id, channel FROM users".into(),
+                    },
+                ],
+            }],
+            failed: vec![BriefFailure {
+                name: "退款明细".into(),
+                error: "连接 crm 不可达".into(),
+                widgets: vec!["w3".into()],
+            }],
+            steps: vec![
+                "scan orders (商城库)".into(),
+                "join users (客户库) on o.user_id = u.id".into(),
+                "group by city".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn explain_prompt_hands_the_model_both_ends_of_a_cross_db_report() {
+        let p = explain_prompt(&brief()).unwrap();
+        assert!(p.contains("SELECT id, city, amount FROM orders"), "{p}");
+        assert!(p.contains("SELECT id, channel FROM users"), "{p}");
+        assert!(p.contains("商城库") && p.contains("客户库"), "{p}");
+        assert!(p.contains("mysql") && p.contains("sqlite"), "{p}");
+        // 部分与缺失必须一起给：不然模型会把"只取回一部分"的数讲成全量
+        assert!(p.contains("撞上取数上限的源：u"), "{p}");
+        assert!(p.contains("连接 crm 不可达") && p.contains("w3"), "{p}");
+        assert!(p.contains("group by city"), "{p}");
+        assert!(p.contains("各城市成交额"), "{p}");
+    }
+
+    #[test]
+    fn explain_prompt_refuses_a_report_with_nothing_to_explain() {
+        // 既没有数据集也没有失败项 = 这张图还没画出来，不该白问一次模型
+        let e = explain_prompt(&ReportBrief::default()).unwrap_err();
+        assert!(e.contains("取数并渲染"), "{e}");
+        let only_failed = ReportBrief {
+            failed: vec![BriefFailure {
+                name: "x".into(),
+                error: "连不上".into(),
+                widgets: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(explain_prompt(&only_failed).is_ok());
     }
 
     #[tokio::test]

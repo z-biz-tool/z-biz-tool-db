@@ -472,6 +472,30 @@ export function installDriver() {
             ans == null ? "null" : String(ans).slice(0, 30)
           }`;
         }),
+    /** 从某个下标起，每次"讲这张图"到底交出去了什么材料。
+     *  跨库那条链最该看的就这一眼：两条库的 SQL 是不是都上了线、行数据有没有跟着过去。 */
+    explainSent: (from: number) =>
+      (w.__PROBE_CALLS as any[])
+        .slice(from)
+        .filter((c: any) => c.cmd === "ai_report_explain")
+        .map((c: any) => {
+          const b = c.args.brief || {};
+          const ds = b.datasets || [];
+          const sqls = ds.flatMap((d: any) => (d.sqls || []).map((x: any) => `${d.id}>${x.connection}`));
+          const conns = [
+            ...new Set(ds.flatMap((d: any) => (d.sqls || []).map((x: any) => x.connection))),
+          ];
+          return `q="${(b.question || "").slice(0, 16)}"|ds=${ds.length}|sqls=[${sqls.join(",")}]|conns=${conns.join("+")}|failed=${(b.failed || []).length}|steps=${(b.steps || []).length}|带行数据=${JSON.stringify(b).includes("categories")}`;
+        }),
+    /** AI 讲图那张卡的正文（没有卡返回 null） */
+    explainCard: () => {
+      const head = Array.from(document.querySelectorAll(".ant-card-head-title")).find((t) =>
+        (t.textContent || "").includes("AI 讲这张图")
+      );
+      if (!head) return null;
+      const body = head.closest(".ant-card")?.querySelector(".ant-card-body")?.textContent || "";
+      return body.trim().replace(/\s+/g, " ").slice(0, 200);
+    },
     /** 挑表那张错误卡：kind|正文||按钮（没有卡返回 null） */
     pickAlert: () => {
       const a = Array.from(document.querySelectorAll(".ant-alert")).find((x) =>

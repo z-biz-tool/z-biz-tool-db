@@ -14,6 +14,7 @@ import type {
   PickResult,
   PriorDraft,
   PriorReport,
+  ReportBrief,
   SavedReport,
   SqlDraft,
   SqlPreview,
@@ -117,6 +118,11 @@ export const aiSqlGenerate = (
     prior: prior ?? null,
     feedback: feedback ?? null,
   });
+
+/** 把这张报表"讲清是怎么算出来的"：只交结构（各库下推的 SQL、算子链、取数上限、没取到数的集），
+ *  行数据留在本机。后端没材料时直接拒，不会白问一次模型。 */
+export const aiReportExplain = (brief: ReportBrief, config: AIConfig): Promise<string> =>
+  invoke<string>("ai_report_explain", { brief, config });
 
 export const reportDatasetValidate = (
   spec: DatasetSpec,

@@ -40,6 +40,7 @@ import {
 } from "@ant-design/icons";
 import {
   aiReportDraft,
+  aiReportExplain,
   aiReportPickTables,
   catalogColumns,
   columnSummary,
@@ -57,12 +58,14 @@ import {
 import type {
   CatalogTable,
   ColumnInfo,
+  BriefDataset,
   DatasetSpec,
   DraftReject,
   DraftResult,
   PickReject,
   PickResult,
   PriorReport,
+  ReportBrief,
   ReportDraft,
   SavedReport,
   TableCandidate,
@@ -829,6 +832,63 @@ export function ReportWorkbench({
     }
   };
 
+  /** 讲图：换一张图就得重讲，旧解释跟着这张图作废 */
+  const [explaining, setExplaining] = useState(false);
+  const [explainText, setExplainText] = useState("");
+  const [explainError, setExplainError] = useState("");
+  useEffect(() => {
+    setExplainText("");
+    setExplainError("");
+  }, [payload]);
+
+  const briefForExplain = (): ReportBrief => ({
+    question: question.trim() || priorRef.current?.question || "",
+    widgets: (payload?.charts || []).map((c) => `${c.widget} · ${c.title || c.kind}`),
+    datasets: (payload?.datasets || []).map<BriefDataset>((d) => ({
+      id: d.id,
+      name: d.name,
+      rows: d.rows,
+      columns: d.columns,
+      truncated: d.truncated,
+      // 跨库报表里一个数据集会有好几条 SQL，分属不同库：只给一条就会把 join 讲错地方
+      sqls: (payload?.generated_sql || [])
+        .filter((q) => q.dataset === d.id)
+        .map((q) => ({
+          alias: q.alias,
+          connection: q.connection_name,
+          database_type: q.database_type,
+          sql: q.sql,
+        })),
+    })),
+    failed: (payload?.failed || []).map((f) => ({
+      name: f.name,
+      error: f.error,
+      widgets: f.widgets,
+    })),
+    steps: payload?.steps || [],
+  });
+
+  /** 让 AI 讲清这张图怎么算出来的。行数据不发过去：模型看不全一张表，
+   *  把数搬过去只会让它复述它并不理解的数字。 */
+  const onExplain = async () => {
+    if (!payload) return;
+    if (!aiReady) {
+      onOpenAiSettings();
+      return;
+    }
+    setExplaining(true);
+    setExplainText("");
+    setExplainError("");
+    try {
+      setExplainText(await aiReportExplain(briefForExplain(), aiConfig));
+    } catch (e) {
+      setExplainError(String(e));
+      msgApi.error("这张图没能讲清");
+    } finally {
+      setExplaining(false);
+    }
+  };
+
   const onRender = async () => {
     if (!spec.view || !spec.datasets) {
       msgApi.warning(spec.parseError || "先有一份合法的草稿 JSON");
@@ -1464,7 +1524,55 @@ export function ReportWorkbench({
                 rendering && !payload ? (
                   <Spin style={{ display: "block", margin: "80px auto" }} />
                 ) : payload ? (
-                  <ReportBoard payload={payload} datasetNameOf={datasetNameOf} />
+                  <>
+                    <Space size={6} wrap style={{ marginBottom: 8 }}>
+                      <Tooltip title="把每个库实际下推的 SQL、算子链、取数上限和没取到数的数据集交给模型，让它讲清这些数是怎么来的。行数据不发过去。">
+                        <Button
+                          size="small"
+                          icon={<BulbOutlined />}
+                          loading={explaining}
+                          onClick={() => void onExplain()}
+                        >
+                          让 AI 讲清这张图
+                        </Button>
+                      </Tooltip>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {`材料：${payload.datasets.length} 个数据集 · ${payload.generated_sql.length} 条下推 SQL · ${payload.failed.length} 个没取到数`}
+                      </Text>
+                    </Space>
+                    {explainError && (
+                      <Alert
+                        type="error"
+                        showIcon
+                        closable
+                        onClose={() => setExplainError("")}
+                        style={{ marginBottom: 8 }}
+                        title="AI 没能讲这张图"
+                        description={
+                          <div style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{explainError}</div>
+                        }
+                      />
+                    )}
+                    {explainText && (
+                      <Card
+                        size="small"
+                        style={{ marginBottom: 8 }}
+                        title={
+                          <Space size={4}>
+                            <BulbOutlined /> AI 讲这张图
+                          </Space>
+                        }
+                        extra={
+                          <Button size="small" onClick={() => setExplainText("")}>
+                            收起
+                          </Button>
+                        }
+                      >
+                        <div style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{explainText}</div>
+                      </Card>
+                    )}
+                    <ReportBoard payload={payload} datasetNameOf={datasetNameOf} />
+                  </>
                 ) : draft ? (
                   <Empty description="还没有取数，点「取数并渲染」" style={{ marginTop: 60 }} />
                 ) : (

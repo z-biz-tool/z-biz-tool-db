@@ -293,6 +293,40 @@ export interface PickReject {
   answer?: string | null;
 }
 
+/** 一张已经出图的报表交给模型"讲一遍"的材料单。
+ *  刻意**不含行数据**：要解释的是口径与结构，数字用户在图上自己看，
+ *  把整张结果搬过去只会让模型去复述它其实看不全的数。 */
+export interface BriefSql {
+  alias: string;
+  connection: string;
+  database_type: string;
+  sql: string;
+}
+
+export interface BriefDataset {
+  id: string;
+  name: string;
+  rows: number;
+  columns: string[];
+  /** 撞上取数上限的源别名：这些数只是已取回的那部分 */
+  truncated: string[];
+  sqls: BriefSql[];
+}
+
+export interface BriefFailure {
+  name: string;
+  error: string;
+  widgets: string[];
+}
+
+export interface ReportBrief {
+  question: string;
+  widgets: string[];
+  datasets: BriefDataset[];
+  failed: BriefFailure[];
+  steps: string[];
+}
+
 /** 报表簿条目：存的是 spec 而不是结果，落盘在后端 queries.rs */
 export interface SavedReport {
   id: string;
