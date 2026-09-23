@@ -85,6 +85,9 @@ export function ReportWorkbench({
   const [msgApi, msgHolder] = message.useMessage();
   const [connState, setConnState] = useState<Record<string, ConnState>>({});
   const [columns, setColumns] = useState<Record<string, string[]>>({});
+  // 正在读列清单的表：面板要把它和"读失败"分开显示，
+  // 否则每勾一张表都会先闪一条红色"列清单没读到"。
+  const [colBusy, setColBusy] = useState<string[]>([]);
   const [picked, setPicked] = useState<string[]>([]);
   const [question, setQuestion] = useState("");
   const [draft, setDraft] = useState<DraftResult | null>(null);
@@ -118,9 +121,12 @@ export function ReportWorkbench({
 
   // 与查询链路同一套防竞态：晚到的响应不能盖掉新结果
   const runId = useRef(0);
-  // 已发出/已拿到的列清单请求。只看 columns 会漏：同一次 onChange 里
-  // 逐个 ensure 时 state 还没落地，同一张表会被问两次（真库就是两次探列）。
-  const colInFlight = useRef<Set<string>>(new Set());
+  // 列清单请求按 key 存 promise。用 Set 只够去重，不够等：起草那一刻
+  // 在飞的请求还没落地，catalog 里那张表就是 columns: []。
+  const colInFlight = useRef<Map<string, Promise<void>>>(new Map());
+  // state 是渲染快照，await 之后读它会拿到请求落地前的旧值，
+  // 所以列清单同时镜像到 ref，起草时用 ref 现读。
+  const columnsRef = useRef<Record<string, string[]>>({});
 
   const aiReady = Boolean(aiConfig.base_url && aiConfig.api_key && aiConfig.model);
 
@@ -168,42 +174,79 @@ export function ReportWorkbench({
     refreshReports();
   }, []);
 
-  const catalog: CatalogTable[] = useMemo(() => {
+  /** 目录按"能不能拿去起草"分成两堆：连接已删、列清单为空的表都不能进目录。
+   *  空列清单比缺连接更阴：后端 normalize_sources 会把它原样写进 schema 缓存，
+   *  之后每次引用该表都报"未声明列清单"，三轮自我修正全烧在这上面。 */
+  const splitPicked = (colMap: Record<string, string[]>) => {
     const byId = new Map(configs.map((c) => [c.id, c]));
-    return picked
-      .map((k) => {
-        const [connId, schema, table] = k.split("\u0000");
-        const cfg = byId.get(connId);
-        if (!cfg) return null;
-        return {
-          connection_id: cfg.id,
-          connection_name: cfg.name,
-          database_type: cfg.db_type,
-          schema: schema || "",
+    const ready: CatalogTable[] = [];
+    const unusable: { key: string; table: string; conn: string; why: string }[] = [];
+    for (const k of picked) {
+      const [connId, schema, table] = k.split("\u0000");
+      const cfg = byId.get(connId);
+      if (!cfg) {
+        // 连接被删过就只剩这个 id 了，截一段出来至少能对上当初配的是哪个
+        unusable.push({
+          key: k,
           table,
-          columns: columns[k] || [],
-        } as CatalogTable;
-      })
-      .filter((t): t is CatalogTable => t !== null);
-  }, [picked, configs, columns]);
+          conn: `${connId.slice(0, 8)}…`,
+          why: "所在连接已不在本机",
+        });
+        continue;
+      }
+      const cols = colMap[k] || [];
+      if (!cols.length) {
+        unusable.push({ key: k, table, conn: cfg.name || cfg.id, why: "列清单没读到" });
+        continue;
+      }
+      ready.push({
+        connection_id: cfg.id,
+        connection_name: cfg.name,
+        database_type: cfg.db_type,
+        schema: schema || "",
+        table,
+        columns: cols,
+      });
+    }
+    return { ready, unusable };
+  };
 
-  const ensureColumns = async (key: string) => {
-    if (columns[key] || colInFlight.current.has(key)) return;
-    colInFlight.current.add(key);
+  const { ready: catalog, unusable } = useMemo(() => splitPicked(columns), [
+    picked,
+    configs,
+    columns,
+  ]);
+
+  const ensureColumns = (key: string): Promise<void> => {
+    const running = colInFlight.current.get(key);
+    if (running) return running;
+    if ((columnsRef.current[key] || []).length) return Promise.resolve();
     const [connId, schema, table] = key.split("\u0000");
     const cfg = configs.find((c) => c.id === connId);
-    if (!cfg) {
-      colInFlight.current.delete(key);
-      return;
-    }
-    try {
-      const cols = await reportDescribeColumns(cfg, schema || "", table);
-      setColumns((s) => ({ ...s, [key]: cols }));
-    } catch (e) {
-      // 失败了要允许重选这张表再问一次，否则它永远没有列清单
-      colInFlight.current.delete(key);
-      msgApi.error(`${table} 列清单读取失败：${e}`);
-    }
+    if (!cfg) return Promise.resolve();
+    setColBusy((s) => [...s, key]);
+    const p = (async () => {
+      try {
+        const cols = await reportDescribeColumns(cfg, schema || "", table);
+        columnsRef.current = { ...columnsRef.current, [key]: cols };
+        setColumns((s) => ({ ...s, [key]: cols }));
+      } catch (e) {
+        // 失败了要允许重选这张表再问一次，否则它永远没有列清单
+        msgApi.error(`${table} 列清单读取失败：${e}`);
+      } finally {
+        colInFlight.current.delete(key);
+        setColBusy((s) => s.filter((k) => k !== key));
+      }
+    })();
+    colInFlight.current.set(key, p);
+    return p;
+  };
+
+  /** 起草前的前置闸：把在飞的列清单等完，缺的补读一次，然后重新分组 */
+  const readyCatalogForDraft = async () => {
+    const keys = picked.filter((k) => !(columnsRef.current[k] || []).length);
+    if (keys.length) await Promise.allSettled(keys.map(ensureColumns));
+    return splitPicked(columnsRef.current);
   };
 
   const tableOptions = configs.map((c) => ({
@@ -229,7 +272,7 @@ export function ReportWorkbench({
       onOpenAiSettings();
       return;
     }
-    if (catalog.length === 0) {
+    if (picked.length === 0) {
       msgApi.warning("先选至少一张表，模型没有目录就只能编字段");
       return;
     }
@@ -237,7 +280,26 @@ export function ReportWorkbench({
     setDrafting(true);
     setError(null);
     try {
-      const d = await aiReportDraft(question, catalog, aiConfig);
+      const { ready, unusable } = await readyCatalogForDraft();
+      if (id !== runId.current) return;
+      // 读不到列清单的表要点名丢掉：没有列清单，后端的列校验对那张表形同虚设，
+      // 留着只会让模型自由发挥、三轮修复全烧在"未声明列清单"上。
+      if (!ready.length) {
+        setError({
+          title: "列清单没读到，这一稿根本没发给模型",
+          detail: unusable.map((u) => `· ${u.conn}/${u.table}：${u.why}`).join("\n"),
+        });
+        msgApi.error("没有一张表能进目录，先补上连接或重选表");
+        return;
+      }
+      if (unusable.length) {
+        msgApi.warning(
+          `已丢掉进不了目录的 ${unusable.length} 张表：${unusable
+            .map((u) => `${u.table}（${u.why}）`)
+            .join("、")}`
+        );
+      }
+      const d = await aiReportDraft(question, ready, aiConfig);
       if (id !== runId.current) return;
       applyDraft(d);
       msgApi.success(
@@ -459,6 +521,29 @@ export function ReportWorkbench({
           optionFilterProp="label"
           maxTagCount="responsive"
         />
+        {/* 目录现状要说得出口：哪几张表真带着字段进了目录、哪几张没进去、为什么。
+            以前连接被删的表会被静默滤掉，用户看到"已生成"却不知道模型少看了两张表。 */}
+        {colBusy.length > 0 && (
+          <Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+            正在读取 {colBusy.length} 张表的列清单…
+          </Text>
+        )}
+        {catalog.map((t) => (
+          <Tooltip key={keyOf(t)} title={`${t.columns.join(", ")}\n方言：${t.database_type}`}>
+            <Tag color="blue" style={{ margin: "4px 4px 0 0" }}>
+              {t.connection_name}/{t.table} · {t.columns.length} 列
+            </Tag>
+          </Tooltip>
+        ))}
+        {unusable
+          .filter((u) => !colBusy.includes(u.key))
+          .map((u) => (
+            <Tooltip key={u.key} title={`${u.conn}：${u.why}`}>
+              <Tag color="red" style={{ margin: "4px 4px 0 0" }}>
+                {u.table} 进不了目录
+              </Tag>
+            </Tooltip>
+          ))}
         {configs.map((c) => {
           const st = connState[c.id];
           if (!st || st.loading) return null;

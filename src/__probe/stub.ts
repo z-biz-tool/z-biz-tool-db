@@ -80,10 +80,15 @@ function invoke(cmd: string, args: any): Promise<any> {
     }
     case "report_describe_columns": {
       const t = String(a.table || "");
-      if (window.__PROBE_ARG("descfail") === t) {
-        return fail(`读取列清单失败：注入（表 ${t}）`);
-      }
-      return Promise.resolve((fixture as any).columns[t] || []);
+      // ?colslow=600 让列清单慢到"起草时还没落地"，用来验前置闸真的在等
+      const slow = Number(window.__PROBE_ARG("colslow") || 0);
+      const body = () => {
+        if (window.__PROBE_ARG("descfail") === t) {
+          return fail(`读取列清单失败：注入（表 ${t}）`);
+        }
+        return Promise.resolve((fixture as any).columns[t] || []);
+      };
+      return slow > 0 ? new Promise((r) => setTimeout(() => r(body()), slow)) : body();
     }
     case "ai_sql_generate": {
       const catalog: any[] = a.catalog || [];
@@ -131,17 +136,36 @@ function invoke(cmd: string, args: any): Promise<any> {
       return Promise.resolve((fixture as any).render);
     case "report_view_validate":
       return Promise.resolve((fixture as any).validate);
-    case "ai_report_draft":
+    case "ai_report_draft": {
+      const cat: any[] = a.catalog || [];
+      const hole = cat.find((t) => !(t.columns || []).length);
+      // 镜像 normalize_sources + source_columns：目录项列清单为空时，缓存里
+      // 这张表就是零列，模型任何一次引用都过不了校验，三轮修光也没用。
+      // 少了这条，探针里前端塞 columns: [] 也会"起草成功"，是个假绿灯。
+      if (hole) {
+        return fail(
+          `重试 3 次后仍未通过本机校验：数据集 ds1：源 ${hole.table} 未声明列清单，也无法从 schema 缓存取到`
+        );
+      }
+      // DraftResult.datasets 是 DatasetSpec[]（sources/aggregates/joins…）。
+      // 这里曾误取 render.datasets —— 那是取数后的结果形状，没有 sources，
+      // 起草一成功就在草稿卡里 map 崩掉整棵树，"起草成功"这条腿其实从没跑通过。
+      const specs = (fixture as any).reports[0].datasets;
+      const view = (fixture as any).reports[0].view;
+      // 镜像 ai.rs 的 warning 规则：只提"没有组件在用的数据集"，
+      // 以前写死一句"跨 2 种方言"，把 users 丢掉之后它就不成立了。
+      const used = new Set((view.widgets || []).map((x: any) => x.dataset));
       return Promise.resolve({
-        datasets: (fixture as any).render.datasets,
-        // fixture 的 view 挂在报表条目上；这里曾误取 fixture.view（不存在），
-        // 会让起草链路拿到 undefined 而假通过
-        view: (fixture as any).reports[0].view,
-        steps: [],
-        columns: {},
-        warnings: [],
+        datasets: specs,
+        view,
+        steps: ["scan orders (shop)", "filter status = 'paid'", "group by city", "join users (crm)"],
+        columns: Object.fromEntries(specs.map((d: any) => [d.id, ["city", "gmv", "cnt"]])),
+        warnings: specs
+          .filter((d: any) => !used.has(d.id))
+          .map((d: any) => `数据集 ${d.id}（${d.name}）没有任何组件在用，执行时会白取一次数`),
         repairs: 0,
       });
+    }
     // ================== SQL 工作台（App）启动所需 ==================
     case "load_connections":
       return Promise.resolve((fixture as any).connections);

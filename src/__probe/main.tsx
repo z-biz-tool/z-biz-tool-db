@@ -4,12 +4,15 @@ import ReactDOM from "react-dom/client";
 import "./stub";
 import { CONTRACT } from "./stub";
 import ReportWorkbench from "../report/ReportWorkbench";
-import { installRoShim } from "./ro_shim";
+import { installDriver } from "./driver";
+import { installReaders, installRoShim } from "./ro_shim";
 import "../index.css";
 
 // 内嵌浏览器视口恒为 0x0，recharts 量不到盒子就不画柱；
 // 这里替一次 ResizeObserver 供给尺寸，只为验证组件本身正确。
 installRoShim(900, 320);
+installReaders();
+installDriver();
 
 (window as any).__CONTRACT = CONTRACT;
 
