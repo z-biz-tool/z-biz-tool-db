@@ -224,6 +224,13 @@ export interface SqlDraft {
   repairs: number;
 }
 
+/** 上一稿：追问（"再按月拆开"）时带回去，让模型在已有语句上改而不是从零重写。
+ *  question 是写这一稿时那句需求——模型得知道旧稿是为了什么写的。 */
+export interface PriorDraft {
+  question: string;
+  sql: string;
+}
+
 /** 报表簿条目：存的是 spec 而不是结果，落盘在后端 queries.rs */
 export interface SavedReport {
   id: string;

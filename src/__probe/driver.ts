@@ -67,6 +67,15 @@ export function installDriver() {
      *  列数为 0 就是 T-067 堵掉的那个洞；带类型的列数为 0 说明类型没送到模型眼前。 */
     catalogSent: (from: number) => sentOf("ai_report_draft", from),
     genCatalogSent: (from: number) => sentOf("ai_sql_generate", from),
+    /** 从某个下标起，每次生成有没有带上上一稿：'当时需求||旧语句'，没带是 'null'，
+     *  连键都没有则是 'undefined'（说明前端根本没往 wire 上放这个参数）。 */
+    genPriorSent: (from: number) =>
+      (w.__PROBE_CALLS as any[])
+        .slice(from)
+        .filter((c: any) => c.cmd === "ai_sql_generate")
+        .map((c: any) =>
+          c.args.prior == null ? String(c.args.prior) : `${c.args.prior.question}||${c.args.prior.sql}`
+        ),
     /** 从某个下标起，取数请求里各数据集源用到的连接 id（改绑是否真落到 IPC 上看这个） */
     connsSent: (cmd: string, from: number) =>
       (w.__PROBE_CALLS as any[])

@@ -9,7 +9,7 @@
 //   4. 校验失败把错误原文回喂，模型自己改，重试次数有上限
 // 写操作不在这里拦：归类成 warning 报给 UI，真正执行仍走 T-006/T-024 的审批门禁。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db::sql_classify;
 use crate::report::ai::{strip_fences, column_list, CatalogTable, Model, HttpModel, MAX_REPAIRS};
@@ -30,6 +30,14 @@ pub struct SqlDraft {
     pub warnings: Vec<String>,
     /// 模型被本机校验打回了几次
     pub repairs: u8,
+}
+
+/// 上一稿：让"再按月份聚合一下""把金额换成含税的"这种追问能在已有语句上改，
+/// 而不是每次从零重写。带着当时那句需求，模型才知道旧稿是为了什么写的。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PriorDraft {
+    pub question: String,
+    pub sql: String,
 }
 
 /// 目录里出现过的表名（含 schema 限定的写法），以及每张表的列清单
@@ -188,8 +196,15 @@ fn is_word(t: &Tok, kw: &str) -> bool {
 
 // ==================== 提示词 ====================
 
-/// 生成给模型的完整提示词。feedback 是上一稿被本机校验拒绝的原因。
-pub fn prompt(question: &str, catalog: &[CatalogTable], dialect: &str, feedback: Option<&str>) -> String {
+/// 生成给模型的完整提示词。prior 是上一稿（追问式改稿时才带），
+/// feedback 是上一稿被本机校验拒绝的原因。
+pub fn prompt(
+    question: &str,
+    catalog: &[CatalogTable],
+    dialect: &str,
+    prior: Option<&PriorDraft>,
+    feedback: Option<&str>,
+) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "你是数据库工程师。用 {} 方言写一条 SQL，只回 SQL 本身，不要解释、不要 markdown 围栏。\n\n\
@@ -218,6 +233,15 @@ pub fn prompt(question: &str, catalog: &[CatalogTable], dialect: &str, feedback:
     );
     s.push_str("\n需求：");
     s.push_str(question.trim());
+    if let Some(p) = prior {
+        s.push_str(&format!(
+            "\n\n上一稿是这么写的（当时需求：{}）：\n{}\n\
+             请在它基础上按新需求改：新需求没提到的部分保持原样，只回改好的完整 SQL，\n\
+             不要回 diff、不要只回改动的那几行。\n",
+            p.question.trim(),
+            p.sql.trim()
+        ));
+    }
     if let Some(fb) = feedback {
         s.push_str("\n\n上一稿没有通过本机校验，原因：\n");
         s.push_str(fb.trim());
@@ -642,16 +666,20 @@ fn dialect_of(catalog: &[CatalogTable]) -> String {
     }
 }
 
-/// 生成：问一次 → 本机校验 → 不通过就把错误原文回喂，最多 repairs 次
+/// 生成：问一次 → 本机校验 → 不通过就把错误原文回喂，最多 repairs 次。
+/// prior 是上一稿，追问式改稿时带上；改出来的稿子照样过本机校验。
 pub async fn generate(
     model: &dyn Model,
     question: &str,
     catalog: &[CatalogTable],
     repairs: u8,
+    prior: Option<&PriorDraft>,
 ) -> Result<SqlDraft, String> {
     if question.trim().is_empty() {
         return Err("先描述你想查什么".into());
     }
+    // 空白的上一稿只会往提示词里塞噪音，当作没带
+    let prior = prior.filter(|p| !p.sql.trim().is_empty());
     if catalog.is_empty() {
         return Err("先选至少一张表，模型没有列清单就只能编字段".into());
     }
@@ -671,7 +699,7 @@ pub async fn generate(
     let mut last = String::new();
     for round in 0..=rounds {
         let raw = model
-            .complete(prompt(question, kept, &dialect, feedback.as_deref()))
+            .complete(prompt(question, kept, &dialect, prior, feedback.as_deref()))
             .await?;
         let sql = match extract_sql(&raw) {
             Ok(s) => s,
@@ -716,9 +744,17 @@ pub async fn ai_sql_generate(
     catalog: Vec<CatalogTable>,
     config: AIConfig,
     max_repairs: Option<u8>,
+    prior: Option<PriorDraft>,
 ) -> Result<SqlDraft, String> {
     let model = HttpModel::new(config)?;
-    generate(&model, &question, &catalog, max_repairs.unwrap_or(2)).await
+    generate(
+        &model,
+        &question,
+        &catalog,
+        max_repairs.unwrap_or(2),
+        prior.as_ref(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -799,7 +835,7 @@ mod tests {
 
     #[test]
     fn prompt_feeds_dialect_and_the_real_column_lists() {
-        let p = prompt("各城市成交额", &catalog(), "mysql", None);
+        let p = prompt("各城市成交额", &catalog(), "mysql", None, None);
         assert!(p.contains("mysql 方言"), "{p}");
         assert!(
             p.contains("orders(id, city, amount, status, created_at)"),
@@ -807,12 +843,30 @@ mod tests {
         );
         assert!(!p.contains("上一稿"), "{p}");
 
-        let with_fb = prompt("各城市成交额", &catalog(), "mysql", Some("表 invoicez 不在本次目录里"));
+        let with_fb = prompt("各城市成交额", &catalog(), "mysql", None, Some("表 invoicez 不在本次目录里"));
         assert!(with_fb.contains("上一稿没有通过本机校验"), "{with_fb}");
         assert!(with_fb.contains("invoicez"), "{with_fb}");
 
-        let no_cols = prompt("随便", &[cat_table("crm", "postgresql", "", "customers", &[])], "postgresql", None);
+        let no_cols = prompt("随便", &[cat_table("crm", "postgresql", "", "customers", &[])], "postgresql", None, None);
         assert!(no_cols.contains("customers（本机没读到列清单）"), "{no_cols}");    }
+
+    /// 追问式改稿：上一稿和它当时的需求都要送进提示词，否则模型只能从零重写
+    #[test]
+    fn prompt_shows_the_prior_draft_and_its_question() {
+        let prior = PriorDraft {
+            question: "各城市成交额".into(),
+            sql: "SELECT city, SUM(amount) AS total FROM orders GROUP BY city".into(),
+        };
+        let p = prompt("再按月拆开", &catalog(), "mysql", Some(&prior), None);
+        assert!(p.contains("上一稿是这么写的"), "{p}");
+        // 这两串只可能来自 prior：新需求里没有，目录里也没有
+        assert!(p.contains("当时需求：各城市成交额"), "{p}");
+        assert!(p.contains("SUM(amount) AS total"), "{p}");
+        assert!(p.contains("请在它基础上"), "{p}");
+        assert!(p.contains("需求：再按月拆开"), "{p}");
+        // 改稿不能把"只回完整 SQL"这条弄丢，否则模型会回 diff
+        assert!(p.contains("不要回 diff"), "{p}");
+    }
 
     /// 目录带类型时提示词要写成 `amount decimal(12,2)`，但列校验的口径不变：
     /// 类型是给模型少犯错的，不是给校验用的（校验只认 columns 里的名字）。
@@ -825,7 +879,7 @@ mod tests {
             "orders",
             &["id int(11)", "amount decimal(12,2)", "status varchar(20)"],
         )];
-        let p = prompt("按金额汇总", &c, "mysql", None);
+        let p = prompt("按金额汇总", &c, "mysql", None, None);
         assert!(p.contains("orders(id int(11), amount decimal(12,2), status varchar(20))"), "{p}");
         assert!(p.contains("列名 类型"), "{p}");
         let out = check_sql(
@@ -1047,7 +1101,7 @@ mod tests {
             "SELECT city, total FROM invoicez".into(),
             "```sql\nSELECT city, SUM(amount) AS total FROM orders GROUP BY city;\n```".into(),
         ]);
-        let out = generate(&model, "各城市成交额", &catalog(), 3).await.unwrap();
+        let out = generate(&model, "各城市成交额", &catalog(), 3, None).await.unwrap();
         assert_eq!(out.repairs, 1);
         assert_eq!(out.sql, "SELECT city, SUM(amount) AS total FROM orders GROUP BY city");
         assert_eq!(out.dialect, "mysql");
@@ -1061,7 +1115,7 @@ mod tests {
     #[tokio::test]
     async fn generate_gives_up_after_the_last_round_and_says_why() {
         let model = scripted(vec!["SELECT * FROM ghost_a".into(), "SELECT * FROM ghost_b".into()]);
-        let e = generate(&model, "随便查查", &catalog(), 1).await.unwrap_err();
+        let e = generate(&model, "随便查查", &catalog(), 1, None).await.unwrap_err();
         assert!(e.contains("重试 2 次"), "{e}");
         assert!(e.contains("ghost_b"), "{e}");
         assert_eq!(model.prompts.lock().unwrap().len(), 2);
@@ -1074,7 +1128,7 @@ mod tests {
             big.push(cat_table("shop", "mysql", "", &format!("t{i}"), &["id"]));
         }
         let model = scripted(vec!["SELECT id FROM t24".into()]);
-        let out = generate(&model, "查 t24", &big, 2).await.unwrap();
+        let out = generate(&model, "查 t24", &big, 2, None).await.unwrap();
         assert_eq!(out.sql, "SELECT id FROM t24");
         assert!(
             out.warnings.iter().any(|w| w.contains("只带了前 20 张")),
@@ -1089,8 +1143,8 @@ mod tests {
     #[tokio::test]
     async fn generate_refuses_before_bothering_the_model() {
         let model = scripted(vec![]);
-        assert!(generate(&model, "  ", &catalog(), 1).await.is_err());
-        assert!(generate(&model, "查订单", &[], 1).await.is_err());
+        assert!(generate(&model, "  ", &catalog(), 1, None).await.is_err());
+        assert!(generate(&model, "查订单", &[], 1, None).await.is_err());
         assert!(model.prompts.lock().unwrap().is_empty());
     }
 
@@ -1102,7 +1156,78 @@ mod tests {
                 Box::pin(async { Err("AI 服务请求失败: 连接超时".into()) })
             }
         }
-        let e = generate(&Down, "查订单", &catalog(), 3).await.unwrap_err();
+        let e = generate(&Down, "查订单", &catalog(), 3, None).await.unwrap_err();
         assert_eq!(e, "AI 服务请求失败: 连接超时");
+    }
+
+    fn prior_draft(question: &str, sql: &str) -> PriorDraft {
+        PriorDraft { question: question.into(), sql: sql.into() }
+    }
+
+    /// 空白的上一稿（用户新开会话、或上一轮什么都没写）不该往提示词里塞噪音
+    #[tokio::test]
+    async fn generate_ignores_a_blank_prior_draft() {
+        let model = scripted(vec!["SELECT id FROM orders".into()]);
+        let out = generate(
+            &model,
+            "查订单",
+            &catalog(),
+            1,
+            Some(&prior_draft("上次的需求串", "   \n  ")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.sql, "SELECT id FROM orders");
+        let ps = model.prompts.lock().unwrap();
+        assert_eq!(ps.len(), 1);
+        assert!(!ps[0].contains("上一稿是这么写的"), "{}", ps[0]);
+        assert!(!ps[0].contains("上次的需求串"), "{}", ps[0]);
+    }
+
+    /// 改稿回路：重试轮次也不能把上一稿弄丢，否则第二轮模型是在凭空重写
+    #[tokio::test]
+    async fn generate_keeps_the_prior_in_every_round() {
+        let model = scripted(vec![
+            "SELECT city, total FROM invoicez".into(),
+            "SELECT city, SUM(amount) AS total FROM orders GROUP BY city".into(),
+        ]);
+        let p = prior_draft("各城市成交额", "SELECT id, city FROM orders WHERE status = 'paid'");
+        let out = generate(&model, "再按月拆开", &catalog(), 3, Some(&p)).await.unwrap();
+        assert_eq!(out.repairs, 1);
+        assert_eq!(out.sql, "SELECT city, SUM(amount) AS total FROM orders GROUP BY city");
+        let ps = model.prompts.lock().unwrap();
+        assert_eq!(ps.len(), 2);
+        for round in ps.iter() {
+            assert!(round.contains("SELECT id, city FROM orders WHERE status = 'paid'"), "{round}");
+            assert!(round.contains("再按月拆开"), "{round}");
+        }
+        // 改稿提示和校验拒因同时在场，模型才知道既要在旧稿上改、又要修哪个错
+        assert!(ps[1].contains("上一稿没有通过本机校验"), "{}", ps[1]);
+        assert!(ps[1].contains("invoicez"), "{}", ps[1]);
+    }
+
+    /// 上一稿是从编辑器/历史里带过来的，里面的列可能是编的：
+    /// 模型照抄也不能放行，改出来的稿子过的还是同一套本机校验。
+    #[tokio::test]
+    async fn generate_still_rejects_a_hallucinated_column_from_the_prior() {
+        let bad = "SELECT o.city, o.net_amount FROM orders o";
+        let model = scripted(vec![bad.into(), bad.into()]);
+        let p = prior_draft("各城市成交额", bad);
+        let e = generate(&model, "把金额换成税前的", &catalog(), 1, Some(&p))
+            .await
+            .unwrap_err();
+        assert!(e.contains("重试 2 次"), "{e}");
+        assert!(e.contains("orders.net_amount"), "{e}");
+        assert_eq!(model.prompts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prior_deserializes_from_the_frontend_shape() {
+        // 前端传 {question, sql}；少一个字段的半截对象不能解成"sql 为空"混过去
+        let p: PriorDraft =
+            serde_json::from_str(r#"{"question":"按月份","sql":"SELECT 1"}"#).unwrap();
+        assert_eq!(p.question, "按月份");
+        assert_eq!(p.sql, "SELECT 1");
+        assert!(serde_json::from_str::<PriorDraft>(r#"{"question":"按月份"}"#).is_err());
     }
 }

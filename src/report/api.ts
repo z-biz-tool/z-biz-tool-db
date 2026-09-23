@@ -11,6 +11,7 @@ import type {
   DatasetPayload,
   DatasetSpec,
   DraftResult,
+  PriorDraft,
   SavedReport,
   SqlDraft,
   SqlPreview,
@@ -55,14 +56,17 @@ export const aiReportDraft = (
 ): Promise<DraftResult> =>
   invoke<DraftResult>("ai_report_draft", { question, catalog, config, maxRepairs });
 
-/** 自然语言 → 一条 SQL。表与列由本机目录限定，编出来的字段会被后端打回 */
+/** 自然语言 → 一条 SQL。表与列由本机目录限定，编出来的字段会被后端打回。
+ *  prior 是上一稿：追问式改稿时带上，后端会在提示词里请模型在旧稿上改，
+ *  改出来的稿子过的还是同一套本机校验（旧稿里的编造字段照样会被拦下）。 */
 export const aiSqlGenerate = (
   question: string,
   catalog: CatalogTable[],
   config: AIConfig,
-  maxRepairs?: number
+  maxRepairs?: number,
+  prior?: PriorDraft | null
 ): Promise<SqlDraft> =>
-  invoke<SqlDraft>("ai_sql_generate", { question, catalog, config, maxRepairs });
+  invoke<SqlDraft>("ai_sql_generate", { question, catalog, config, maxRepairs, prior: prior ?? null });
 
 export const reportDatasetValidate = (
   spec: DatasetSpec,

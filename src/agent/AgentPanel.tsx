@@ -48,9 +48,11 @@ export interface AgentPanelProps {
   hint?: string;
   /** 生成出的 SQL 落到哪里。不给就不显示「填进编辑器」 */
   onUseSql?: (sql: string) => void;
+  /** 清空对话时的额外收尾：会话都没了，宿主据以改稿的"上一稿"也该作废 */
+  onClear?: () => void;
 }
 
-export function AgentPanel({ hint, onUseSql }: AgentPanelProps) {
+export function AgentPanel({ hint, onUseSql, onClear }: AgentPanelProps) {
   const [input, setInput] = useState('');
   const [intent, setIntent] = useState<AgentIntent>('query');
   const { messages, busy, ask, clear } = useAgentStore();
@@ -90,7 +92,14 @@ export function AgentPanel({ hint, onUseSql }: AgentPanelProps) {
       styles={{ body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } }}
       extra={
         messages.length > 0 ? (
-          <Button size="small" type="text" onClick={clear}>
+          <Button
+            size="small"
+            type="text"
+            onClick={() => {
+              clear();
+              onClear?.();
+            }}
+          >
             清空对话
           </Button>
         ) : null

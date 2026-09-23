@@ -602,6 +602,31 @@ function App() {
     [tables]
   );
 
+  // 多轮改稿：追问（"再按月拆开""把金额换成税前的"）得把上一稿带回去，
+  // 否则模型每轮都在从零重写，用户只能自己动手改。上一稿只在同一份表目录下可复用——
+  // 换了连接或换了表，旧稿引用的字段可能根本不在本次目录里，带着只会误导。
+  const aiPriorRef = useRef<{ key: string; question: string; sql: string } | null>(null);
+  const catalogKey = (catalog: CatalogTable[]) =>
+    catalog.map((t) => `${t.connection_id}/${t.schema}/${t.table}`).sort().join(",");
+
+  const generateSql = async (question: string, catalog: CatalogTable[]) => {
+    const key = catalogKey(catalog);
+    const last = aiPriorRef.current;
+    // 同一句需求再点一次生成 = 重来一次，不该把上一稿喂回去让它"改"自己
+    const prior = last && last.key === key && last.question !== question
+      ? { question: last.question, sql: last.sql }
+      : null;
+    const draft = await aiSqlGenerate(question, catalog, aiConfigForReport, undefined, prior);
+    // 只成功之后才把这一稿记成新的上一稿：这一轮失败时，旧稿仍是可用的底稿
+    aiPriorRef.current = { key, question, sql: draft.sql };
+    return {
+      draft,
+      builtOn: prior ? prior.question : null,
+      // 上一稿还在、却因为范围变了没被用上，得说清楚不是"接着改"
+      droppedPrior: !!last && !prior && last.key !== key,
+    };
+  };
+
   // AI 生成 SQL：自然语言 → 一条过了本机校验的 SQL（后端只看得见我们给的表与列）
   const handleAiGenerateSql = async () => {
     const question = aiNaturalLanguage.trim();
@@ -638,13 +663,22 @@ function App() {
         return;
       }
       if (failed.length) msgApi.warning(`这些表读不到列清单，本次没带上：${failed.join("；")}`);
-      const draft = await aiSqlGenerate(question, catalog, aiConfigForReport);
+      const { draft, builtOn, droppedPrior } = await generateSql(question, catalog);
       setAiDraft(draft);
       setSqlCode(draft.sql);
       msgApi.success(
-        draft.repairs > 0
-          ? `已生成，本机校验打回 ${draft.repairs} 次后通过`
-          : "已生成并通过本机校验"
+        [
+          builtOn
+            ? `在上一稿（${builtOn}）基础上改`
+            : droppedPrior
+              ? "本次表目录和上一稿不同，这一稿是从零写的"
+              : "",
+          draft.repairs > 0
+            ? `已生成，本机校验打回 ${draft.repairs} 次后通过`
+            : "已生成并通过本机校验",
+        ]
+          .filter(Boolean)
+          .join("；")
       );
     } catch (e: any) {
       // 后端把本机校验的拒因原样带回来，别只留一句"失败"
@@ -793,13 +827,18 @@ function App() {
           error: `这一稿根本没发给模型：列清单一张都没读到\n${failed.join("\n")}`,
         };
       }
-      const draft = await aiSqlGenerate(text, catalog, aiConfigForReport);
+      const { draft, builtOn, droppedPrior } = await generateSql(text, catalog);
       const lines = [
+        builtOn
+          ? `在上一稿（当时需求：${builtOn}）基础上改，没从零重写。`
+          : droppedPrior
+            ? "本次表目录和上一稿不同，这一稿是从零写的。"
+            : "",
         `只用 ${catalog.length} 张表的真实字段生成，引用了 ${
           draft.tables.join("、") || "（没引用目录里的表）"
         }，方言 ${draft.dialect}。`,
         draft.repairs > 0 ? `本机校验打回 ${draft.repairs} 次后才通过。` : "一次就过了本机校验。",
-      ];
+      ].filter(Boolean);
       if (failed.length) lines.push(`读不到列清单、这次没带上：${failed.join("；")}`);
       if (draft.warnings.length) lines.push(`提示：${draft.warnings.join("；")}`);
       // 不直接盖编辑器：面板留了「填进编辑器」，什么时候落由用户定
@@ -2043,6 +2082,10 @@ function App() {
                 <div style={{ height: 480 }}>
                   <AgentPanel
                     hint={agentHint}
+                    onClear={() => {
+                      // 会话清空了还拿上一轮那稿去"改"，用户看不出串台，只会觉得模型在装
+                      aiPriorRef.current = null;
+                    }}
                     onUseSql={(sql) => {
                       setSqlCode(sql);
                       msgApi.success("已填进编辑器，运行前自己过一眼");
