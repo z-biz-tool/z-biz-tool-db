@@ -81,6 +81,81 @@ function described(table: string): { name: string; data_type: string }[] {
   return names.map((name) => ({ name, data_type: types[name] || "" }));
 }
 
+// 与 Rust ai.rs family_of 同口径：只看类型名开头的那个词，认不出的保持沉默。
+// fixture 里 orders.user_id 是 int、users.id 是 varchar(64)——就是跨库最常见的
+// 那一对"值相同、桶不同"的连接键，探针要能在浏览器里看见它被拦下来。
+const NUM_TY = [
+  "int", "integer", "tinyint", "smallint", "mediumint", "bigint", "int2", "int4", "int8",
+  "serial", "bigserial", "smallserial", "float", "double", "real", "decimal", "dec",
+  "numeric", "fixed", "money", "smallmoney", "bool", "boolean",
+];
+const TXT_TY = [
+  "char", "varchar", "nchar", "nvarchar", "text", "tinytext", "mediumtext", "longtext",
+  "character", "citext", "string", "name", "clob", "uuid", "json", "jsonb", "enum", "set",
+  "date", "datetime", "smalldatetime", "time", "timestamp", "timestamptz", "year",
+];
+const BIN_TY = [
+  "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bytea", "geometry",
+  "geography", "image", "vector",
+];
+function familyOf(ty: string): string {
+  const head = (String(ty || "").trim().toLowerCase().match(/^[a-z]+/) || [])[0] || "";
+  if (NUM_TY.includes(head)) return "num";
+  if (TXT_TY.includes(head)) return "text";
+  if (BIN_TY.includes(head)) return "bin";
+  return "?";
+}
+
+/** 镜像 ai.rs join_key_warnings：连接键跨族 ⇒ 内存 join 必然空表。
+ *  左侧累计列的命名规则与执行期 plan_join_columns 一致（重名依次加 _2/_3）。 */
+function joinKeyWarnings(specs: any[], catalog: any[]): string[] {
+  const out: string[] = [];
+  for (const ds of specs) {
+    const byAlias: Record<string, { cols: string[]; ty: (c: string) => string }> = {};
+    for (const s of ds.sources || []) {
+      const hit = catalog.find(
+        (t: any) => t.connection_id === s.connection_id && t.table === s.table
+      );
+      byAlias[s.alias] = {
+        cols: (hit && hit.columns) || [],
+        ty: (c: string) => String((hit && hit.column_types && hit.column_types[c]) || ""),
+      };
+    }
+    const base = byAlias[ds.base];
+    if (!base) continue;
+    let acc = base.cols.map((c) => ({ name: c, label: `${ds.base}.${c}`, ty: base.ty(c) }));
+    for (const j of ds.joins || []) {
+      const right = byAlias[j.source];
+      for (const p of j.on || []) {
+        const l = acc.find((a) => a.name.toLowerCase() === String(p.left).toLowerCase());
+        const rty = right ? right.ty(p.right) : "";
+        const lf = familyOf(l ? l.ty : "");
+        const rf = familyOf(rty);
+        const binary = lf === "bin" || rf === "bin";
+        const cross =
+          (lf === "num" && rf === "text") || (lf === "text" && rf === "num") || binary;
+        if (!l || !cross) continue;
+        const why = binary
+          ? "有一边是二进制/大字段，取数时会被置成 NULL，而 NULL 连接键不可能匹配"
+          : "一边数值一边文本，内存 join 按值分桶比较（数值 #… / 文本 S…），相同的值也对不上";
+        out.push(
+          `数据集 ${ds.id}（${ds.name}）：${l.label}（${l.ty || "类型未知"}）与 ${p.right}（${rty || "类型未知"}）做连接键，${why}——这一轮 join 一行都配不上，做出来的表会是空表；换一对两边同族的列`
+        );
+      }
+      if (!right) continue;
+      const taken = acc.map((a) => a.name);
+      for (const c of right.cols) {
+        let n = c;
+        let i = 2;
+        while (taken.some((x) => x.toLowerCase() === n.toLowerCase())) n = `${c}_${i++}`;
+        taken.push(n);
+        acc.push({ name: n, label: `${j.source}.${c}`, ty: right.ty(c) });
+      }
+    }
+  }
+  return out;
+}
+
 function invoke(cmd: string, args: any): Promise<any> {
   push(cmd, args);
   const a = args || {};
@@ -184,7 +259,7 @@ function invoke(cmd: string, args: any): Promise<any> {
       // 起草一成功就在草稿卡里 map 崩掉整棵树，"起草成功"这条腿其实从没跑通过。
       const specs = (fixture as any).reports[0].datasets;
       const view = (fixture as any).reports[0].view;
-      // 镜像 ai.rs 的 warning 规则：只提"没有组件在用的数据集"，
+      // 镜像 ai.rs 的两条 warning 规则：连接键跨族 + 没有组件在用的数据集。
       // 以前写死一句"跨 2 种方言"，把 users 丢掉之后它就不成立了。
       const used = new Set((view.widgets || []).map((x: any) => x.dataset));
       return Promise.resolve({
@@ -192,9 +267,12 @@ function invoke(cmd: string, args: any): Promise<any> {
         view,
         steps: ["scan orders (shop)", "filter status = 'paid'", "group by city", "join users (crm)"],
         columns: Object.fromEntries(specs.map((d: any) => [d.id, ["city", "gmv", "cnt"]])),
-        warnings: specs
-          .filter((d: any) => !used.has(d.id))
-          .map((d: any) => `数据集 ${d.id}（${d.name}）没有任何组件在用，执行时会白取一次数`),
+        warnings: [
+          ...joinKeyWarnings(specs, cat),
+          ...specs
+            .filter((d: any) => !used.has(d.id))
+            .map((d: any) => `数据集 ${d.id}（${d.name}）没有任何组件在用，执行时会白取一次数`),
+        ],
         repairs: 0,
       });
     }

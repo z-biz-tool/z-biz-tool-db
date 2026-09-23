@@ -1156,6 +1156,97 @@ mod tests {
         assert_eq!(payload.generated_sql.len(), 2);
     }
 
+    /// 连接键类型族告警不是玄学：同一份草稿只换连接键，
+    /// 空表就正按告警说的那样发生；换回同族则三行照出。
+    #[tokio::test]
+    async fn warning_predicts_the_silently_empty_cross_db_join() {
+        use crate::report::ai::{self, CatalogTable};
+        let db = temp_db();
+        let (shop, crm) = seed_shop_crm(&db).await;
+        // 网页端的 uid 是文本：值一模一样，桶不一样（'1' → S1，1 → #1.0）
+        run_dispatch(&crm, "CREATE TABLE web_users (uid TEXT, city TEXT)")
+            .await
+            .unwrap();
+        for (uid, city) in [("1", "SH"), ("2", "BJ"), ("3", "SZ")] {
+            run_dispatch(
+                &crm,
+                &format!("INSERT INTO web_users VALUES ('{}', '{}')", uid, city),
+            )
+            .await
+            .unwrap();
+        }
+        let orders = CatalogTable {
+            connection_id: "shop".into(),
+            connection_name: "商城库".into(),
+            database_type: "sqlite".into(),
+            schema: String::new(),
+            table: "orders".into(),
+            columns: vec!["id".into(), "user_id".into(), "amount".into(), "status".into()],
+            column_types: col_types(&[
+                ("id", "INTEGER"),
+                ("user_id", "INTEGER"),
+                ("amount", "REAL"),
+                ("status", "TEXT"),
+            ]),
+        };
+        let right = |table: &str, cols: &[(&str, &str)]| CatalogTable {
+            connection_id: "crm".into(),
+            connection_name: "客户库".into(),
+            database_type: "sqlite".into(),
+            schema: String::new(),
+            table: table.into(),
+            columns: cols.iter().map(|(n, _)| n.to_string()).collect(),
+            column_types: col_types(cols),
+        };
+        let raw = |table: &str, key: &str| {
+            format!(
+                r#"{{"datasets":[{{"id":"city-gmv","name":"城市成交额","base":"o",
+                  "sources":[{{"alias":"o","connection_id":"shop","table":"orders"}},
+                              {{"alias":"u","connection_id":"crm","table":"{}"}}],
+                  "joins":[{{"source":"u","on":[{{"left":"user_id","right":"{}"}}]}}],
+                  "filters":["status = 'paid'"],"group_by":["city"],
+                  "aggregates":[{{"output":"gmv","func":"SUM","column":"amount"}}]}}],
+                 "view":{{"id":"board","name":"成交看板","widgets":[
+                   {{"id":"bar","type":"BAR","title":"分城市","dataset":"city-gmv",
+                     "encode":{{"x":"city","y":"gmv"}}}}
+                 ]}}}}"#,
+                table, key
+            )
+        };
+
+        let bad = ai::check_draft(
+            ai::parse_draft(&raw("web_users", "uid")).unwrap(),
+            &[orders.clone(), right("web_users", &[("uid", "TEXT"), ("city", "TEXT")])],
+        )
+        .unwrap();
+        assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
+        assert!(bad.warnings[0].contains("INTEGER"), "{}", bad.warnings[0]);
+        assert!(bad.warnings[0].contains("TEXT"), "{}", bad.warnings[0]);
+        let bad_payload = report_view_render(bad.view, bad.datasets, vec![shop.clone(), crm.clone()], None)
+            .await
+            .unwrap();
+        assert!(
+            bad_payload.charts[0].categories.is_empty(),
+            "告警说这一轮 join 配不上，结果它画出了图——告警在瞎报"
+        );
+
+        // 同族连接键：既不告警，也必须真的出三行，否则上面的"空"不作数
+        let good = ai::check_draft(
+            ai::parse_draft(&raw("users", "id")).unwrap(),
+            &[orders, right("users", &[("id", "INTEGER"), ("city", "TEXT")])],
+        )
+        .unwrap();
+        assert!(good.warnings.is_empty(), "{:?}", good.warnings);
+        let good_payload = report_view_render(good.view, good.datasets, vec![shop, crm], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            good_payload.charts[0].categories.len(),
+            3,
+            "种子数据没生效的话，上面那条「空表」就不能算被证明"
+        );
+    }
+
     #[tokio::test]
     async fn report_view_names_the_hallucinated_field() {
         let db = temp_db();

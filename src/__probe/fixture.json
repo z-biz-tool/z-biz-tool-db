@@ -181,12 +181,12 @@
     ]
   },
   "columns": {
-    "orders": ["id", "amount", "city", "status"],
+    "orders": ["id", "user_id", "amount", "city", "status"],
     "users": ["id", "name", "channel"]
   },
   "column_types": {
-    "orders": { "id": "int", "amount": "decimal(12,2)", "city": "varchar(64)", "status": "varchar(16)" },
-    "users": { "id": "INTEGER" }
+    "orders": { "id": "int", "user_id": "int", "amount": "decimal(12,2)", "city": "varchar(64)", "status": "varchar(16)" },
+    "users": { "id": "varchar(64)" }
   },
   "reports": [
     {

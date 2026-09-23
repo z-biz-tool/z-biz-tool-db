@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::dataset::{DatasetSpec, SchemaCache, SourceRef};
 use super::expr::ALLOWED_FUNCTIONS;
+use super::table::plan_join_columns;
 use super::view::ViewSpec;
 use crate::AIConfig;
 
@@ -225,8 +226,9 @@ pub fn prompt(question: &str, catalog: &[CatalogTable], feedback: Option<&str>) 
          1. sources 只需 alias / connection_id / table；方言和列清单由本机目录填充，写了也会被覆盖。\n\
          2. 跨库：把不同 connection_id 的表放进同一个数据集，join 在本机内存里做，不要写 SQL。\n\
          3. 引用列：本表列直接写名字，需要消歧时写 别名.列名（如 u.city）。\n\
-         \x20  列名后面那个词是数据库真实类型：文本列别拿去 SUM；join 两边类型不一致时，\n\
-         \x20  用 CAST / toString 之类的函数把其中一边对齐，别假设它们天然能比。\n\
+         \x20  列名后面那个词是数据库真实类型：文本列别拿去 SUM。\n\
+         \x20  joins[].on 只能写列名，不接受表达式或 CAST，而内存 join 按值分桶比较：\n\
+         \x20  一边 bigint 一边 varchar 会一行都配不上，两边连接键必须同族（都数值或都文本）。\n\
          4. 表达式支持 + - * /、比较、AND/OR/NOT、IS NULL、IN，以及函数 \
          ",
     );
@@ -309,17 +311,19 @@ fn lookup<'a>(
     }
 }
 
-/// 用目录覆盖模型声明的方言与列清单，并产出校验用的 SchemaCache。
+/// 用目录覆盖模型声明的方言与列清单，并产出校验用的 SchemaCache + 列类型索引。
 /// 这一步之后，模型写下的任何标识符都不再影响能连哪个库、能读哪些列。
 fn normalize_sources(
     ds: &DatasetSpec,
     catalog: &[CatalogTable],
-) -> Result<(Vec<SourceRef>, SchemaCache), String> {
+) -> Result<(Vec<SourceRef>, SchemaCache, TypeIndex), String> {
     let mut cache: SchemaCache = HashMap::new();
+    let mut types: TypeIndex = HashMap::new();
     let mut sources: Vec<SourceRef> = Vec::with_capacity(ds.sources.len());
     for src in &ds.sources {
         let hit = lookup(catalog, src).map_err(|e| format!("数据集 {}：{}", label_of(ds), e))?;
         cache.insert(src.alias.clone(), hit.columns.clone());
+        types.insert(src.alias.clone(), lower_types(hit));
         sources.push(SourceRef {
             alias: src.alias.clone(),
             connection_id: hit.connection_id.clone(),
@@ -330,7 +334,152 @@ fn normalize_sources(
             columns: hit.columns.clone(),
         });
     }
-    Ok((sources, cache))
+    Ok((sources, cache, types))
+}
+
+// ==================== 连接键的类型族 ====================
+
+/// 列名（小写）→ 数据库类型。模型写的列名大小写不一定和目录一致，
+/// 校验那边是忽略大小写比对的，这里同口径。
+type TypeIndex = HashMap<String, HashMap<String, String>>;
+
+fn lower_types(t: &CatalogTable) -> HashMap<String, String> {
+    t.column_types
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
+        .collect()
+}
+
+/// 连接键在内存 join 里会落进哪个值桶。bucket_of 给文本打 `S`、给数值打 `#`，
+/// 二进制和无法解码的单元格在取数阶段就被置成 NULL，而 NULL 键永不匹配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Numeric,
+    Text,
+    Binary,
+    /// 目录没给类型，或类型名认不出：沉默，不猜
+    Unknown,
+}
+
+/// 数据库自报类型 → 值桶。只看开头的词，所以 `decimal(12,2)`、`int(11)`、
+/// `double precision`、`character varying(64)`、`timestamp without time zone` 都能落对。
+fn family_of(ty: &str) -> Family {
+    let head: String = ty
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    match head.as_str() {
+        "int" | "integer" | "tinyint" | "smallint" | "mediumint" | "bigint" | "int2"
+        | "int4" | "int8" | "serial" | "bigserial" | "smallserial" | "float" | "double"
+        | "real" | "decimal" | "dec" | "numeric" | "fixed" | "money" | "smallmoney"
+        | "bool" | "boolean" => Family::Numeric,
+        "char" | "varchar" | "nchar" | "nvarchar" | "text" | "tinytext" | "mediumtext"
+        | "longtext" | "character" | "citext" | "string" | "name" | "clob" | "uuid"
+        | "json" | "jsonb" | "enum" | "set" | "date" | "datetime" | "smalldatetime"
+        | "time" | "timestamp" | "timestamptz" | "year" => Family::Text,
+        "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob"
+        | "bytea" | "geometry" | "geography" | "image" | "vector" => Family::Binary,
+        _ => Family::Unknown,
+    }
+}
+
+/// 一列的类型与值桶。目录里没有这一列（或类型为空白）时返回 Unknown，
+/// 让沉默成为默认——宁可漏报，也不能把本来能跑的草稿说成坏的。
+fn column_family(types: &TypeIndex, alias: &str, col: &str) -> (String, Family) {
+    let ty = types
+        .get(alias)
+        .and_then(|m| m.get(&col.to_ascii_lowercase()))
+        .cloned()
+        .unwrap_or_default();
+    let f = if ty.is_empty() {
+        Family::Unknown
+    } else {
+        family_of(&ty)
+    };
+    (ty, f)
+}
+
+fn show_ty(ty: &str) -> String {
+    if ty.is_empty() {
+        "类型未知".to_string()
+    } else {
+        ty.to_string()
+    }
+}
+
+/// 两侧连接键是否注定配不上。返回原因文本（拼到告警里）。
+fn key_conflict(
+    lf: Family,
+    rf: Family,
+    lcol: &str,
+    lty: &str,
+    rcol: &str,
+    rty: &str,
+) -> Option<String> {
+    let why = match (lf, rf) {
+        (Family::Binary, _) | (_, Family::Binary) => {
+            "有一边是二进制/大字段，取数时会被置成 NULL，而 NULL 连接键不可能匹配"
+        }
+        (Family::Numeric, Family::Text) | (Family::Text, Family::Numeric) => {
+            "一边数值一边文本，内存 join 按值分桶比较（数值 #… / 文本 S…），相同的值也对不上"
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "{}（{}）与 {}（{}）做连接键，{}——这一轮 join 一行都配不上，做出来的表会是空表；换一对两边同族的列",
+        lcol,
+        show_ty(lty),
+        rcol,
+        show_ty(rty),
+        why
+    ))
+}
+
+/// 逐个 join 比对连接键的类型族。
+///
+/// 左侧是"到当前为止已累计的输出列"，命名规则与执行期共用 plan_join_columns，
+/// 所以重命名成 `id_2` 的那一侧也能拿到正确的类型。列名本身已由 plan_dataset
+/// 验过，这里只在能确定类型族时才开口。
+fn join_key_warnings(ds: &DatasetSpec, types: &TypeIndex) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(base) = ds.source(&ds.base) else {
+        return warnings;
+    };
+    // (输出列名, 别名.原始列名, 类型, 值桶)
+    let mut acc: Vec<(String, String, String, Family)> = base
+        .columns
+        .iter()
+        .map(|c| {
+            let (ty, f) = column_family(types, &base.alias, c);
+            (c.clone(), format!("{}.{}", base.alias, c), ty, f)
+        })
+        .collect();
+
+    for j in &ds.joins {
+        let Some(right) = ds.source(&j.source) else {
+            continue;
+        };
+        for p in &j.on {
+            let Some((_, lcol, lty, lf)) =
+                acc.iter().find(|(n, _, _, _)| same(n, &p.left)).cloned()
+            else {
+                continue;
+            };
+            let (rty, rf) = column_family(types, &right.alias, &p.right);
+            if let Some(why) = key_conflict(lf, rf, &lcol, &lty, &p.right, &rty) {
+                warnings.push(format!("数据集 {}：{}", label_of(ds), why));
+            }
+        }
+        let left: Vec<String> = acc.iter().map(|(n, _, _, _)| n.clone()).collect();
+        let (_, mapping) = plan_join_columns(&left, &right.columns);
+        for (orig, out) in mapping {
+            let (ty, f) = column_family(types, &right.alias, &orig);
+            acc.push((out, format!("{}.{}", right.alias, orig), ty, f));
+        }
+    }
+    warnings
 }
 
 fn label_of(ds: &DatasetSpec) -> String {
@@ -354,6 +503,7 @@ pub fn check_draft(draft: ReportDraft, catalog: &[CatalogTable]) -> Result<Draft
     let mut steps: Vec<String> = Vec::new();
     let mut columns: HashMap<String, Vec<String>> = HashMap::new();
     let mut ids: HashSet<String> = HashSet::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     for ds in draft.datasets {
         if ds.id.trim().is_empty() {
@@ -362,18 +512,19 @@ pub fn check_draft(draft: ReportDraft, catalog: &[CatalogTable]) -> Result<Draft
         if !ids.insert(ds.id.clone()) {
             return Err(format!("数据集 id {} 重复", ds.id));
         }
-        let (sources, cache) = normalize_sources(&ds, catalog)?;
+        let (sources, cache, types) = normalize_sources(&ds, catalog)?;
         let ds = DatasetSpec { sources, ..ds };
         let plan = super::dataset::plan_dataset(&ds, &cache)
             .map_err(|e| format!("数据集 {}：{}", label_of(&ds), e))?;
         steps.extend(plan.steps);
         columns.insert(ds.id.clone(), plan.columns.clone());
+        // 类型族只在结构已经合法之后才评：列名都不存在的草稿，报错比告警有用
+        warnings.extend(join_key_warnings(&ds, &types));
         datasets.push(ds);
     }
 
     let view_steps = super::view::validate_view(&draft.view, &columns)?;
     let used: HashSet<&str> = draft.view.widgets.iter().map(|w| w.dataset.as_str()).collect();
-    let mut warnings: Vec<String> = Vec::new();
     for ds in &datasets {
         if !used.contains(ds.id.as_str()) {
             warnings.push(format!(
@@ -791,6 +942,185 @@ mod tests {
         let out = check_draft(parse_draft(&raw).unwrap(), &catalog()).unwrap();
         assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
         assert!(out.warnings[0].contains("d2"), "{:?}", out.warnings);
+    }
+
+    /// 连接键的类型族决定告警准不准，所以按各方言真实写法逐条钉住
+    #[test]
+    fn family_of_covers_real_dialect_type_strings() {
+        for ty in [
+            "int(11)",
+            "INT",
+            "bigint(20)",
+            "integer",
+            "smallint",
+            "decimal(12,2)",
+            "numeric",
+            "real",
+            "double precision",
+            "float",
+            "boolean",
+            "serial",
+        ] {
+            assert_eq!(family_of(ty), Family::Numeric, "{} 该算数值", ty);
+        }
+        for ty in [
+            "varchar(64)",
+            "char(8)",
+            "text",
+            "tinytext",
+            "character varying(64)",
+            "uuid",
+            "json",
+            "jsonb",
+            "date",
+            "datetime",
+            "timestamp without time zone",
+            "enum('a','b')",
+        ] {
+            assert_eq!(family_of(ty), Family::Text, "{} 该算文本", ty);
+        }
+        for ty in ["blob", "bytea", "varbinary(16)", "geometry"] {
+            assert_eq!(family_of(ty), Family::Binary, "{} 该算二进制", ty);
+        }
+        // 认不出的一律沉默：宁可漏报，不能把本来能跑的草稿说成坏的
+        for ty in ["", "   ", "widget", "未知类型", "array"] {
+            assert_eq!(family_of(ty), Family::Unknown, "{} 不该乱猜", ty);
+        }
+    }
+
+    /// 三张表专门用来验连接键：orders(bigint) / ext(bigint + int) / att(varchar + blob)
+    fn typed_catalog() -> Vec<CatalogTable> {
+        let t = |conn: &str, table: &str, cols: &[(&str, &str)]| CatalogTable {
+            connection_id: conn.into(),
+            connection_name: conn.into(),
+            database_type: "mysql".into(),
+            schema: String::new(),
+            table: table.into(),
+            columns: cols.iter().map(|(n, _)| n.to_string()).collect(),
+            column_types: types(cols),
+        };
+        vec![
+            t(
+                "shop",
+                "orders",
+                &[
+                    ("order_no", "bigint(20)"),
+                    ("city", "varchar(32)"),
+                    ("amount", "decimal(12,2)"),
+                ],
+            ),
+            t(
+                "crm",
+                "ext",
+                &[("order_no", "bigint(20)"), ("city", "int(11)")],
+            ),
+            t("crm", "att", &[("zone", "varchar(64)"), ("raw_key", "blob")]),
+        ]
+    }
+
+    /// 把 sources + joins 拼成一个结构合法的数据集：聚合固定输出 city / gmv，配 widget()
+    fn typed_ds(sources: &str, joins: &str) -> String {
+        spec(
+            "d1",
+            "o",
+            sources,
+            &format!(
+                concat!(
+                    r#""joins":[{}],"group_by":["city"],"#,
+                    r#""aggregates":[{{"output":"gmv","func":"SUM","column":"amount"}}]"#
+                ),
+                joins
+            ),
+        )
+    }
+
+    fn join_one(left: &str, src: &str, right: &str) -> String {
+        format!(
+            r#"{{"source":"{}","on":[{{"left":"{}","right":"{}"}}]}}"#,
+            src, left, right
+        )
+    }
+
+    /// 这一条测的是"新能力补上之前根本看不见的洞"：
+    /// bigint 连接键配 varchar，内存 join 分桶不同（#… vs S…），做出的报表必然空表。
+    #[test]
+    fn check_draft_warns_when_join_keys_can_never_match() {
+        let c = typed_catalog();
+        let bad = typed_ds(
+            r#"[{"alias":"o","connection_id":"shop","table":"orders"},{"alias":"a","connection_id":"crm","table":"att"}]"#,
+            &join_one("order_no", "a", "zone"),
+        );
+        let out = check_draft(parse_draft(&draft_of(&[bad], &[widget("d1", "BAR")])).unwrap(), &c)
+            .unwrap();
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        let w = &out.warnings[0];
+        assert!(w.contains("d1"), "告警要带数据集 id：{}", w);
+        assert!(w.contains("o.order_no"), "要指出左侧键：{}", w);
+        assert!(w.contains("bigint(20)"), "要给出两侧真实类型：{}", w);
+        assert!(w.contains("varchar(64)"), "要给出两侧真实类型：{}", w);
+        assert!(w.contains("空表"), "要说清后果，不然只是行黑话：{}", w);
+
+        // 二进制键两边同族也配不上：取数阶段就被置成 NULL
+        let blob = typed_ds(
+            r#"[{"alias":"o","connection_id":"shop","table":"orders"},{"alias":"a","connection_id":"crm","table":"att"}]"#,
+            &join_one("order_no", "a", "raw_key"),
+        );
+        let out2 =
+            check_draft(parse_draft(&draft_of(&[blob], &[widget("d1", "BAR")])).unwrap(), &c)
+                .unwrap();
+        assert_eq!(out2.warnings.len(), 1, "{:?}", out2.warnings);
+        assert!(out2.warnings[0].contains("NULL"), "{:?}", out2.warnings[0]);
+
+        // 同族连接键不能报警：否则这条告警就是噪音，模型和用户都会学着忽略它
+        let good = typed_ds(
+            r#"[{"alias":"o","connection_id":"shop","table":"orders"},{"alias":"x","connection_id":"crm","table":"ext"}]"#,
+            &join_one("order_no", "x", "order_no"),
+        );
+        let out3 =
+            check_draft(parse_draft(&draft_of(&[good], &[widget("d1", "BAR")])).unwrap(), &c)
+                .unwrap();
+        assert!(out3.warnings.is_empty(), "{:?}", out3.warnings);
+    }
+
+    /// 重命名之后的连接键（ext.city 落成 city_2）也要能追到类型：
+    /// 左侧累计列的命名规则必须和执行期 plan_join_columns 同一套。
+    #[test]
+    fn warning_follows_a_renamed_join_column() {
+        let raw = draft_of(
+            &[typed_ds(
+                concat!(
+                    r#"[{"alias":"o","connection_id":"shop","table":"orders"},"#,
+                    r#"{"alias":"x","connection_id":"crm","table":"ext"},"#,
+                    r#"{"alias":"a","connection_id":"crm","table":"att"}]"#
+                ),
+                &format!(
+                    "{},{}",
+                    join_one("order_no", "x", "order_no"),
+                    join_one("city_2", "a", "zone")
+                ),
+            )],
+            &[widget("d1", "BAR")],
+        );
+        let out = check_draft(parse_draft(&raw).unwrap(), &typed_catalog()).unwrap();
+        assert_eq!(
+            out.warnings.len(),
+            1,
+            "只有第二个 join 的连接键跨了族：{:?}",
+            out.warnings
+        );
+        assert!(out.warnings[0].contains("x.city"), "{}", out.warnings[0]);
+        assert!(out.warnings[0].contains("int(11)"), "{}", out.warnings[0]);
+    }
+
+    /// 目录没给类型时保持沉默——很多库就是读不出列类型，不能因此卡住起草
+    #[test]
+    fn no_join_warning_when_the_catalog_has_no_types() {
+        let out = check_draft(
+            parse_draft(&draft_of(&[city_gmv()], &[widget("d1", "BAR")])).unwrap(),
+            &catalog(),
+        )
+        .unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
 
     #[test]
