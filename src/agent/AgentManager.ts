@@ -1,8 +1,12 @@
 import { create } from "zustand";
-import { AgentIntent, AgentMessage, AgentResponse } from "./types";
+import { AgentAskContext, AgentIntent, AgentMessage, AgentResponse } from "./types";
 
-/** 宿主应用登记的真实实现：面板只收意图和那句话，不认识任何后端命令。 */
-export type AgentHandler = (intent: AgentIntent, text: string) => Promise<AgentResponse>;
+/** 宿主应用登记的真实实现：面板只收意图、那句话和最小上下文，不认识任何后端命令。 */
+export type AgentHandler = (
+  intent: AgentIntent,
+  text: string,
+  ctx?: AgentAskContext
+) => Promise<AgentResponse>;
 
 interface AgentStore {
   messages: AgentMessage[];
@@ -12,7 +16,7 @@ interface AgentStore {
   addMessage: (message: AgentMessage) => void;
   setHandler: (handler: AgentHandler | null) => void;
   clear: () => void;
-  ask: (intent: AgentIntent, text: string) => Promise<void>;
+  ask: (intent: AgentIntent, text: string, ctx?: AgentAskContext) => Promise<void>;
 }
 
 /** 面板可以被没有后端的宿主单独挂上去，那时不许伪造回答（T-005 那条闸）。 */
@@ -33,8 +37,9 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
   clear: () => set({ messages: [] }),
 
   /** 一轮对话：先把用户那句贴进会话，再交给宿主登记的实现。
-   *  两边的消息都在 store 里落账，面板才不会"发出去却什么都没看见"。 */
-  ask: async (intent, text) => {
+   *  两边的消息都在 store 里落账，面板才不会"发出去却什么都没看见"。
+   *  ctx 不落账，只跟着这一轮传给实现（报错原文本身就是那句"用户话"）。 */
+  ask: async (intent, text, ctx) => {
     const body = text.trim();
     if (!body || get().busy) return;
     set((state) => ({
@@ -57,7 +62,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
         reply(`错误: ${NO_HANDLER}`);
         return;
       }
-      const res = await handler(intent, body);
+      const res = await handler(intent, body, ctx);
       if (res.success) reply(res.content, res.sql);
       else reply(`错误: ${res.error || "未知错误"}`);
     } catch (e: any) {

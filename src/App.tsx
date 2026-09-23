@@ -73,7 +73,7 @@ import { aiSqlGenerate, catalogColumns, reportDescribeColumns } from "./report/a
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
 import type { BackendConfig } from "./report/api";
 import type { CatalogTable, SqlDraft } from "./report/types";
-import type { AgentIntent, AgentResponse } from "./agent/types";
+import type { AgentAskContext, AgentIntent, AgentResponse } from "./agent/types";
 
 // 渐变色主题常量
 const brandGradient = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
@@ -463,6 +463,17 @@ function App() {
         duration: 5,
       });
       const err = classifyError(String(e));
+      // 报错原文只闪在 toast 里，五秒就没了；连着当时那条语句一起落进会话，
+      // 才能一键交给模型诊断，不用用户凭记忆手抄（T-075）。
+      // sqlCode 取的是这次请求闭包里的那份：中途改编辑器也不会记错现场。
+      useAgentStore.getState().addMessage({
+        id: `${Date.now().toString(36)}-fail`,
+        role: "system",
+        content: "这条语句执行失败了",
+        sql: sqlCode,
+        error: String(e),
+        timestamp: Date.now(),
+      });
       const newItem: QueryHistoryItem = {
         id: Date.now().toString(),
         sql: sqlCode,
@@ -729,10 +740,14 @@ function App() {
         agentTables.join("、") || "未选"
       }`;
 
-  // Agent 对话的真实实现（T-073）：面板只交过来意图和那句话，连接、表目录、
-  // 编辑器当前 SQL 这些上下文只有这里拿得到。两条链路都不碰库：
+  // Agent 对话的真实实现（T-073）：面板只交过来意图、那句话和最小上下文，连接、表目录、
+  // 编辑器当前 SQL 这些只有这里拿得到。两条链路都不碰库：
   // query 出的 SQL 要用户自己点填进编辑器再运行，diagnose 只回文字。
-  const agentAsk = async (intent: AgentIntent, text: string): Promise<AgentResponse> => {
+  const agentAsk = async (
+    intent: AgentIntent,
+    text: string,
+    ctx?: AgentAskContext
+  ): Promise<AgentResponse> => {
     if (!aiConfig.baseUrl || !aiConfig.apiKey || !aiConfig.model) {
       setShowAiConfigModal(true);
       return {
@@ -746,15 +761,22 @@ function App() {
     }
     try {
       if (intent === "diagnose") {
-        // 报错原文就是用户刚打的那句，SQL 取编辑器当前那段——对话里再手抄一遍没有意义
-        if (!sqlCode.trim()) {
+        // 手打的报错按编辑器当前那段诊断；从失败现场点进来的用当时那条语句——
+        // 报错之后用户又改了稿子，拿新内容去问旧报错只会问出不相干的答案
+        const target = (ctx?.sql ?? sqlCode).trim();
+        if (!target) {
           return {
             success: false,
             content: "",
-            error: "编辑器里没有 SQL：诊断要先有报错对应的那条语句",
+            error: "没有可诊断的 SQL：编辑器当前那段和报错那条都是空的",
           };
         }
-        return { success: true, content: await aiDiagnoseError(text, sqlCode, aiConfigForReport) };
+        const answer = await aiDiagnoseError(text, target, aiConfigForReport);
+        const note =
+          ctx?.sql && ctx.sql.trim() !== sqlCode.trim()
+            ? "（问的是报错时那条语句，编辑器现在的内容没参与）\n"
+            : "";
+        return { success: true, content: note + answer };
       }
       if (!agentTables.length) {
         return {
@@ -793,7 +815,8 @@ function App() {
   const agentAskRef = useRef(agentAsk);
   agentAskRef.current = agentAsk;
   const askAgent = useCallback(
-    (intent: AgentIntent, text: string) => agentAskRef.current(intent, text),
+    (intent: AgentIntent, text: string, ctx?: AgentAskContext) =>
+      agentAskRef.current(intent, text, ctx),
     []
   );
   useEffect(() => {

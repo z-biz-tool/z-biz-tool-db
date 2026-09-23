@@ -339,8 +339,35 @@ function invoke(cmd: string, args: any): Promise<any> {
           .replace(/\s+/g, " ")
           .trim()
       );
-    case "execute_query":
-      return fail("探针不执行真实 SQL：请走 report_* 链路");
+    case "execute_query": {
+      // 真实后端会跑这条 SQL 并回 tagged 单元格；探针按同一种形状回，
+      // 这样"成功/失败各留什么现场"才验得动。?execfail=1 换成一条带驱动原文的报错。
+      if (window.__PROBE_FLAG("execfail")) {
+        return fail(
+          "error returned from database: 1146 (42S02): Table 'shop.orders_x' doesn't exist"
+        );
+      }
+      return Promise.resolve({
+        id: "probe-run-1",
+        columns: ["id", "city", "amount"],
+        column_meta: [
+          { ordinal: 0, name: "id", native_type: "BIGINT", logical_type: "integer", nullable: false },
+          { ordinal: 1, name: "city", native_type: "VARCHAR", logical_type: "text", nullable: true },
+          { ordinal: 2, name: "amount", native_type: "DECIMAL", logical_type: "decimal", nullable: true },
+        ],
+        rows: [
+          [
+            { __kind: "integer", value: "1" },
+            { __kind: "text", value: "杭州" },
+            { __kind: "decimal", value: "99.50" },
+          ],
+        ],
+        affected_rows: 0,
+        execution_time_ms: 7,
+        is_query: true,
+        timings: { connect_ms: 2, queue_ms: 0, execute_ms: 4, fetch_ms: 1, total_ms: 7 },
+      });
+    }
     // ================== 四条 AI 解说链路 ==================
     // 后端这四个命令都回纯文本；探针只验"参数键名与结构对不对"，
     // 因为 Tauri v2 会把 Rust 形参 snake_case 映射成 camelCase 载荷键。

@@ -163,6 +163,41 @@ export function installDriver() {
       Array.from(document.querySelectorAll(".ant-list-item")).map((li) =>
         (li.textContent || "").trim().replace(/\s+/g, " ")
       ),
+    /** 会话里某条消息上的按钮（按文案找）。找不到就把现场按钮都吐出来，
+     *  不然探针只会说"没点着"，看不出是没渲染还是文案不对。 */
+    clickBubbleButton: async (label: string) => {
+      const items: Element[] = Array.from(document.querySelectorAll(".ant-list-item"));
+      const inList = (li: Element): HTMLButtonElement[] =>
+        Array.from(li.querySelectorAll("button")) as HTMLButtonElement[];
+      const all = items.flatMap(inList);
+      const btn = all.find((b) => (b.textContent || "").includes(label));
+      if (!btn)
+        throw new Error(
+          `会话里没有这个按钮：${label}（现有：${all.map((b) => (b.textContent || "").trim()).join("|") || "一个都没有"}）`
+        );
+      if ((btn as HTMLButtonElement).disabled) throw new Error(`按钮 ${label} 是禁用状态`);
+      w.__PROBE_CLICK(btn);
+      await sleep(400);
+    },
+    /** 顶栏"+ 新建查询"：切到新页签会把编辑器清空，用来验"报错现场用的是当时那条" */
+    addQueryTab: async () => {
+      const btn = document.querySelector(".ant-tabs-nav-add");
+      if (!btn) throw new Error("没有新建查询的页签按钮");
+      w.__PROBE_CLICK(btn);
+      await sleep(150);
+    },
+    /** 编辑器右上角的「执行」。clickButton 会命中任何含"执行"的按钮（收藏弹窗里就有），
+     *  所以这里只认文案正好等于"执行"的那一个，多一个就报出来。 */
+    clickRun: async () => {
+      const hits = (
+        Array.from(document.querySelectorAll("button")) as HTMLButtonElement[]
+      ).filter((b) => (b.textContent || "").trim() === "执行");
+      if (hits.length !== 1)
+        throw new Error(`"执行"按钮应当只有一个，实际 ${hits.length} 个`);
+      if (hits[0].disabled) throw new Error("执行按钮是禁用状态");
+      w.__PROBE_CLICK(hits[0]);
+      await sleep(500);
+    },
     /** 连上左侧某条连接 */
     connect: async (label: string) => {
       const li = Array.from(document.querySelectorAll(".ant-menu-item")).find((x) =>

@@ -29,6 +29,20 @@ const INTENT_PLACEHOLDER: Record<AgentIntent, string> = {
   diagnose: '把报错原文贴进来，SQL 用编辑器里当前那段',
 };
 
+/** 失败现场里的 SQL / 报错原文：等宽、能滚、不许把面板撑破 */
+const RAW_BOX: React.CSSProperties = {
+  backgroundColor: 'rgba(0, 0, 0, 0.05)',
+  padding: '4px 8px',
+  borderRadius: 4,
+  fontFamily: 'monospace',
+  fontSize: 12,
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-all',
+  maxHeight: 120,
+  overflowY: 'auto',
+  marginTop: 4,
+};
+
 export interface AgentPanelProps {
   /** 这轮对话依据的上下文（连的哪个库、用哪些表），由宿主拼好；空则不显示 */
   hint?: string;
@@ -105,10 +119,36 @@ export function AgentPanel({ hint, onUseSql }: AgentPanelProps) {
           locale={{ emptyText: '还没有对话。上面选一个意图，说一句试试。' }}
           renderItem={(msg) =>
             msg.role === 'system' ? (
-              <List.Item style={{ justifyContent: 'center', border: 'none', padding: '2px 0' }}>
-                <Text type="secondary" style={{ fontSize: 12 }}>
-                  {msg.content} · {new Date(msg.timestamp).toLocaleTimeString()}
-                </Text>
+              <List.Item
+                style={{
+                  justifyContent: msg.error ? 'flex-start' : 'center',
+                  border: 'none',
+                  padding: '2px 0',
+                }}
+              >
+                {msg.error ? (
+                  <div style={{ width: '100%', borderLeft: '3px solid #ff4d4f', paddingLeft: 10 }}>
+                    <Text type="danger" style={{ fontSize: 12 }}>
+                      {msg.content} · {new Date(msg.timestamp).toLocaleTimeString()}
+                    </Text>
+                    {/* 报错原文与当时那条语句一起留下：不写进会话，用户就得凭记忆抄一遍 */}
+                    {msg.sql && <div style={RAW_BOX}>{msg.sql}</div>}
+                    <div style={RAW_BOX}>{msg.error}</div>
+                    <Button
+                      size="small"
+                      danger
+                      style={{ marginTop: 6 }}
+                      disabled={busy}
+                      onClick={() => void ask('diagnose', msg.error as string, { sql: msg.sql })}
+                    >
+                      诊断这条报错
+                    </Button>
+                  </div>
+                ) : (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {msg.content} · {new Date(msg.timestamp).toLocaleTimeString()}
+                  </Text>
+                )}
               </List.Item>
             ) : (
             <List.Item

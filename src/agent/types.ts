@@ -11,7 +11,16 @@ export interface AgentMessage {
   role: 'user' | 'agent' | 'system';
   content: string;
   sql?: string;
+  /** 带这个字段的 system 行是一次失败现场：面板据此给出「诊断这条报错」 */
+  error?: string;
   timestamp: number;
+}
+
+/** 一轮提问能附带的最小上下文。
+ *  sql = 这句话是从哪条语句的报错里来的。不传就按编辑器当前那段走——
+ *  报错发生在用户改稿之前时，只有带着当时那条才能问对（T-075）。 */
+export interface AgentAskContext {
+  sql?: string;
 }
 
 export interface AgentResponse {
