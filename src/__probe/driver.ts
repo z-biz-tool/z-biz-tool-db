@@ -67,6 +67,62 @@ export function installDriver() {
      *  列数为 0 就是 T-067 堵掉的那个洞；带类型的列数为 0 说明类型没送到模型眼前。 */
     catalogSent: (from: number) => sentOf("ai_report_draft", from),
     genCatalogSent: (from: number) => sentOf("ai_sql_generate", from),
+    /** 从某个下标起，取数请求里各数据集源用到的连接 id（改绑是否真落到 IPC 上看这个） */
+    connsSent: (cmd: string, from: number) =>
+      (w.__PROBE_CALLS as any[])
+        .slice(from)
+        .filter((c: any) => c.cmd === cmd)
+        .map((c: any) => [
+          ...new Set((c.args.datasets || []).flatMap((d: any) => (d.sources || []).map((s: any) => s.connection_id))),
+        ]),
+    /** 切右侧页签。别用 clickButton("报表簿")——页签文案带计数，而且左栏有
+     *  一个"存入报表簿"按钮会抢先命中。 */
+    clickTab: async (label: string) => {
+      const flat = (s: string) => (s || "").replace(/\s+/g, "");
+      const tabs = Array.from(document.querySelectorAll(".ant-tabs-tab"));
+      const t = tabs.find((x) => flat(x.textContent).startsWith(flat(label)));
+      if (!t) throw new Error(`没有这个页签：${label}（有 ${tabs.map((x) => (x.textContent || "").trim()).join("|")}）`);
+      w.__PROBE_CLICK(t.querySelector(".ant-tabs-tab-btn") || t);
+      await sleep(200);
+    },
+    /** 报表簿里点开某张报表的「打开并取数」 */
+    openReport: async (name: string) => {
+      const item = Array.from(document.querySelectorAll(".ant-list-item")).find((li) =>
+        (li.textContent || "").includes(name)
+      );
+      if (!item) throw new Error(`报表簿里没有「${name}」（有 ${document.querySelectorAll(".ant-list-item").length} 条）`);
+      const btn = Array.from(item.querySelectorAll("button")).find((b) =>
+        (b.textContent || "").includes("打开并取数")
+      );
+      if (!btn) throw new Error(`「${name}」没有「打开并取数」按钮`);
+      w.__PROBE_CLICK(btn);
+      await sleep(250);
+    },
+    /** 改绑入口第 i 行的下拉，选到 label 命中的那条连接 */
+    pickRemap: async (i: number, label: string) => {
+      const card = Array.from(document.querySelectorAll(".ant-alert")).find(
+        (a) => (a.textContent || "").includes("按改绑重新取数")
+      );
+      if (!card) throw new Error("没有改绑入口（找不到含「按改绑重新取数」的提示条）");
+      const rows = card.querySelectorAll(".ant-select");
+      const sel = rows[i];
+      if (!sel) throw new Error(`改绑入口里没有第 ${i + 1} 个下拉（共 ${rows.length} 个）`);
+      w.__PROBE_CLICK(sel.querySelector(".ant-select-content") || sel);
+      await sleep(120);
+      // 只看还开着的下拉面板：之前选表留下的隐藏面板会串味
+      const opts = Array.from(
+        document.querySelectorAll(".ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option")
+      );
+      const o = opts.find((x) => (x.textContent || "").includes(label));
+      if (!o) throw new Error(`下拉里没有 ${label}（有 ${opts.map((x) => x.textContent).join("|")}）`);
+      w.__PROBE_CLICK(o);
+      await sleep(60);
+    },
+    /** 当前规格 JSON 编辑器内容（按含 connection_id 的那一栏找，避开问题输入框） */
+    specValue: () =>
+      Array.from(document.querySelectorAll("textarea"))
+        .map((t) => t.value)
+        .find((v) => v.includes("connection_id")) || "",
     tags: () => Array.from(document.querySelectorAll(".ant-tag")).map((t) => (t.textContent || "").trim()),
     alerts: () =>
       Array.from(document.querySelectorAll(".ant-alert")).map((a) =>

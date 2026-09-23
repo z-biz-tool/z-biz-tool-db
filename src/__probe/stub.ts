@@ -248,9 +248,23 @@ function invoke(cmd: string, args: any): Promise<any> {
       return Promise.resolve(null);
     }
     case "report_view_render":
-      return Promise.resolve((fixture as any).render);
-    case "report_view_validate":
-      return Promise.resolve((fixture as any).validate);
+    case "report_view_validate": {
+      // 镜像 DbSource::resolve：源引用的连接不在前端传来的 configs 里就是这句拒因。
+      // 不补这条，探针里把死连接改成任意字符串都会"取数成功"，改绑链路是个假绿灯。
+      const alive = new Set((a.configs || []).map((c: any) => c.id));
+      for (const ds of a.datasets || []) {
+        for (const s of ds.sources || []) {
+          if (!alive.has(s.connection_id)) {
+            return fail(
+              `源 ${s.alias} 引用的连接 ${s.connection_id} 不在本会话已解锁的连接里，请先在连接面板建立连接`
+            );
+          }
+        }
+      }
+      return Promise.resolve(
+        cmd === "report_view_render" ? (fixture as any).render : (fixture as any).validate
+      );
+    }
     case "ai_report_draft": {
       const cat: any[] = a.catalog || [];
       // 后端 draft() 的第一道门槛就是空问题；探针不镜像的话，

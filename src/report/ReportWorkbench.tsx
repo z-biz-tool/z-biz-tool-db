@@ -80,6 +80,37 @@ interface ConnState {
 const typeCovered = (t: CatalogTable) =>
   t.columns.filter((c) => (t.column_types?.[c] || "").trim()).length;
 
+/** 规格里用到、但本机已经没有的连接。
+ *  光贴 connection_id 等于没贴：用户还得自己去 JSON 里对是哪张表出的问题。 */
+interface MissingConn {
+  id: string;
+  /** 这条连接在规格里被哪些表用到（带 schema 的照规格写全） */
+  tables: string[];
+  /** 受影响的数据集（无名回退到 id） */
+  datasets: string[];
+}
+
+const findMissingConns = (datasets: DatasetSpec[], alive: Set<string>): MissingConn[] => {
+  const out: MissingConn[] = [];
+  for (const d of datasets) {
+    for (const s of d.sources || []) {
+      if (alive.has(s.connection_id)) continue;
+      let m = out.find((x) => x.id === s.connection_id);
+      if (!m) out.push((m = { id: s.connection_id, tables: [], datasets: [] }));
+      const label = s.schema ? `${s.schema}.${s.table}` : s.table;
+      if (!m.tables.includes(label)) m.tables.push(label);
+      const ds = d.name || d.id;
+      if (!m.datasets.includes(ds)) m.datasets.push(ds);
+    }
+  }
+  return out;
+};
+
+const describeMissing = (m: MissingConn[]) =>
+  m
+    .map((x) => `· 连接 ${x.id}\n  表：${x.tables.join("、")}\n  数据集：${x.datasets.join("、")}`)
+    .join("\n");
+
 export function ReportWorkbench({
   configs,
   aiConfig,
@@ -109,6 +140,8 @@ export function ReportWorkbench({
   // 缺连接和幻觉字段会顶同一个标题，用户分不出该去补表还是该改问题。
   const [error, setError] = useState<{ title: string; detail: string } | null>(null);
   const [tab, setTab] = useState("board");
+  // 缺连接的改绑入口：规格里的死连接 id → 本机现有连接 id
+  const [remap, setRemap] = useState<Record<string, string>>({});
 
   // 报表簿
   const [reports, setReports] = useState<SavedReport[]>([]);
@@ -345,8 +378,27 @@ export function ReportWorkbench({
     }
   }, [specText]);
 
+  const aliveConnIds = useMemo(() => new Set(configs.map((c) => c.id)), [configs]);
+  /** 当前这份规格里用到的死连接：跟着规格 JSON 实时算，
+   *  改绑成功后入口自己消失，不需要额外记"用户是否点过取数"。 */
+  const missing = useMemo(
+    () => findMissingConns(spec.datasets || [], aliveConnIds),
+    [spec.datasets, aliveConnIds]
+  );
+
   /** 抽出来是为了"打开报表即取数"：那时 specText 的 state 还没落地，不能走 onRender */
   const runRender = async (view: ViewSpec, datasets: DatasetSpec[]) => {
+    // 取数前先挡一遍缺连接：后端那句"源 o 引用的连接 … 不在本会话已解锁的连接里"
+    // 只点得到别名 o，点不到是哪张表、哪个数据集，而且这一挡省掉一次注定失败的 IPC 往返。
+    const missNow = findMissingConns(datasets, aliveConnIds);
+    if (missNow.length) {
+      setError({
+        title: "报表需要的连接不在本机",
+        detail: `${describeMissing(missNow)}\n\n规格已载入，未下推任何 SQL。用下面的入口把它改绑到一条现有连接，或先按原名重建连接。`,
+      });
+      msgApi.warning("缺少连接，已载入规格但未取数");
+      return;
+    }
     const id = ++runId.current;
     setRendering(true);
     setError(null);
@@ -371,6 +423,40 @@ export function ReportWorkbench({
       return;
     }
     await runRender(spec.view, spec.datasets);
+  };
+
+  /** 把规格里选不出的连接改绑到本机现有连接：改的只是这份规格里的 connection_id，
+   *  不动报表簿也不动库。规格 JSON 和左侧目录要一起改，否则切到那一页看到的还是旧 id，
+   *  下次手改会把这次改绑冲掉。 */
+  const applyRemap = async () => {
+    if (!spec.view || !spec.datasets) return;
+    const map = remap;
+    const datasets = spec.datasets.map((d) => ({
+      ...d,
+      sources: (d.sources || []).map((s) =>
+        map[s.connection_id] ? { ...s, connection_id: map[s.connection_id] } : s
+      ),
+    }));
+    setSpecText(JSON.stringify({ datasets, view: spec.view }, null, 2));
+    const reload: string[] = [];
+    const next = [
+      ...new Set(
+        picked.map((k) => {
+          const [cid, schema, table] = k.split("\u0000");
+          const to = map[cid];
+          if (!to) return k;
+          const nk = keyOf({ connection_id: to, schema, table });
+          if (nk !== k) reload.push(nk);
+          return nk;
+        })
+      ),
+    ];
+    if (next.length !== picked.length || next.some((k, i) => k !== picked[i])) setPicked(next);
+    // 目录键跟着换了连接，列清单得按新连接重读一次，否则起草拿到的还是旧列
+    reload.forEach(ensureColumns);
+    setRemap({});
+    setError(null);
+    await runRender(spec.view, datasets);
   };
 
   /** 只跑计划不取数：改完 JSON 先自检一次，比直接渲染便宜得多 */
@@ -468,21 +554,12 @@ export function ReportWorkbench({
     setOpenId(r.id);
     setOpenName(r.name);
     setTab("board");
+    setRemap({});
     keys.forEach(ensureColumns);
     runId.current += 1; // 让可能在飞的草稿/渲染响应作废
 
-    // 连接被删过就别去取数：后端只会回一句"找不到连接"，
-    // 用户看不出该回去补哪张表
-    const need = [...new Set(r.datasets.flatMap((d) => d.sources.map((s) => s.connection_id)))];
-    const gone = need.filter((id) => !configs.some((c) => c.id === id));
-    if (gone.length) {
-      setError({
-        title: "报表需要的连接不在本机",
-        detail: `这张报表用到的连接已不存在：${gone.join("、")}。\n请在左侧重新选表，或改规格 JSON 里的 connection_id 后再取数。`,
-      });
-      msgApi.warning("缺少连接，已载入规格但未取数");
-      return;
-    }
+    // 缺连接的情况交给 runRender 前置闸：它会把受影响的表和数据集点名列出来，
+    // 手改 JSON 走「取数并渲染」时也是同一条路，两处不会说法不一。
     await runRender(r.view, r.datasets);
   };
 
@@ -684,6 +761,70 @@ export function ReportWorkbench({
               <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
                 {error.detail}
               </div>
+            }
+          />
+        )}
+        {/* 报表簿里一张报表可以横跨好几条连接：删了一条就是一张废图。
+            这里给一条改绑的岔路，而不是把用户推回"重新选表、重新起草"。 */}
+        {missing.length > 0 && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            title="把这些表改绑到现有连接"
+            description={
+              <Space orientation="vertical" size={8} style={{ width: "100%" }}>
+                {configs.length === 0 ? (
+                  <Text>本机一条连接都没有，先去连接管理新建连接再回来。</Text>
+                ) : (
+                  missing.map((m) => (
+                    <div
+                      key={m.id}
+                      style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}
+                    >
+                      <Select
+                        size="small"
+                        style={{ minWidth: 200 }}
+                        placeholder="改绑到哪条连接"
+                        value={remap[m.id]}
+                        onChange={(v) => setRemap((p) => ({ ...p, [m.id]: v }))}
+                        options={configs.map((c) => ({
+                          value: c.id,
+                          label: `${c.name || c.id}（${c.db_type}）`,
+                        }))}
+                      />
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        原连接 {m.id}：表 {m.tables.join("、")} · 数据集 {m.datasets.join("、")}
+                      </Text>
+                    </div>
+                  ))
+                )}
+                <Space>
+                  <Button
+                    size="small"
+                    type="primary"
+                    disabled={configs.length === 0 || missing.some((m) => !remap[m.id])}
+                    loading={rendering}
+                    onClick={applyRemap}
+                  >
+                    按改绑重新取数
+                  </Button>
+                  {Object.keys(remap).length > 0 && (
+                    <Button size="small" onClick={() => setRemap({})}>
+                      清空选择
+                    </Button>
+                  )}
+                  {missing.some((m) => !remap[m.id]) && (
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      每一条缺失连接都要给一个去向，否则改了还是取不出数
+                    </Text>
+                  )}
+                </Space>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  改绑只重写这份规格里的 connection_id，会同步进「规格 JSON」；目标连接里必须有同名的表和列，
+                  对不上的话取数会照实报错。
+                </Text>
+              </Space>
             }
           />
         )}
