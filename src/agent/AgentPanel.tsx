@@ -54,9 +54,11 @@ export interface AgentPanelProps {
   onClear?: () => void;
   /** 撞见"表在别的连接里"时把那句需求送去 AI 报表（那边能跨连接出图）。不给就不显示出口。 */
   onGoReport?: (question: string) => void;
+  /** 没勾表时一步跳到勾表那一页，别让用户自己在三个页签里找 */
+  onGoPickTables?: () => void;
 }
 
-export function AgentPanel({ hint, onUseSql, onClear, onGoReport }: AgentPanelProps) {
+export function AgentPanel({ hint, onUseSql, onClear, onGoReport, onGoPickTables }: AgentPanelProps) {
   /** "表其实在别的连接里"那一块：SQL 腿的失败现场（system）与问数回复（agent）都会带，
    *  两处都要有出口，否则用户在气泡里看到一句解释却不知道下一步去哪。 */
   const crossBlock = (msg: AgentMessage) =>
@@ -265,6 +267,16 @@ export function AgentPanel({ hint, onUseSql, onClear, onGoReport }: AgentPanelPr
                 )}
 
                 {crossBlock(msg)}
+                {msg.action === 'pickTables' && onGoPickTables && (
+                  <Button
+                    size="small"
+                    style={{ marginTop: 8 }}
+                    disabled={busy}
+                    onClick={onGoPickTables}
+                  >
+                    去勾这次要用的表
+                  </Button>
+                )}
 
                 <Text type="secondary" style={{ fontSize: '12px', marginTop: 4 }}>
                   {new Date(msg.timestamp).toLocaleTimeString()}

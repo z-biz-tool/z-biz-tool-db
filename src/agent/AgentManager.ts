@@ -53,12 +53,13 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
       content: string,
       sql?: string,
       fix?: AgentResponse["fix"],
-      cross?: AgentResponse["cross"]
+      cross?: AgentResponse["cross"],
+      action?: AgentResponse["action"]
     ) =>
       set((state) => ({
         messages: [
           ...state.messages,
-          { id: nextId(), role: "agent", content, sql, fix, cross, timestamp: Date.now() },
+          { id: nextId(), role: "agent", content, sql, fix, cross, action, timestamp: Date.now() },
         ],
       }));
     const handler = get().handler;
@@ -71,7 +72,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
       // 失败也可能带回一张"改稿单"（fix）：那条拒因点名了具体哪一列，
       // 只把文字贴进气泡，用户能做的就剩下重新问一遍
       if (res.success) reply(res.content, res.sql);
-      else reply(`错误: ${res.error || "未知错误"}`, undefined, res.fix, res.cross);
+      else reply(`错误: ${res.error || "未知错误"}`, undefined, res.fix, res.cross, res.action);
     } catch (e: any) {
       reply(`系统错误: ${e?.message || e}`);
     } finally {

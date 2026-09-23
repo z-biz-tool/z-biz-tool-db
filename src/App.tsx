@@ -1007,7 +1007,10 @@ function App() {
         return {
           success: false,
           content: "",
-          error: "先勾选这次要用的表（或在左侧选中一张），模型没有列清单就只能编字段",
+          // 勾表的控件在同一个弹窗的另一页（还有左侧的库表树）：只说"先勾选"等于让人自己找
+          error: "还没勾这次要用的表：模型没有列清单就只能编字段。勾表在这一弹窗的「生成 SQL」页，" +
+            "也可以直接在左侧点库表树里选一张。",
+          action: "pickTables",
         };
       }
       const { catalog, failed } = await buildAiCatalog(agentTables, toBackendConfig(selectedConnection));
@@ -2371,6 +2374,7 @@ function App() {
                       setShowAiResultModal(false);
                       goReport(q, true);
                     }}
+                    onGoPickTables={() => setAiActiveTab("generate")}
                   />
                 </div>
               ),

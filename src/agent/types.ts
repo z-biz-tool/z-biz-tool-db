@@ -14,6 +14,10 @@ export interface AgentCrossDb {
   connections: string[];
 }
 
+/** 失败时能一步到位的下一步：pickTables = 这条弹窗里另一页有勾表的控件。
+ *  只说"先勾选要用的表"而不给去处，等于让用户自己在三个页签里找。 */
+export type AgentNextAction = "pickTables";
+
 export interface AgentMessage {
   id: string;
   /** system 是"发生过的事"（例如一条已执行的语句），不是用户打的话，别画成用户气泡 */
@@ -23,6 +27,8 @@ export interface AgentMessage {
   /** 带这个字段的 system 行是一次失败现场：面板据此给出「诊断这条报错」 */
   error?: string;
   cross?: AgentCrossDb;
+  /** 有值 = 面板给一个把这一步接过去的按钮，而不是让用户自己找页签 */
+  action?: AgentNextAction;
   /** 带这个字段的 agent 气泡是一次被本机挡下的稿子：面板据此给出「照这条错误改」 */
   fix?: SqlFixTicket;
   timestamp: number;
@@ -53,4 +59,5 @@ export interface AgentResponse {
   cross?: AgentCrossDb;
   /** 这一轮没过本机校验、且手上确有被拒的那条 SQL 时带回来 */
   fix?: SqlFixTicket;
+  action?: AgentNextAction;
 }
