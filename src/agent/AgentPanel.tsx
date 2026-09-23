@@ -1,28 +1,45 @@
 // Agent 交互面板 - 共享组件
 // 所有 z-biz-tool 项目都可以使用
+//
+// 面板本身不认识任何后端命令：一轮对话走 useAgentStore.ask，
+// 真实实现由宿主应用用 setHandler 登记（z-biz-tool-db 里是 App.tsx）。
+// 没登记时 ask 会照实回"没有可用的后端实现"，不会伪造回答。
 
 import { useState, useEffect, useRef } from 'react';
-import { 
-  Card, 
-  Input, 
-  Button, 
-  Space, 
-  Typography, 
-  Spin, 
-  Avatar,
+import {
+  Alert,
+  Button,
+  Card,
+  Input,
   List,
-  Tag
+  Segmented,
+  Space,
+  Spin,
+  Typography,
 } from 'antd';
 import { RobotOutlined, SendOutlined } from '@ant-design/icons';
 import { useAgentStore } from '../agent/AgentManager';
+import type { AgentIntent } from '../agent/types';
 
 const { TextArea } = Input;
 const { Text } = Typography;
 
-export const AgentPanel: React.FC = () => {
+const INTENT_PLACEHOLDER: Record<AgentIntent, string> = {
+  query: '想要查什么？例如：按城市统计已支付订单金额（模型只能在已勾选的表的真实字段里挑）',
+  diagnose: '把报错原文贴进来，SQL 用编辑器里当前那段',
+};
+
+export interface AgentPanelProps {
+  /** 这轮对话依据的上下文（连的哪个库、用哪些表），由宿主拼好；空则不显示 */
+  hint?: string;
+  /** 生成出的 SQL 落到哪里。不给就不显示「填进编辑器」 */
+  onUseSql?: (sql: string) => void;
+}
+
+export function AgentPanel({ hint, onUseSql }: AgentPanelProps) {
   const [input, setInput] = useState('');
-  const { messages, addMessage, query, optimize, analyze, diagnoseError } = useAgentStore();
-  const [loading, setLoading] = useState(false);
+  const [intent, setIntent] = useState<AgentIntent>('query');
+  const { messages, busy, ask, clear } = useAgentStore();
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -31,61 +48,19 @@ export const AgentPanel: React.FC = () => {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, loading]);
+  }, [messages, busy]);
 
-  const handleSend = async () => {
-    if (!input.trim()) return;
-
-    setLoading(true);
-
-    try {
-      // 尝试智能识别用户意图
-      const text = input.toLowerCase();
-
-      // T-049 统一意图入口：先显式意图，再回退到关键词猜测。
-      // 所有 Agent 路径已通过 AgentManager 统一返回 NOT_CONFIGURED（如不可用），
-      // 面板只负责 intent 路由，不重复上述 store 内的 fallback
-      // （关键字猜测保留作兼容层；S3 会替换为显式 intent 选择器）
-      let response;
-      if (text.includes('优化') || text.includes('改进')) {
-        // 优化 SQL
-        response = await optimize(input.replace(/优化|改进/i, ''));
-      } else if (text.includes('分析') || text.includes('结果')) {
-        // 分析结果
-        response = await analyze(input.replace(/分析|结果/i, ''), {});
-      } else if (text.includes('错误') || text.includes('问题')) {
-        // 错误诊断
-        response = await diagnoseError(input, '');
-      } else {
-        // 默认查询
-        response = await query(input);
-      }
-
-      if (!response.success) {
-        addMessage({
-          id: Date.now().toString(),
-          role: 'agent',
-          content: `错误: ${response.error || '未知错误'}`,
-          timestamp: Date.now(),
-        });
-      }
-    } catch (error: any) {
-      addMessage({
-        id: Date.now().toString(),
-        role: 'agent',
-        content: `系统错误: ${error.message}`,
-        timestamp: Date.now(),
-      });
-    } finally {
-      setLoading(false);
-      setInput('');
-    }
+  const send = () => {
+    const body = input.trim();
+    if (!body || busy) return;
+    setInput('');
+    void ask(intent, body);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      send();
     }
   };
 
@@ -94,16 +69,48 @@ export const AgentPanel: React.FC = () => {
       title={
         <Space>
           <RobotOutlined style={{ fontSize: '20px', color: '#1890ff' }} />
-          <span>AI Agent 助手</span>
+          <span>Agent 问数</span>
         </Space>
       }
       style={{ height: '600px', display: 'flex', flexDirection: 'column' }}
+      styles={{ body: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } }}
+      extra={
+        messages.length > 0 ? (
+          <Button size="small" type="text" onClick={clear}>
+            清空对话
+          </Button>
+        ) : null
+      }
     >
+      <Segmented
+        size="small"
+        block
+        value={intent}
+        onChange={(v) => setIntent(v as AgentIntent)}
+        options={[
+          { label: '生成 SQL', value: 'query' },
+          { label: '诊断报错', value: 'diagnose' },
+        ]}
+      />
+      {hint && (
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', margin: '6px 0 8px' }}>
+          {hint}
+        </Text>
+      )}
+
       {/* 消息列表 */}
-      <div style={{ flex: 1, overflowY: 'auto', marginBottom: 16, paddingRight: 8 }}>
+      <div style={{ flex: 1, overflowY: 'auto', margin: '8px 0 16px', paddingRight: 8 }}>
         <List
           dataSource={messages}
-          renderItem={(msg) => (
+          locale={{ emptyText: '还没有对话。上面选一个意图，说一句试试。' }}
+          renderItem={(msg) =>
+            msg.role === 'system' ? (
+              <List.Item style={{ justifyContent: 'center', border: 'none', padding: '2px 0' }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {msg.content} · {new Date(msg.timestamp).toLocaleTimeString()}
+                </Text>
+              </List.Item>
+            ) : (
             <List.Item
               style={{
                 justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
@@ -111,7 +118,7 @@ export const AgentPanel: React.FC = () => {
             >
               <div
                 style={{
-                  maxWidth: '80%',
+                  maxWidth: '86%',
                   backgroundColor: msg.role === 'user' ? '#1890ff' : '#f0f0f0',
                   color: msg.role === 'user' ? '#fff' : '#000',
                   padding: '12px 16px',
@@ -122,22 +129,10 @@ export const AgentPanel: React.FC = () => {
                 }}
               >
                 <div style={{ marginBottom: 8 }}>
-                  <Space size="small">
-                    <Avatar
-                      size={24}
-                      icon={msg.role === 'user' ? <Text>A</Text> : <RobotOutlined />}
-                      style={{
-                        backgroundColor: msg.role === 'user' ? '#fff' : '#1890ff',
-                        color: msg.role === 'user' ? '#1890ff' : '#fff',
-                      }}
-                    />
-                    <Text strong>{msg.role === 'user' ? '你' : 'AI Agent'}</Text>
-                  </Space>
+                  <Text strong>{msg.role === 'user' ? '你' : 'Agent'}</Text>
                 </div>
-                
-                <div style={{ marginBottom: 8, whiteSpace: 'pre-wrap' }}>
-                  {msg.content}
-                </div>
+
+                <div style={{ marginBottom: 8, whiteSpace: 'pre-wrap' }}>{msg.content}</div>
 
                 {msg.sql && (
                   <div
@@ -149,10 +144,21 @@ export const AgentPanel: React.FC = () => {
                       fontSize: '12px',
                       maxWidth: '100%',
                       overflowX: 'auto',
+                      whiteSpace: 'pre-wrap',
                     }}
                   >
-                    <Text code>{msg.sql}</Text>
+                    {msg.sql}
                   </div>
+                )}
+
+                {msg.sql && onUseSql && (
+                  <Button
+                    size="small"
+                    style={{ marginTop: 8 }}
+                    onClick={() => onUseSql(msg.sql as string)}
+                  >
+                    填进编辑器
+                  </Button>
                 )}
 
                 <Text type="secondary" style={{ fontSize: '12px', marginTop: 4 }}>
@@ -160,16 +166,29 @@ export const AgentPanel: React.FC = () => {
                 </Text>
               </div>
             </List.Item>
-          )}
+            )
+          }
         />
-        {loading && (
+        {busy && (
           <div style={{ textAlign: 'center', padding: 8 }}>
             <Spin size="small" />
-            <Text type="secondary" style={{ marginLeft: 8 }}>Agent 正在思考...</Text>
+            <Text type="secondary" style={{ marginLeft: 8 }}>
+              正在问模型…
+            </Text>
           </div>
         )}
         <div ref={messagesEndRef} />
       </div>
+
+      {messages.length > 0 && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 8 }}
+          title="这里不会替你执行 SQL"
+          description="生成出来的语句要你自己看过再点运行；写操作另走审批门禁。"
+        />
+      )}
 
       {/* 输入框 */}
       <Space size="small" style={{ width: '100%' }}>
@@ -177,27 +196,14 @@ export const AgentPanel: React.FC = () => {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="输入自然语言描述... (例如: 查询所有用户表)"
+          placeholder={INTENT_PLACEHOLDER[intent]}
           rows={2}
           style={{ flex: 1 }}
         />
-        <Button
-          type="primary"
-          icon={<SendOutlined />}
-          onClick={handleSend}
-          disabled={!input.trim() || loading}
-        />
-      </Space>
-
-      {/* 快捷操作 */}
-      <Space size="small" style={{ marginTop: 8 }} wrap>
-        <Tag color="processing">查询</Tag>
-        <Tag color="warning">优化</Tag>
-        <Tag color="success">分析</Tag>
-        <Tag color="error">诊断</Tag>
+        <Button type="primary" icon={<SendOutlined />} onClick={send} disabled={!input.trim() || busy} />
       </Space>
     </Card>
   );
-};
+}
 
 export default AgentPanel;

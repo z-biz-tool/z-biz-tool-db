@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import SqlEditor from "./components/SqlEditor";
 import {
   ConfigProvider,
@@ -71,7 +71,9 @@ import AgentPanel from "./agent/AgentPanel";
 import { ReportWorkbench } from "./report/ReportWorkbench";
 import { aiSqlGenerate, catalogColumns, reportDescribeColumns } from "./report/api";
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
+import type { BackendConfig } from "./report/api";
 import type { CatalogTable, SqlDraft } from "./report/types";
+import type { AgentIntent, AgentResponse } from "./agent/types";
 
 // 渐变色主题常量
 const brandGradient = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
@@ -422,19 +424,13 @@ function App() {
       setQueryColumnsMeta(result.column_meta ?? []);
       setQueryResults(result.rows || []);
 
-      // 添加到 Agent 历史
+      // 执行记录落进 Agent 会话，但标成 system：那是刚发生过的事，不是用户打的一句话
       useAgentStore.getState().addMessage({
-        id: Date.now().toString(),
-        role: "user",
-        content: `执行查询: ${sqlCode}`,
-        timestamp: Date.now(),
-      });
-
-      useAgentStore.getState().addMessage({
-        id: (Date.now() + 1).toString(),
-        role: "agent",
-        content: `查询返回 ${result.rows?.length || 0} 行结果`,
-        sql: sqlCode,
+        id: `${Date.now().toString(36)}-run`,
+        role: "system",
+        content: `已执行一条语句，返回 ${result.rows?.length || 0} 行，耗时 ${
+          result.execution_time_ms || 0
+        }ms`,
         timestamp: Date.now(),
       });
 
@@ -561,6 +557,40 @@ function App() {
       .catch(() => {});
   }, []);
 
+  // 一次问数用的表目录。列清单读不到的表要丢掉：没有列清单，后端的列校验对那张表形同虚设。
+  // 「生成 SQL」按钮与 Agent 对话共用这一份，两边给模型的字段必须一模一样。
+  const buildAiCatalog = useCallback(
+    async (
+      names: string[],
+      cfg: BackendConfig
+    ): Promise<{ catalog: CatalogTable[]; failed: string[] }> => {
+      const built = await Promise.all(
+        names.map(async (name) => {
+          const schema = tables.find((t) => t.name === name)?.schema || "";
+          try {
+            const cols = await reportDescribeColumns(cfg, schema, name);
+            const entry: CatalogTable = {
+              connection_id: cfg.id,
+              connection_name: cfg.name,
+              database_type: cfg.db_type,
+              schema,
+              table: name,
+              ...catalogColumns(cols),
+            };
+            return { entry, failed: "" };
+          } catch (e: any) {
+            return { entry: null, failed: `${name}：${e}` };
+          }
+        })
+      );
+      return {
+        catalog: built.map((b) => b.entry).filter((t): t is CatalogTable => t !== null),
+        failed: built.map((b) => b.failed).filter(Boolean),
+      };
+    },
+    [tables]
+  );
+
   // AI 生成 SQL：自然语言 → 一条过了本机校验的 SQL（后端只看得见我们给的表与列）
   const handleAiGenerateSql = async () => {
     const question = aiNaturalLanguage.trim();
@@ -589,28 +619,7 @@ function App() {
     setAiDraftError("");
     setAiDraftPrecheck(false);
     try {
-      // 列清单读不到的表要丢掉：没有列清单，后端的列校验对那张表形同虚设
-      const built = await Promise.all(
-        wanted.map(async (name) => {
-          const schema = tables.find((t) => t.name === name)?.schema || "";
-          try {
-            const cols = await reportDescribeColumns(cfg, schema, name);
-            const entry: CatalogTable = {
-              connection_id: cfg.id,
-              connection_name: cfg.name,
-              database_type: cfg.db_type,
-              schema,
-              table: name,
-              ...catalogColumns(cols),
-            };
-            return { entry, failed: "" };
-          } catch (e: any) {
-            return { entry: null, failed: `${name}：${e}` };
-          }
-        })
-      );
-      const catalog = built.map((b) => b.entry).filter((t): t is CatalogTable => t !== null);
-      const failed = built.map((b) => b.failed).filter(Boolean);
+      const { catalog, failed } = await buildAiCatalog(wanted, cfg);
       if (!catalog.length) {
         setAiDraftError(`没能读到任何表的列清单：\n${failed.join("\n")}`);
         setAiDraftPrecheck(true);
@@ -712,6 +721,86 @@ function App() {
     await runAiText(() => aiExplainResults(sqlCode, sample, aiConfigForReport));
   };
 
+  // 对话这一轮能用到哪些表：和「生成 SQL」页同一条回退规则，两边不能各说各话
+  const agentTables = aiGenTables.length ? aiGenTables : selectedTable ? [selectedTable] : [];
+  const agentHint = !selectedConnection
+    ? "未连接数据库：先在左侧连上，模型只能查已连上的那个库"
+    : `已连 ${selectedConnection.name}（${selectedConnection.type}）· 本轮可选表：${
+        agentTables.join("、") || "未选"
+      }`;
+
+  // Agent 对话的真实实现（T-073）：面板只交过来意图和那句话，连接、表目录、
+  // 编辑器当前 SQL 这些上下文只有这里拿得到。两条链路都不碰库：
+  // query 出的 SQL 要用户自己点填进编辑器再运行，diagnose 只回文字。
+  const agentAsk = async (intent: AgentIntent, text: string): Promise<AgentResponse> => {
+    if (!aiConfig.baseUrl || !aiConfig.apiKey || !aiConfig.model) {
+      setShowAiConfigModal(true);
+      return {
+        success: false,
+        content: "",
+        error: "先配置 AI 服务地址、密钥与模型（配置窗口已打开）",
+      };
+    }
+    if (!selectedConnection) {
+      return { success: false, content: "", error: "先在左侧连上数据库：模型只能查已连上的那个库" };
+    }
+    try {
+      if (intent === "diagnose") {
+        // 报错原文就是用户刚打的那句，SQL 取编辑器当前那段——对话里再手抄一遍没有意义
+        if (!sqlCode.trim()) {
+          return {
+            success: false,
+            content: "",
+            error: "编辑器里没有 SQL：诊断要先有报错对应的那条语句",
+          };
+        }
+        return { success: true, content: await aiDiagnoseError(text, sqlCode, aiConfigForReport) };
+      }
+      if (!agentTables.length) {
+        return {
+          success: false,
+          content: "",
+          error: "先勾选这次要用的表（或在左侧选中一张），模型没有列清单就只能编字段",
+        };
+      }
+      const { catalog, failed } = await buildAiCatalog(agentTables, toBackendConfig(selectedConnection));
+      if (!catalog.length) {
+        return {
+          success: false,
+          content: "",
+          error: `这一稿根本没发给模型：列清单一张都没读到\n${failed.join("\n")}`,
+        };
+      }
+      const draft = await aiSqlGenerate(text, catalog, aiConfigForReport);
+      const lines = [
+        `只用 ${catalog.length} 张表的真实字段生成，引用了 ${
+          draft.tables.join("、") || "（没引用目录里的表）"
+        }，方言 ${draft.dialect}。`,
+        draft.repairs > 0 ? `本机校验打回 ${draft.repairs} 次后才通过。` : "一次就过了本机校验。",
+      ];
+      if (failed.length) lines.push(`读不到列清单、这次没带上：${failed.join("；")}`);
+      if (draft.warnings.length) lines.push(`提示：${draft.warnings.join("；")}`);
+      // 不直接盖编辑器：面板留了「填进编辑器」，什么时候落由用户定
+      return { success: true, content: lines.join("\n"), sql: draft.sql };
+    } catch (e: any) {
+      // 后端把 HTTP 状态码与本机校验的拒因原样带回来，别只留一句"失败"
+      return { success: false, content: "", error: String(e) };
+    }
+  };
+
+  // 只登记一次转发函数：agentAsk 每次渲染都是新闭包（要读当前编辑器内容），
+  // 直接登记会让 store 跟着每次按键换引用。
+  const agentAskRef = useRef(agentAsk);
+  agentAskRef.current = agentAsk;
+  const askAgent = useCallback(
+    (intent: AgentIntent, text: string) => agentAskRef.current(intent, text),
+    []
+  );
+  useEffect(() => {
+    useAgentStore.getState().setHandler(askAgent);
+    return () => useAgentStore.getState().setHandler(null);
+  }, [askAgent]);
+
   // 打开 AI 助手：三条 SQL 输入默认用编辑器当前内容，手抄一遍没有意义
   const openAiAssistant = () => {
     const cur = sqlCode.trim();
@@ -755,27 +844,11 @@ function App() {
     setColumns([]);
     msgApi.success(`已连接到 ${connection.name}`);
 
-    // 设置 Agent 上下文
-    useAgentStore.getState().setContext({
-      connectionId: connection.id,
-      databaseType: connection.type,
-      databaseName: connection.database,
-    });
-
+    // Agent 不再存一份"上下文"副本：它那一轮问数直接读这里的 selectedConnection
+    // 与勾选表，两份状态迟早会对不上（T-073）。
     try {
       const list = await invoke<TableInfo[]>("get_tables", { config: cfg });
       setTables(list);
-
-      // 更新 Agent 上下文的表信息
-      useAgentStore.getState().setContext({
-        connectionId: connection.id,
-        databaseType: connection.type,
-        databaseName: connection.database,
-        tables: list.map((t) => ({
-          name: t.name,
-          columns: [], // TODO: 从后端获取列信息
-        })),
-      });
     } catch (e: any) {
       msgApi.warning(`获取表列表失败: ${e}`);
     }
@@ -1940,12 +2013,18 @@ function App() {
               label: (
                 <Space>
                   <RobotOutlined />
-                  Agent 对话（未接通）
+                  Agent 问数
                 </Space>
               ),
               children: (
                 <div style={{ height: 480 }}>
-                  <AgentPanel />
+                  <AgentPanel
+                    hint={agentHint}
+                    onUseSql={(sql) => {
+                      setSqlCode(sql);
+                      msgApi.success("已填进编辑器，运行前自己过一眼");
+                    }}
+                  />
                 </div>
               ),
             },

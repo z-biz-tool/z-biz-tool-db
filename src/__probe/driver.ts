@@ -123,6 +123,84 @@ export function installDriver() {
       Array.from(document.querySelectorAll("textarea"))
         .map((t) => t.value)
         .find((v) => v.includes("connection_id")) || "",
+    /** Agent 输入框：按 placeholder 认。页面里 textarea 不止一个（CodeMirror、
+     *  自然语言描述、规格 JSON 都是），抓第一个会填到别处去还不报错。 */
+    chatBox: () => {
+      const tas = Array.from(document.querySelectorAll("textarea")) as HTMLTextAreaElement[];
+      const ta = tas.find(
+        (t) => (t.placeholder || "").includes("想要查什么") || (t.placeholder || "").includes("报错原文")
+      );
+      if (!ta) throw new Error(`没有 Agent 输入框（placeholder 有：${tas.map((x) => x.placeholder).join(" | ")}）`);
+      return ta;
+    },
+    typeChat: (text: string) => {
+      const ta = w.__probe.chatBox();
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+      setter.call(ta, text);
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+    },
+    /** 意图切换：生成 SQL / 诊断报错 */
+    pickIntent: async (label: string) => {
+      const items = Array.from(document.querySelectorAll(".ant-segmented-item"));
+      const it = items.find((x) => (x.textContent || "").trim() === label);
+      if (!it) throw new Error(`没有这个意图：${label}（有 ${items.map((x) => x.textContent).join("|")}）`);
+      w.__PROBE_CLICK(it.querySelector(".ant-segmented-item-label") || it);
+      await sleep(80);
+    },
+    /** 发送：同一个 Card 里那个主按钮（只有图标，文案为空，所以按 class 认） */
+    sendChat: async () => {
+      const card = w.__probe.chatBox().closest(".ant-card") as Element | null;
+      const btn = Array.from(card ? card.querySelectorAll("button") : []).find((b: Element) =>
+        b.className.includes("ant-btn-primary")
+      ) as HTMLButtonElement | undefined;
+      if (!btn) throw new Error("Agent 面板里没有发送按钮");
+      if (btn.disabled) throw new Error("发送按钮是禁用状态");
+      w.__PROBE_CLICK(btn);
+      await sleep(300);
+    },
+    /** 会话气泡文本（含 system 那行），用来验"用户那句有没有回声、回答有没有落屏" */
+    bubbles: () =>
+      Array.from(document.querySelectorAll(".ant-list-item")).map((li) =>
+        (li.textContent || "").trim().replace(/\s+/g, " ")
+      ),
+    /** 连上左侧某条连接 */
+    connect: async (label: string) => {
+      const li = Array.from(document.querySelectorAll(".ant-menu-item")).find((x) =>
+        (x.textContent || "").includes(label)
+      );
+      if (!li) throw new Error(`左侧没有这条连接：${label}`);
+      w.__PROBE_CLICK(li);
+      await sleep(700);
+    },
+    /** 顶栏那个只有图标的 AI 助手按钮 → 开弹窗并切到指定页签 */
+    openAiTab: async (tab: string) => {
+      const btn = Array.from(document.querySelectorAll("button")).find(
+        (b) => b.querySelector(".anticon-robot") && !(b.textContent || "").trim()
+      );
+      if (!btn) throw new Error("顶栏没有 AI 助手按钮");
+      w.__PROBE_CLICK(btn);
+      await sleep(600);
+      w.__probe.clickTab(tab);
+      await sleep(300);
+    },
+    /** 在「生成 SQL」页勾一张表（要先看过那一页，页签内容才在 DOM 里） */
+    pickGenTable: async (label: string) => {
+      const item = Array.from(document.querySelectorAll(".ant-form-item-label")).find((x) =>
+        (x.textContent || "").includes("这次要用的表")
+      );
+      if (!item) throw new Error("没有「这次要用的表」这一项（先切到生成 SQL 页）");
+      const sel = (item.closest(".ant-form-item") as Element).querySelector(".ant-select-content");
+      w.__PROBE_CLICK(sel);
+      await sleep(200);
+      const o = Array.from(
+        document.querySelectorAll(
+          ".ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option"
+        )
+      ).find((x) => x.getAttribute("title") === label);
+      if (!o) throw new Error(`表下拉里没有 ${label}`);
+      w.__PROBE_CLICK(o);
+      await sleep(200);
+    },
     tags: () => Array.from(document.querySelectorAll(".ant-tag")).map((t) => (t.textContent || "").trim()),
     alerts: () =>
       Array.from(document.querySelectorAll(".ant-alert")).map((a) =>

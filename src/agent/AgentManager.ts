@@ -1,63 +1,69 @@
-import { create } from 'zustand';
-import { AgentConfig, AgentMessage, AgentContext, AgentResponse } from './types';
+import { create } from "zustand";
+import { AgentIntent, AgentMessage, AgentResponse } from "./types";
+
+/** 宿主应用登记的真实实现：面板只收意图和那句话，不认识任何后端命令。 */
+export type AgentHandler = (intent: AgentIntent, text: string) => Promise<AgentResponse>;
 
 interface AgentStore {
-  config: AgentConfig;
   messages: AgentMessage[];
-  context: AgentContext;
+  /** 这一轮还在等后端 */
+  busy: boolean;
+  handler: AgentHandler | null;
   addMessage: (message: AgentMessage) => void;
-  setContext: (context: AgentContext) => void;
-  query: (naturalLanguage: string) => Promise<AgentResponse>;
-  optimize: (sql: string) => Promise<AgentResponse>;
-  analyze: (sql: string, results: any) => Promise<AgentResponse>;
-  diagnoseError: (error: string, sql: string) => Promise<AgentResponse>;
+  setHandler: (handler: AgentHandler | null) => void;
+  clear: () => void;
+  ask: (intent: AgentIntent, text: string) => Promise<void>;
 }
 
-/**
- * T-005：S0 止血。所有 Agent 路径均尚未接通真实服务；任何未接通的方法
- * 都直接返回"服务未配置"错误，禁止伪造 SQL 或示例响应。
- * 后端 agent_* 命令也已去掉静默重执行 SQL 行为（DB-04 / A08）。
- */
-const NOT_CONFIGURED: AgentResponse = {
-  success: false,
-  content: '',
-  error: 'Agent 服务未配置；S0 阶段所有路径均不可用。请前往设置配置后端服务后再试。',
-};
+/** 面板可以被没有后端的宿主单独挂上去，那时不许伪造回答（T-005 那条闸）。 */
+const NO_HANDLER = "没有可用的后端实现：宿主应用没给 Agent 登记处理函数";
 
-export const useAgentStore = create<AgentStore>((set) => ({
-  config: {
-    id: 'default-agent',
-    name: 'SQL Agent',
-    description: '数据库查询助手',
-    provider: 'local',
-  },
+const nextId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+export const useAgentStore = create<AgentStore>((set, get) => ({
   messages: [],
-  context: {
-    connectionId: '',
-    databaseType: '',
-    databaseName: '',
-  },
+  busy: false,
+  handler: null,
 
-  addMessage: (message) => set((state) => ({
-    messages: [...state.messages, message],
-  })),
+  addMessage: (message) =>
+    set((state) => ({ messages: [...state.messages, message] })),
 
-  setContext: (context) => set({ context }),
+  setHandler: (handler) => set({ handler }),
 
-  query: async (_naturalLanguage) => {
-    return NOT_CONFIGURED;
-  },
+  clear: () => set({ messages: [] }),
 
-  optimize: async (_sql) => {
-    return NOT_CONFIGURED;
-  },
-
-  // T-004：结果分析仅接 resultData，禁止再次执行 SQL。
-  analyze: async (_sql, _results) => {
-    return NOT_CONFIGURED;
-  },
-
-  diagnoseError: async (_error, _sql) => {
-    return NOT_CONFIGURED;
+  /** 一轮对话：先把用户那句贴进会话，再交给宿主登记的实现。
+   *  两边的消息都在 store 里落账，面板才不会"发出去却什么都没看见"。 */
+  ask: async (intent, text) => {
+    const body = text.trim();
+    if (!body || get().busy) return;
+    set((state) => ({
+      busy: true,
+      messages: [
+        ...state.messages,
+        { id: nextId(), role: "user", content: body, timestamp: Date.now() },
+      ],
+    }));
+    const reply = (content: string, sql?: string) =>
+      set((state) => ({
+        messages: [
+          ...state.messages,
+          { id: nextId(), role: "agent", content, sql, timestamp: Date.now() },
+        ],
+      }));
+    const handler = get().handler;
+    try {
+      if (!handler) {
+        reply(`错误: ${NO_HANDLER}`);
+        return;
+      }
+      const res = await handler(intent, body);
+      if (res.success) reply(res.content, res.sql);
+      else reply(`错误: ${res.error || "未知错误"}`);
+    } catch (e: any) {
+      reply(`系统错误: ${e?.message || e}`);
+    } finally {
+      set({ busy: false });
+    }
   },
 }));

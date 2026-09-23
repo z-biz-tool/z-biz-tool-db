@@ -208,6 +208,11 @@ function invoke(cmd: string, args: any): Promise<any> {
     case "ai_sql_generate": {
       const catalog: any[] = a.catalog || [];
       const question = String(a.question || "");
+      // 镜像 ai_sql_generate → HttpModel::new：模型名空则在发请求之前就拒。
+      // 不补这条，前端"先配置 AI"那道闸在探针里删掉也是绿的。
+      if (!String((a.config || {}).model || "").trim()) {
+        return fail("请先在设置中填写 AI 模型名");
+      }
       // 与 Rust generate() 同序的前置门槛
       if (!question.trim()) return fail("先描述你想查什么");
       if (!catalog.length) return fail("先选至少一张表，模型没有列清单就只能编字段");
@@ -305,7 +310,9 @@ function invoke(cmd: string, args: any): Promise<any> {
     case "load_connections":
       return Promise.resolve((fixture as any).connections);
     case "get_ai_config":
-      return Promise.resolve((fixture as any).ai_config);
+      // ?noaicfg=1 当成"还没配过 AI"：没有这条注入，前端那道
+      // "先配置 AI 服务地址、密钥与模型"的闸在探针里删掉也量不出来
+      return Promise.resolve(window.__PROBE_FLAG("noaicfg") ? null : (fixture as any).ai_config);
     case "load_query_history":
       return Promise.resolve((fixture as any).history || []);
     case "load_saved_queries":
@@ -341,6 +348,12 @@ function invoke(cmd: string, args: any): Promise<any> {
     case "ai_explain_sql":
     case "ai_diagnose_error":
     case "ai_explain_results": {
+      // 镜像 lib.rs 里这四条命令共用的第一道门槛：缺地址或密钥就在发请求前拒。
+      // 没有这条，前端"先配置 AI"那道闸删掉探针照样绿。
+      const cfg = a.config || {};
+      if (!cfg.base_url || !cfg.api_key) {
+        return fail("请先在设置中配置 AI 参数");
+      }
       if (window.__PROBE_FLAG("aitextfail")) {
         return fail('AI 服务返回 401 Unauthorized：{"error":{"message":"invalid api key"}}');
       }
