@@ -1408,6 +1408,115 @@ mod tests {
         assert_eq!(payload.generated_sql.len(), 2);
     }
 
+    /// 挑表这一步以前只对着手写清单测过。这条测它在真库上用得上：候选由两个真实
+    /// SQLite 文件的 get_tables 列出来，模型只回 connection_id + table，
+    /// 挑完直接用真 describe_columns 建目录 → 起草 → 跨库出数。
+    /// 中间任何一环编了张不存在的表或列，这条就会断在真库上，而不是断在假目录里。
+    #[tokio::test]
+    async fn ai_pick_tables_feeds_a_real_cross_db_catalog() {
+        use crate::report::ai::{self, CatalogTable, TableCandidate};
+        use std::collections::HashMap;
+
+        /// 按脚本回两个答案的模型：挑表一次、起草一次
+        struct ChainScripted {
+            answers: Vec<String>,
+            prompts: std::sync::Mutex<Vec<String>>,
+        }
+        impl ai::Model for ChainScripted {
+            fn complete(
+                &self,
+                prompt: String,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>,
+            > {
+                self.prompts.lock().unwrap().push(prompt);
+                let n = self.prompts.lock().unwrap().len();
+                let answer = self
+                    .answers
+                    .get(n - 1)
+                    .cloned()
+                    .unwrap_or_else(|| "not a json at all".into());
+                Box::pin(async move { Ok(answer) })
+            }
+        }
+
+        let db = temp_db();
+        let (shop, crm) = seed_shop_crm(&db).await;
+        let cfgs = vec![shop.clone(), crm.clone()];
+        let mut cands: Vec<TableCandidate> = Vec::new();
+        for cfg in &cfgs {
+            for t in crate::get_tables(cfg.clone()).await.unwrap() {
+                cands.push(TableCandidate {
+                    connection_id: cfg.id.clone(),
+                    connection_name: cfg.name.clone(),
+                    database_type: cfg.db_type.clone(),
+                    schema: t.schema.unwrap_or_default(),
+                    table: t.name,
+                });
+            }
+        }
+        assert_eq!(cands.len(), 2, "两个库各一张表：{:?}", cands);
+
+        let pick_raw = r#"{"tables":[{"connection_id":"shop","table":"orders"},
+{"connection_id":"crm","table":"users"}],"reason":"成交额看订单，城市看客户库"}"#;
+        let draft_raw = r#"{"datasets":[{"id":"city-gmv","name":"城市成交额","base":"o",
+          "sources":[{"alias":"o","connection_id":"shop","table":"orders"},
+                     {"alias":"u","connection_id":"crm","table":"users"}],
+          "joins":[{"source":"u","on":[{"left":"user_id","right":"id"}]}],
+          "filters":["status = 'paid'"],"group_by":["city"],
+          "aggregates":[{"output":"gmv","func":"SUM","column":"amount"}]}],
+         "view":{"id":"board","name":"成交看板","widgets":[
+           {"id":"bar","type":"BAR","title":"分城市","dataset":"city-gmv","encode":{"x":"city","y":"gmv"}}
+         ]}}"#;
+        let model = ChainScripted {
+            answers: vec![pick_raw.into(), draft_raw.into()],
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let picked = ai::pick(&model, "各城市成交额", &cands, 2, None, None)
+            .await
+            .unwrap();
+        assert_eq!(picked.repairs, 0);
+        assert_eq!(picked.picked.len(), 2);
+        // 挑中的表名必须能在真库里问到列清单：这一句就足以拦下"模型多编了一张表"
+        let mut catalog: Vec<CatalogTable> = Vec::new();
+        for c in &picked.picked {
+            let cfg = cfgs.iter().find(|x| x.id == c.connection_id).unwrap();
+            let cols = describe_columns_typed(cfg, &c.schema, &c.table).await.unwrap();
+            assert!(!cols.is_empty(), "{}.{} 的列清单是空的", c.connection_name, c.table);
+            let mut types = HashMap::new();
+            for col in &cols {
+                types.insert(col.name.clone(), col.data_type.clone());
+            }
+            catalog.push(CatalogTable {
+                connection_id: c.connection_id.clone(),
+                connection_name: c.connection_name.clone(),
+                database_type: c.database_type.clone(),
+                schema: c.schema.clone(),
+                table: c.table.clone(),
+                columns: cols.into_iter().map(|x| x.name).collect(),
+                column_types: types,
+            });
+        }
+
+        let draft = ai::draft(&model, "各城市成交额", &catalog, 2, None, None)
+            .await
+            .unwrap();
+        let payload = report_view_render(draft.view, draft.datasets, cfgs, None)
+            .await
+            .unwrap();
+        assert!(!payload.partial);
+        assert_eq!(
+            payload.charts[0].categories,
+            vec!["SH".to_string(), "BJ".into(), "SZ".into()]
+        );
+        assert_eq!(payload.generated_sql.len(), 2, "两个库各下推一条 SQL");
+        let prompts = model.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2, "挑表一次、起草一次，没有多余的拉锯");
+        // 起草那份提示词得带上从真库读到的列，否则模型又开始编字段
+        assert!(prompts[1].contains("amount"), "{}", prompts[1]);
+    }
+
     /// 跨库连接键的两条腿都要实测：文本侧写成 '01' 这种带前导零的键，规范化也救不回来，
     /// 告警所说的空表真的发生；文本侧写成 '1' 时 join 按规范化整数配得上，
     /// 此时仍提示写法风险但必须出行。同族连接键作对照——不然上面那条"空"不作数。
