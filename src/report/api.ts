@@ -11,11 +11,13 @@ import type {
   DatasetPayload,
   DatasetSpec,
   DraftResult,
+  PickResult,
   PriorDraft,
   PriorReport,
   SavedReport,
   SqlDraft,
   SqlPreview,
+  TableCandidate,
   ValidationReport,
   ViewPayload,
   ViewSpec,
@@ -72,8 +74,29 @@ export const aiReportDraft = (
     feedback: feedback ?? null,
   });
 
-/** 自然语言 → 一条 SQL。表与列由本机目录限定，编出来的字段会被后端打回。
- *  prior 是上一稿：追问式改稿时带上，后端会在提示词里请模型在旧稿上改，
+/** 自然语言 → 这次要用哪几张表（跨库）。候选是"本机各连接里的表名"，不含列清单：
+ *  读列清单要一张一张问库，几百张表全问一遍太贵，而挑表靠的就是表名和它属于哪个库。
+ *  后端逐字对着候选清单核对，编出来的表名/连接、同名歧义一次列全；挑中之后的
+ *  连接名与方言由本机回填。feedback / priorAnswer 与起草那条腿同构：被挡下时
+ *  错误原文要连同那份答案一起回喂，模型是单发的。 */
+export const aiReportPickTables = (
+  question: string,
+  candidates: TableCandidate[],
+  config: AIConfig,
+  maxRepairs?: number,
+  feedback?: string | null,
+  priorAnswer?: string | null
+): Promise<PickResult> =>
+  invoke<PickResult>("ai_report_pick_tables", {
+    question,
+    candidates,
+    config,
+    maxRepairs,
+    feedback: feedback ?? null,
+    priorAnswer: priorAnswer ?? null,
+  });
+
+/** 自然语言 → 一条 SQL。表与列由本机目录限定，编出来的字段会被后端打回。 *  prior 是上一稿：追问式改稿时带上，后端会在提示词里请模型在旧稿上改，
  *  改出来的稿子过的还是同一套本机校验（旧稿里的编造字段照样会被拦下）。
  *  feedback 是上一稿被本机挡下的原因（SqlReject.error）：点「让 AI 照这条错误改」时，
  *  前端把那个 error 和被挡下的 sql 一起带回来当 prior，缺任何一半都是在凭空重写。

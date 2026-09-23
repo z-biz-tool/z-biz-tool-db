@@ -806,6 +806,293 @@ pub fn parse_draft(raw: &str) -> Result<ReportDraft, String> {
     serde_json::from_str::<ReportDraft>(&json).map_err(|e| format!("草稿 JSON 不合法: {}", e))
 }
 
+// ==================== 跨库挑表（把"选哪几张表"也交给模型） ====================
+
+/// 一张候选表：只到表名这一级。列清单要一张一张问库，几百张表全问一遍既不现实
+/// 也没必要——挑表靠的是表名、它属于哪个库、什么方言；挑中之后的列清单另说。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableCandidate {
+    pub connection_id: String,
+    #[serde(default)]
+    pub connection_name: String,
+    pub database_type: String,
+    #[serde(default)]
+    pub schema: String,
+    pub table: String,
+}
+
+/// 模型交回的挑选结果（还没对着候选清单校验）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PickAnswer {
+    #[serde(default)]
+    pub tables: Vec<PickTable>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PickTable {
+    pub connection_id: String,
+    #[serde(default)]
+    pub schema: String,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PickResult {
+    /// 挑中的候选：整份从 candidates 里取，模型写不了的字段（连接名、方言）由本机填
+    pub picked: Vec<TableCandidate>,
+    /// 模型给的一句话理由，可空
+    pub reason: String,
+    pub repairs: u8,
+    /// 因为表太多而根本没进提示词的候选数：不说就等于让用户以为模型看过了全部
+    pub truncated: usize,
+    /// 不算错但要点名的取舍，例如"挑了 9 张，只留前 6 张"
+    pub warnings: Vec<String>,
+}
+
+/// 挑被本机挡下的回执：错误原文 + 被挡下的那份答案。
+/// 模型是单发的，只喂"清单里没有这张表"它认不出自己刚交了哪几张表。
+#[derive(Debug, Clone, Serialize)]
+pub struct PickReject {
+    pub error: String,
+    /// 还没见到模型输出就被拒（空问题、请求发不出去）时没有底稿
+    pub answer: Option<String>,
+}
+
+impl PickReject {
+    fn of(error: impl Into<String>) -> Self {
+        PickReject { error: error.into(), answer: None }
+    }
+}
+
+/// 一次摆进提示词的表名上限：桌面工具连着十几个库、每库几百张表很常见，
+/// 全塞进去既烧 token 也挑得飘，超出来的部分如实报给用户。
+pub const MAX_CANDIDATES: usize = 200;
+/// 一次报表最多带几张表：跨库 join 每多一张源，取数和内存 join 都翻倍
+pub const MAX_PICKED: usize = 6;
+
+fn pick_prompt(
+    question: &str,
+    cands: &[TableCandidate],
+    feedback: Option<&str>,
+    prior_answer: Option<&str>,
+) -> String {
+    let mut s =
+        String::from("你在为桌面数据库工具挑表：用户想要一张报表，先决定这次要用到哪几张表。\n需求：\n");
+    s.push_str(question.trim());
+    s.push_str("\n\n本机各连接里的表（连接 / 方言 / schema.表名，这次不给列清单）：\n");
+    for c in cands {
+        s.push_str(&format!(
+            "- connection_id={} | {} | {} | {}{}\n",
+            c.connection_id,
+            if c.connection_name.trim().is_empty() {
+                c.connection_id.as_str()
+            } else {
+                c.connection_name.trim()
+            },
+            c.database_type,
+            if c.schema.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{}.", c.schema.trim())
+            },
+            c.table
+        ));
+    }
+    s.push_str(
+        "\n跨库没问题：报表由每个库各自取数、在本机内存里 join，一条 SQL 不用跨库。\n\
+         只挑这次真的需要的表，最多 6 张；拿不准就少挑，别把整库拖进来。\n\
+         只回一个 JSON 对象，不要 Markdown、不要解释：\n\
+         {\"tables\":[{\"connection_id\":\"...\",\"schema\":\"...\",\"table\":\"...\"}],\"reason\":\"一句话\"}\n\
+         connection_id 和 table 必须逐字从上面那份清单里抄；schema 只在清单里写了前缀时才填。\n",
+    );
+    if let Some(pa) = prior_answer.map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        s.push_str("\n上一份挑选结果没通过本机核对，它回的是：\n");
+        s.push_str(pa);
+        s.push_str("\n请在它基础上按下面的原因调整，仍然只回 JSON。\n");
+    }
+    if let Some(fb) = feedback.map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        s.push_str("\n没通过的原因：\n");
+        s.push_str(fb);
+        s.push_str("\n上面点名的每一处都要改到位，重新输出完整 JSON。\n");
+    }
+    s
+}
+
+/// 把模型交回的答案对着候选清单核对：认不出的连接、表、同名歧义一次列全（与
+/// check_sql / check_draft 同口径，一轮只说一处等于放任模型改一处就交回来）。
+/// 命中的那些原样从 candidates 里取出来——连接名、方言本机知道，模型说了不算。
+pub fn check_pick(answer: &PickAnswer, cands: &[TableCandidate]) -> Result<(Vec<TableCandidate>, String), String> {
+    if answer.tables.is_empty() {
+        return Err("模型一张表都没挑出来：换个说法，或者手工勾选".into());
+    }
+    let mut problems: Vec<String> = Vec::new();
+    let mut picked: Vec<TableCandidate> = Vec::new();
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    let conns: Vec<String> = {
+        let mut v: Vec<String> = cands.iter().map(|c| c.connection_id.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let mut unknown_conn: Vec<String> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for t in &answer.tables {
+        let in_conn: Vec<&TableCandidate> =
+            cands.iter().filter(|c| same(&c.connection_id, &t.connection_id)).collect();
+        if in_conn.is_empty() {
+            if !unknown_conn.iter().any(|x| same(x, &t.connection_id)) {
+                unknown_conn.push(t.connection_id.clone());
+            }
+            continue;
+        }
+        let exact: Vec<&TableCandidate> = in_conn
+            .iter()
+            .filter(|c| same(&c.table, &t.table) && same(&c.schema, &t.schema))
+            .cloned()
+            .collect();
+        let hits: Vec<&TableCandidate> = if exact.is_empty() {
+            in_conn.iter().filter(|c| same(&c.table, &t.table)).cloned().collect()
+        } else {
+            exact
+        };
+        match hits.len() {
+            0 => {
+                let mut tables: Vec<String> = in_conn.iter().map(|c| c.table.clone()).collect();
+                tables.sort();
+                tables.dedup();
+                // 可用表摆在拒因里：不摆的话模型下一轮还是只能猜这张表该叫什么
+                problems.push(format!(
+                    "连接 {} 里没有表 {}（该连接的可用表：{}）",
+                    t.connection_id,
+                    t.table,
+                    tables.join(", ")
+                ));
+            }
+            1 => {
+                let c = hits[0];
+                let id = (
+                    c.connection_id.to_ascii_lowercase(),
+                    c.schema.to_ascii_lowercase(),
+                    c.table.to_ascii_lowercase(),
+                );
+                if seen.insert(id) {
+                    picked.push(c.clone());
+                }
+            }
+            n => {
+                ambiguous.push(format!("{}（{} 张同名，需补 schema）", t.table, n));
+            }
+        }
+    }
+    for conn in &unknown_conn {
+        problems.push(format!(
+            "清单里没有连接 {}（可用连接：{}）",
+            conn,
+            conns.join(", ")
+        ));
+    }
+    if !ambiguous.is_empty() {
+        ambiguous.sort();
+        ambiguous.dedup();
+        problems.push(format!(
+            "这些表名在同一个连接里出现了不止一次，请在 JSON 里补上 schema：{}",
+            ambiguous.join("、")
+        ));
+    }
+    problems.sort();
+    problems.dedup();
+    if !problems.is_empty() {
+        return Err(super::view::problem_list(&problems));
+    }
+    Ok((picked, answer.reason.trim().to_string()))
+}
+
+/// 挑表：问一次 → 对着本机清单核对 → 不通过就把错误原文连同它那份答案回喂，最多 repairs 次。
+/// 核对全在本地，模型编的表名根本进不了后面的起草与取数链路。
+pub async fn pick(
+    model: &dyn Model,
+    question: &str,
+    candidates: &[TableCandidate],
+    repairs: u8,
+    feedback: Option<&str>,
+    prior_answer: Option<&str>,
+) -> Result<PickResult, PickReject> {
+    if question.trim().is_empty() {
+        return Err(PickReject::of("先描述你想要什么报表，才知道要挑哪些表"));
+    }
+    if candidates.is_empty() {
+        return Err(PickReject::of("本机一张表都没读到：先连上数据库，或在报表目录里手工勾选"));
+    }
+    let rounds = repairs.min(MAX_REPAIRS);
+    let sent: Vec<TableCandidate> = candidates.iter().take(MAX_CANDIDATES).cloned().collect();
+    let truncated = candidates.len().saturating_sub(sent.len());
+    let mut feedback = feedback.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut prior = prior_answer.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut last = String::new();
+    for round in 0..=rounds {
+        let raw = model
+            .complete(pick_prompt(question, &sent, feedback.as_deref(), prior.as_deref()))
+            .await
+            .map_err(PickReject::of)?;
+        let json = match extract_json(&raw) {
+            Ok(j) => j,
+            Err(e) => {
+                last = e;
+                feedback = Some(last.clone());
+                prior = None;
+                continue;
+            }
+        };
+        let answer: PickAnswer = match serde_json::from_str(&json) {
+            Ok(a) => a,
+            Err(e) => {
+                last = format!("挑表结果 JSON 不合法: {e}");
+                feedback = Some(last.clone());
+                prior = Some(json.clone());
+                continue;
+            }
+        };
+        match check_pick(&answer, &sent) {
+            Ok((mut picked, reason)) => {
+                let mut warnings = Vec::new();
+                if truncated > 0 {
+                    warnings.push(format!(
+                        "本机共 {} 张表，只把前 {} 张给了模型，剩下的它没看见",
+                        candidates.len(),
+                        sent.len()
+                    ));
+                }
+                if picked.len() > MAX_PICKED {
+                    warnings.push(format!(
+                        "模型挑了 {} 张，只留前 {MAX_PICKED} 张：报表源太多会把取数和内存 join 拖垮",
+                        picked.len()
+                    ));
+                    picked.truncate(MAX_PICKED);
+                }
+                return Ok(PickResult {
+                    picked,
+                    reason,
+                    repairs: round,
+                    truncated,
+                    warnings,
+                });
+            }
+            Err(e) => {
+                last = e;
+                feedback = Some(last.clone());
+                // 回喂的是模型自己交的那份答案，不是核对器修好的那份
+                prior = Some(json.clone());
+            }
+        }
+    }
+    Err(PickReject {
+        error: format!("重试 {} 次后仍未通过本机核对：{}", rounds + 1, last),
+        answer: prior,
+    })
+}
+
 // ==================== Tauri 命令 ====================
 
 /// 自然语言 → 一整张报表草稿（数据集 + 组件），已经过本地校验。
@@ -829,6 +1116,31 @@ pub async fn ai_report_draft(
         max_repairs.unwrap_or(2),
         prior.as_ref(),
         feedback.as_deref(),
+    )
+    .await
+}
+
+/// 自然语言 + 本机各连接里的表名 → 这次要用哪几张（跨库）。
+/// 这一步只交表名：列清单要一张一张问库，全问一遍太贵，而挑表靠的就是表名和它属于哪个库。
+/// 挑中的那些由前端按张去读列清单，再交给 ai_report_draft 起草。
+/// feedback / prior_answer 与起草那条腿同构：错误原文连同被挡下的那份答案一起回喂。
+#[tauri::command]
+pub async fn ai_report_pick_tables(
+    question: String,
+    candidates: Vec<TableCandidate>,
+    config: AIConfig,
+    max_repairs: Option<u8>,
+    feedback: Option<String>,
+    prior_answer: Option<String>,
+) -> Result<PickResult, PickReject> {
+    let model = HttpModel::new(config).map_err(PickReject::of)?;
+    pick(
+        &model,
+        &question,
+        &candidates,
+        max_repairs.unwrap_or(2),
+        feedback.as_deref(),
+        prior_answer.as_deref(),
     )
     .await
 }
@@ -1707,5 +2019,163 @@ mod tests {
         assert!(e.contains("模型名"), "{}", e);
         // 地址留给 chat 统一报错：HttpModel 构造不该重复同一份校验
         assert!(HttpModel::new(cfg("", "k", "m")).is_ok());
+    }
+
+    // ==================== 跨库挑表 ====================
+
+    fn cand(conn: &str, name: &str, ty: &str, schema: &str, table: &str) -> TableCandidate {
+        TableCandidate {
+            connection_id: conn.into(),
+            connection_name: name.into(),
+            database_type: ty.into(),
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
+    /// 两条连接五张表，其中 shop 里两张同名 orders（一张在 archive schema）
+    fn candidates() -> Vec<TableCandidate> {
+        vec![
+            cand("shop", "商城库", "mysql", "", "orders"),
+            cand("shop", "商城库", "mysql", "archive", "orders"),
+            cand("shop", "商城库", "mysql", "", "payments"),
+            cand("crm", "客户库", "sqlite", "", "users"),
+            cand("crm", "客户库", "sqlite", "", "tickets"),
+        ]
+    }
+
+    fn pick_of(tables: &str, reason: &str) -> String {
+        format!(r#"{{"tables":{tables},"reason":"{reason}"}}"#)
+    }
+
+    fn answer(tables: &[&str]) -> String {
+        pick_of(&format!("[{}]", tables.join(",")), "先看成交额")
+    }
+
+    #[test]
+    fn check_pick_fills_connection_metadata_from_the_local_list() {
+        // 模型只说"要这张表"：连接名、方言、schema 都得本机填，不能让它带着走
+        let a: PickAnswer = serde_json::from_str(&answer(&[
+            r#"{"connection_id":"shop","table":"orders","connection_name":"编的","database_type":"oracle"}"#,
+            r#"{"connection_id":"crm","table":"users"}"#,
+        ]))
+        .unwrap();
+        let (picked, reason) = check_pick(&a, &candidates()).unwrap();
+        assert_eq!(picked.len(), 2);
+        assert_eq!(picked[0].connection_name, "商城库");
+        assert_eq!(picked[0].database_type, "mysql");
+        assert_eq!(picked[0].schema, "");
+        assert_eq!(picked[1].connection_id, "crm");
+        assert_eq!(reason, "先看成交额");
+    }
+
+    #[test]
+    fn check_pick_names_connection_table_and_ambiguity_in_one_verdict() {
+        // 三类错分三轮报，模型每轮只改得动一处：攒一份清单一次说完（与 check_sql 同口径）
+        let a: PickAnswer = serde_json::from_str(&answer(&[
+            r#"{"connection_id":"erp","table":"stock"}"#,
+            r#"{"connection_id":"shop","table":"invoicez"}"#,
+            r#"{"connection_id":"shop","schema":"x","table":"orders"}"#,
+        ]))
+        .unwrap();
+        let e = check_pick(&a, &candidates()).unwrap_err();
+        assert!(e.contains("共 3 处问题"), "{e}");
+        assert!(e.contains("清单里没有连接 erp（可用连接：crm, shop）"), "{e}");
+        assert!(e.contains("连接 shop 里没有表 invoicez"), "{e}");
+        // 可用表要一起给：只说"没有这张表"等于让模型下一轮接着猜
+        assert!(e.contains("该连接的可用表：orders, payments"), "{e}");
+        assert!(e.contains("补上 schema"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn pick_carries_the_rejected_answer_into_the_repair_round() {
+        // 单发模型看不见自己刚交了哪几张表：拒因要连同那份答案一起回喂
+        let first = answer(&[r#"{"connection_id":"shop","table":"invoicez"}"#]);
+        let second = answer(&[
+            r#"{"connection_id":"shop","table":"orders"}"#,
+            r#"{"connection_id":"crm","table":"users"}"#,
+        ]);
+        let model = scripted(vec![first.clone(), second.clone()]);
+        let out = pick(&model, "各城市成交额和下单用户", &candidates(), 2, None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.repairs, 1);
+        assert_eq!(out.picked.len(), 2);
+        let prompts = model.prompts.lock().unwrap();
+        assert!(prompts[1].contains("连接 shop 里没有表 invoicez"), "{}", prompts[1]);
+        assert!(prompts[1].contains("上一份挑选结果没通过本机核对"), "{}", prompts[1]);
+        assert!(prompts[1].contains("invoicez"), "{}", prompts[1]);
+        assert_eq!(prompts[1].matches("\"tables\"").count(), 2, "{}", prompts[1]);
+    }
+
+    #[tokio::test]
+    async fn pick_returns_the_last_answer_with_the_final_rejection() {
+        // 改稿那一键要两半都有：只把错误原文带回去，用户自己重述一遍才算改
+        let bad = answer(&[r#"{"connection_id":"shop","table":"invoicez"}"#]);
+        let model = scripted(vec![bad.clone(), bad.clone()]);
+        let e = pick(&model, "看发票", &candidates(), 1, None, None).await.unwrap_err();
+        assert!(e.error.contains("重试 2 次后仍未通过本机核对"), "{}", e.error);
+        assert!(e.error.contains("invoicez"), "{}", e.error);
+        assert_eq!(e.answer.as_deref().unwrap(), bad);
+    }
+
+    #[tokio::test]
+    async fn pick_rejects_an_answer_with_no_tables_at_all() {
+        let empty = pick_of("[]", "没想好");
+        let model = scripted(vec![empty.clone(), empty]);
+        let e = pick(&model, "随便看看", &candidates(), 1, None, None).await.unwrap_err();
+        assert!(e.error.contains("一张表都没挑出来"), "{}", e.error);
+    }
+
+    #[tokio::test]
+    async fn pick_stops_before_any_request_without_question_or_tables() {
+        // 空白需求 / 本机一张表都没读到：不该发出任何一次请求
+        let model = scripted(vec![]);
+        assert!(pick(&model, "  ", &candidates(), 2, None, None).await.is_err());
+        assert!(pick(&model, "各城市成交额", &[], 2, None, None).await.is_err());
+        assert!(model.prompts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pick_lists_at_most_two_hundred_tables_and_says_what_it_left_out() {
+        let mut many: Vec<TableCandidate> = (0..MAX_CANDIDATES + 50)
+            .map(|i| cand("shop", "商城库", "mysql", "", &format!("t{i}")))
+            .collect();
+        many.push(cand("crm", "客户库", "sqlite", "", "late_one"));
+        let model = scripted(vec![answer(&[r#"{"connection_id":"shop","table":"t7"}"#])]);
+        let out = pick(&model, "看第七张表", &many, 2, None, None).await.unwrap();
+        let prompts = model.prompts.lock().unwrap();
+        assert_eq!(prompts[0].matches("- connection_id=").count(), MAX_CANDIDATES);
+        assert!(!prompts[0].contains("late_one"), "超出上限的表不该进提示词");
+        assert_eq!(out.truncated, 51);
+        assert!(out.warnings.iter().any(|w| w.contains("只把前 200 张给了模型")), "{:?}", out.warnings);
+    }
+
+    #[tokio::test]
+    async fn pick_keeps_only_the_first_six_tables() {
+        let mut many = candidates();
+        for i in 0..4 {
+            many.push(cand("crm", "客户库", "sqlite", "", &format!("extra{i}")));
+        }
+        let seven: Vec<String> = ["shop|orders", "shop|payments", "crm|users", "crm|tickets", "crm|extra0", "crm|extra1", "crm|extra2"]
+            .iter()
+            .map(|x| {
+                let (c, t) = x.split_once('|').unwrap();
+                format!(r#"{{"connection_id":"{c}","table":"{t}"}}"#)
+            })
+            .collect();
+        let model = scripted(vec![answer(&seven.iter().map(|s| s.as_str()).collect::<Vec<_>>())]);
+        let out = pick(&model, "全部都要", &many, 2, None, None).await.unwrap();
+        assert_eq!(out.picked.len(), MAX_PICKED);
+        assert!(out.warnings.iter().any(|w| w.contains("只留前 6 张")), "{:?}", out.warnings);
+    }
+
+    #[tokio::test]
+    async fn pick_uses_the_schema_prefix_the_prompt_offered() {
+        // 同名表要靠 schema 分开；schema 是提示词里 "archive.orders" 那种写法给的
+        let model = scripted(vec![answer(&[r#"{"connection_id":"shop","schema":"archive","table":"orders"}"#])]);
+        let out = pick(&model, "看历史订单", &candidates(), 2, None, None).await.unwrap();
+        assert_eq!(out.picked.len(), 1);
+        assert_eq!(out.picked[0].schema, "archive");
     }
 }

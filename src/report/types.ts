@@ -266,6 +266,33 @@ export interface DraftReject {
   draft?: ReportDraft | null;
 }
 
+/** 一张候选表：跨库挑表这一步只到表名这一级（列清单要一张一张问库，太贵）。 */
+export interface TableCandidate {
+  connection_id: string;
+  connection_name: string;
+  database_type: string;
+  schema: string;
+  table: string;
+}
+
+/** 本机核对过后的挑表结果：picked 里的连接名、方言都来自本机清单，模型说了不算。
+ *  truncated = 因为表太多而根本没进提示词的表数，界面要如实说出来。 */
+export interface PickResult {
+  picked: TableCandidate[];
+  reason: string;
+  repairs: number;
+  truncated: number;
+  warnings: string[];
+}
+
+/** ai_report_pick_tables 被本机挡下的回执（后端 PickReject）：
+ *  answer 是被挡下的那份答案 JSON 原文，与 DraftReject.draft 同一个道理——
+ *  只回错误原文，模型认不出自己刚交了哪几张表。 */
+export interface PickReject {
+  error: string;
+  answer?: string | null;
+}
+
 /** 报表簿条目：存的是 spec 而不是结果，落盘在后端 queries.rs */
 export interface SavedReport {
   id: string;

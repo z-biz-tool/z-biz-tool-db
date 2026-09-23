@@ -2303,6 +2303,7 @@ pub fn run() {
             report::source::report_view_validate,
             report::source::report_view_render,
             report::ai::ai_report_draft,
+            report::ai::ai_report_pick_tables,
             save_report,
             load_reports,
             delete_report,

@@ -40,6 +40,7 @@ import {
 } from "@ant-design/icons";
 import {
   aiReportDraft,
+  aiReportPickTables,
   catalogColumns,
   columnSummary,
   deleteReport,
@@ -59,9 +60,12 @@ import type {
   DatasetSpec,
   DraftReject,
   DraftResult,
+  PickReject,
+  PickResult,
   PriorReport,
   ReportDraft,
   SavedReport,
+  TableCandidate,
   ViewPayload,
   ViewSpec,
 } from "./types";
@@ -82,6 +86,15 @@ const asDraftReject = (e: unknown): DraftReject => {
     return e as DraftReject;
   }
   return { error: String(e), draft: null };
+};
+
+/** 后端 ai_report_pick_tables 挡下时 reject 的也是结构化对象（错误原文 + 那份答案），
+ *  与 DraftReject 同样的坑：String(e) 只会得到 [object Object]。 */
+const asPickReject = (e: unknown): PickReject => {
+  if (e && typeof e === "object" && typeof (e as PickReject).error === "string") {
+    return e as PickReject;
+  }
+  return { error: String(e), answer: null };
 };
 
 /** 目录项的稳定键：连接 + schema + 表 */
@@ -420,6 +433,109 @@ export function ReportWorkbench({
       if (fix) await onDraft(fix);
     } finally {
       setAddingTable("");
+    }
+  };
+
+  /** 跨库挑表的候选：本机各连接**已经读到表清单**的那些。
+   *  没读到的连接要单独点名——不说就等于让用户以为模型看过了所有库。 */
+  const tableCandidates = useMemo(() => {
+    const candidates: TableCandidate[] = [];
+    const skipped: string[] = [];
+    for (const c of configs) {
+      const st = connState[c.id];
+      if (!st || st.loading) {
+        skipped.push(c.name || c.id);
+        continue;
+      }
+      if (st.error) {
+        skipped.push(`${c.name || c.id}（${st.error.slice(0, 40)}）`);
+        continue;
+      }
+      for (const t of st.tables || []) {
+        candidates.push({
+          connection_id: c.id,
+          connection_name: c.name || c.id,
+          database_type: c.db_type,
+          schema: t.schema || "",
+          table: t.name,
+        });
+      }
+    }
+    return { candidates, skipped };
+  }, [configs, connState]);
+
+  const [picking, setPicking] = useState(false);
+  const [pickError, setPickError] = useState<{ error: string; answer?: string } | null>(null);
+  const [pickNote, setPickNote] = useState("");
+  // 挑表与起草各自一条链：别共用水位，否则点一下挑表会把在飞的起草当"过期结果"丢掉
+  const pickRun = useRef(0);
+
+  /** 让 AI 跨库挑表：挑中的直接并进报表目录，并按张去读列清单（列清单是起草的前置条件）。
+   *  fix 是「照这条错误再挑一次」：错误原文连同被挡下的那份答案一起回喂——模型是单发的。 */
+  const onPickTables = async (fix?: { error: string; answer?: string }) => {
+    const asked = question.trim();
+    if (!asked) {
+      msgApi.warning("先说要查什么，才知道要挑哪些表");
+      return;
+    }
+    if (!aiReady) {
+      onOpenAiSettings();
+      return;
+    }
+    if (!tableCandidates.candidates.length) {
+      msgApi.warning(
+        tableCandidates.skipped.length
+          ? `各连接的表清单还没读到：${tableCandidates.skipped.join("、")}`
+          : "本机没读到任何表，先连上数据库"
+      );
+      return;
+    }
+    const id = ++pickRun.current;
+    setPicking(true);
+    setPickError(null);
+    try {
+      const res: PickResult = await aiReportPickTables(
+        asked,
+        tableCandidates.candidates,
+        aiConfig,
+        undefined,
+        fix?.error ?? null,
+        fix?.answer ?? null
+      );
+      if (id !== pickRun.current) return;
+      const keys = res.picked.map((t) => keyOf(t));
+      setPicked((p) => {
+        const next = [...p];
+        for (const k of keys) {
+          if (!next.some((x) => x.toLowerCase() === k.toLowerCase())) next.push(k);
+        }
+        return next;
+      });
+      // 列清单要一张一张问库：不等它们落地就起草，那张表会被前置闸当"零列"丢掉
+      await Promise.allSettled(keys.map(ensureColumns));
+      if (id !== pickRun.current) return;
+      const noCols = res.picked.filter((t) => !(columnsRef.current[keyOf(t)] || []).length);
+      const conns = new Set(res.picked.map((t) => t.connection_id));
+      setPickNote(
+        `AI 挑了 ${res.picked.length} 张表、跨 ${conns.size} 个连接` +
+          (res.reason ? `：${res.reason}` : "") +
+          (res.repairs ? ` · 本机核对打回 ${res.repairs} 次后才通过` : "") +
+          (res.truncated ? ` · 另有 ${res.truncated} 张表太多，没进这次的候选` : "")
+      );
+      msgApi.success(noCols.length ? "挑好的表已进目录，其中有列清单没读到的" : "挑好的表已进报表目录");
+      if (noCols.length) {
+        msgApi.warning(
+          `这些表的列清单没读到，起草时会被丢掉：${noCols.map((t) => `${t.connection_name}.${t.table}`).join("、")}`
+        );
+      }
+      for (const w of res.warnings) msgApi.warning(w);
+    } catch (e) {
+      if (id !== pickRun.current) return;
+      const rej = asPickReject(e);
+      setPickError({ error: rej.error, answer: rej.answer || undefined });
+      msgApi.error(rej.answer ? "挑表没过本机核对，可以照这条错误再挑一次" : "挑表失败");
+    } finally {
+      if (id === pickRun.current) setPicking(false);
     }
   };
 
@@ -847,6 +963,59 @@ export function ReportWorkbench({
           optionFilterProp="label"
           maxTagCount="responsive"
         />
+        <Tooltip title="把本机各连接里的表名交给模型，按你填的那句需求挑这次要用的表：跨库没问题（各库分别取数、本机内存 join）。挑中的直接进报表目录，并去读列清单。">
+          <Button
+            size="small"
+            icon={<RobotOutlined />}
+            loading={picking}
+            disabled={!question.trim()}
+            style={{ marginBottom: 6 }}
+            onClick={() => void onPickTables()}
+          >
+            让 AI 跨库挑表
+          </Button>
+        </Tooltip>
+        {/* 有的连接表清单还没读到（在飞、或读失败）：模型看不见它们，就得说在前面，
+            免得用户以为"AI 说没有"是问过了所有库的结论 */}
+        {tableCandidates.skipped.length > 0 && (
+          <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>
+            这些连接的表还没读到，不进本次候选：{tableCandidates.skipped.join("、")}
+          </Text>
+        )}
+        {pickNote && (
+          <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 6 }}>
+            {pickNote}
+          </Text>
+        )}
+        {pickError && (
+          <Alert
+            type="error"
+            showIcon
+            closable
+            onClose={() => setPickError(null)}
+            style={{ marginBottom: 8 }}
+            title="挑表没过本机核对"
+            description={
+              <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
+                {pickError.error}
+              </div>
+            }
+            action={
+              pickError.answer ? (
+                <Tooltip title="把这条拒因和模型那份答案一起回喂，让它改完再对着本机清单核一遍">
+                  <Button
+                    size="small"
+                    danger
+                    loading={picking}
+                    onClick={() => void onPickTables(pickError)}
+                  >
+                    照这条错误再挑一次
+                  </Button>
+                </Tooltip>
+              ) : null
+            }
+          />
+        )}
         {/* 目录现状要说得出口：哪几张表真带着字段进了目录、哪几张没进去、为什么。
             以前连接被删的表会被静默滤掉，用户看到"已生成"却不知道模型少看了两张表。 */}
         {colBusy.length > 0 && (

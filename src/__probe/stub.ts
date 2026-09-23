@@ -340,6 +340,80 @@ function invoke(cmd: string, args: any): Promise<any> {
       if (out.reject) return fail({ error: out.reject, sql: null });
       return Promise.resolve(out.draft);
     }
+    case "ai_report_pick_tables": {
+      const cands: any[] = a.candidates || [];
+      // 镜像后端 pick()：模型名空、空需求、本机一张表都没读到，都在发请求之前就拒
+      if (!String((a.config || {}).model || "").trim()) {
+        return fail({ error: "请先在设置中填写 AI 模型名", answer: null });
+      }
+      if (!String(a.question || "").trim()) {
+        return fail({ error: "先描述你想要什么报表，才知道要挑哪些表", answer: null });
+      }
+      if (!cands.length) {
+        return fail({
+          error: "本机一张表都没读到：先连上数据库，或在报表目录里手工勾选",
+          answer: null,
+        });
+      }
+      // ?pick=crm.users,shop.invoicez 指定"模型这一轮回的是哪几张表"（连接.表，与候选同形）；
+      // ?pick=none 是"一张都没挑"；?pickbroken=1 是"回的连 JSON 都不是"（没有答案可回喂）。
+      if (window.__PROBE_FLAG("pickbroken")) {
+        return fail({
+          error: "本机核对没通过：模型回的既不是 JSON 也没法解析（注入）",
+          answer: null,
+        });
+      }
+      const tables = String(window.__PROBE_ARG("pick") || "")
+        .split(",")
+        .map((x) => x.trim())
+        .filter((x) => x && x !== "none");
+      const key = (c: any) => `${c.connection_id}.${c.table}`;
+      const known = tables.filter((x) => cands.some((c) => key(c) === x));
+      const unknown = tables.filter((x) => !known.includes(x));
+      const answer = JSON.stringify({
+        tables: tables.map((x) => {
+          const [connection_id, table] = x.split(".");
+          return { connection_id, table };
+        }),
+        reason: "先看成交额",
+      });
+      // 第二轮（前端把拒因和那份答案一起回喂了）当成模型照着改对了。
+      // 判"改对了"要两半都在：只回错误原文、或只回那份答案，模型都无从下手。
+      const fb = String(a.feedback || "").trim();
+      const pa = String(a.priorAnswer || "").trim();
+      if (unknown.length && !(fb && pa)) {
+        const conns = [...new Set(cands.map((c) => c.connection_id))].sort();
+        const problems = unknown.map((x) => {
+          const [c, t] = x.split(".");
+          const avail = [...new Set(cands.filter((y) => y.connection_id === c).map((y) => y.table))].sort();
+          return avail.length
+            ? `连接 ${c} 里没有表 ${t}（该连接的可用表：${avail.join(", ")}）`
+            : `清单里没有连接 ${c}（可用连接：${conns.join(", ")}）`;
+        });
+        // 不说"重试 N 次"：这条腿只回了一次答案，真后端那几轮自我修正在一次 IPC 里，
+        // 探针里学不出那个次数，写死只会让后面读探针的人以为量过它
+        return fail({
+          error: `本机核对没通过：${problemList(problems)}`,
+          answer,
+        });
+      }
+      if (!unknown.length && !tables.length) {
+        return fail({
+          error: "本机核对没通过：模型一张表都没挑出来：换个说法，或者手工勾选",
+          answer,
+        });
+      }
+      const picked = (unknown.length ? known : tables.map((x) => x)).map((x) =>
+        cands.find((c) => key(c) === x)
+      );
+      return Promise.resolve({
+        picked,
+        reason: "先看成交额",
+        repairs: unknown.length ? 1 : 0,
+        truncated: 0,
+        warnings: [],
+      });
+    }
     case "load_reports":
       if (window.__PROBE_FLAG("loadfail")) {
         return fail(

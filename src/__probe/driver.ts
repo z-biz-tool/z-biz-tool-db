@@ -406,6 +406,33 @@ export function installDriver() {
         );
         return (sel?.textContent || "").trim() || "?";
       }),
+    /** 从某个下标起，每次"跨库挑表"请求带出去的候选清单与回喂的那两半。
+     *  fb/ans 都必须成对：模型是单发的，只给拒因或只给它上一轮的答案都是在凭空重挑。 */
+    pickSent: (from: number) =>
+      (w.__PROBE_CALLS as any[])
+        .slice(from)
+        .filter((c: any) => c.cmd === "ai_report_pick_tables")
+        .map((c: any) => {
+          const cands = (c.args.candidates || [])
+            .map((t: any) => `${t.connection_id}.${t.table}`)
+            .join("|");
+          const fb = c.args.feedback;
+          const ans = c.args.priorAnswer;
+          return `${cands}|fb=${fb == null ? "null" : String(fb).length}|ans=${
+            ans == null ? "null" : String(ans).slice(0, 30)
+          }`;
+        }),
+    /** 挑表那张错误卡：kind|正文||按钮（没有卡返回 null） */
+    pickAlert: () => {
+      const a = Array.from(document.querySelectorAll(".ant-alert")).find((x) =>
+        (x.textContent || "").includes("挑表没过本机核对")
+      );
+      if (!a) return null;
+      const btns = Array.from(a.querySelectorAll("button"))
+        .map((b) => (b.textContent || "").trim())
+        .filter(Boolean);
+      return `${(a.textContent || "").trim().replace(/\s+/g, " ").slice(0, 200)}||${btns.join("、")}`;
+    },
     /** 报表错误卡上那块"这张表没进目录"的提示：null = 根本没这块。
      *  每块带上它自己的按钮文案——一键究竟把哪张表从哪个连接拉进目录，得读得出来。 */
     catalogAddCard: () => {
