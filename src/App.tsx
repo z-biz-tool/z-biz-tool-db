@@ -384,7 +384,9 @@ function App() {
   // 也不是一开始就挂——没去过就别白刷一遍各连接的表清单。
   const [reportSeen, setReportSeen] = useState(false);
   // 从 SQL 那条腿撞进跨库死路时，那句需求要跟着人一起过去（seq 变一次算一次交接）
-  const [reportSeed, setReportSeed] = useState<{ q: string; seq: number } | null>(null);
+  const [reportSeed, setReportSeed] = useState<{ q: string; seq: number; run?: boolean } | null>(
+    null
+  );
   const reportSeedSeq = useRef(0);
 
   // T-045 写入审批状态
@@ -1048,11 +1050,11 @@ function App() {
 
   /** 把用户送到报表工作台，并把他刚那句需求带过去：
    *  一条 SQL 只能进一个库，跨库要在那边按各库取数、本机内存 join。 */
-  const goReport = (q?: string) => {
+  const goReport = (q?: string, run = false) => {
     setReportSeen(true);
     setMode("report");
     const body = (q || "").trim();
-    if (body) setReportSeed({ q: body, seq: ++reportSeedSeq.current });
+    if (body) setReportSeed({ q: body, seq: ++reportSeedSeq.current, run });
   };
 
   // 打开 AI 助手：三条 SQL 输入默认用编辑器当前内容，手抄一遍没有意义
@@ -2324,7 +2326,7 @@ function App() {
                     }}
                     onGoReport={(q) => {
                       setShowAiResultModal(false);
-                      goReport(q);
+                      goReport(q, true);
                     }}
                   />
                 </div>
@@ -2440,7 +2442,7 @@ function App() {
                                 <>
                                   <Text type="secondary" style={{ display: "block", marginTop: 4 }}>
                                     {"不同库的表要进同一张结果，走 AI 报表：每个库各自取数，" +
-                                      "在本机内存里 join。"}
+                                      "在本机内存里 join。下面那一键会带着这句话过去把整条链跑完。"}
                                   </Text>
                                   <Button
                                     size="small"
@@ -2449,10 +2451,10 @@ function App() {
                                     style={{ marginTop: 6 }}
                                     onClick={() => {
                                       setShowAiResultModal(false);
-                                      goReport(aiNaturalLanguage);
+                                      goReport(aiNaturalLanguage, true);
                                     }}
                                   >
-                                    去 AI 报表跨库出图
+                                    拿去 AI 报表，直接跨库出图
                                   </Button>
                                 </>
                               )}

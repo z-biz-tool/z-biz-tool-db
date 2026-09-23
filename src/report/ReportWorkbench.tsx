@@ -164,8 +164,9 @@ export function ReportWorkbench({
   aiConfig: AIConfig;
   onOpenAiSettings: () => void;
   /** 从 SQL 助手那条腿撞进跨库死路时，把用户那句需求带过来（seq 变一次算一次交接，
-   *  同一句连着点两次也要生效）：没有它就得用户自己把那句话再抄一遍。 */
-  seed?: { q: string; seq: number } | null;
+   *  同一句连着点两次也要生效）：没有它就得用户自己把那句话再抄一遍。
+   *  run = 带过来之后直接把链条跑完（挑表→起草→取数出图）；用户在 SQL 腿那边点的就是"出图"。 */
+  seed?: { q: string; seq: number; run?: boolean } | null;
 }) {
   const [msgApi, msgHolder] = message.useMessage();
   const [connState, setConnState] = useState<Record<string, ConnState>>({});
@@ -184,12 +185,22 @@ export function ReportWorkbench({
   const [question, setQuestion] = useState("");
   // 需求交接：只认 seq 变化，不看文本是否不同（同句重过来也要落进这一栏）
   const seedSeq = useRef(0);
+  // 等表清单落地再跑的链条那一轮
+  const [pendingChain, setPendingChain] = useState<{ q: string } | null>(null);
   useEffect(() => {
     if (!seed || seedSeq.current === seed.seq) return;
     seedSeq.current = seed.seq;
-    if (!seed.q.trim()) return;
-    setQuestion(seed.q.trim());
-    msgApi.info("需求已从 AI 助手带过来，接着挑表或起草就行");
+    const asked = seed.q.trim();
+    if (!asked) return;
+    setQuestion(asked);
+    if (seed.run) {
+      // 刚切过来时报表工作台才挂载，各连接的表清单还在读：这时直接跑会被
+      // "一张表都没读到"挡回原地（探针实测过），所以先记下这一轮，等清单落地再跑
+      msgApi.info("需求已从 AI 助手带过来，接着跨库挑表并出图");
+      setPendingChain({ q: asked });
+    } else {
+      msgApi.info("需求已从 AI 助手带过来，接着挑表或起草就行");
+    }
   }, [seed, msgApi]);
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [specText, setSpecText] = useState("");
@@ -483,6 +494,27 @@ export function ReportWorkbench({
     }
     return { candidates, skipped };
   }, [configs, connState]);
+  /** 表清单一落地就把等着的那一轮跑掉；一直读不到就如实说没开始。 */
+  useEffect(() => {
+    if (!pendingChain) return;
+    if (tableCandidates.candidates.length) {
+      const q = pendingChain.q;
+      setPendingChain(null);
+      // 需求是刚 setQuestion 的，这一轮闭包里的 question 还可能是空的：话显式交下去
+      void onPickTables(undefined, { thenDraft: true, question: q });
+      return;
+    }
+    const t = setTimeout(() => {
+      setPendingChain(null);
+      msgApi.warning(
+        `等了一会儿，各连接的表清单还是没读到，没开始挑表：${
+          tableCandidates.skipped.join("、") || "未知"
+        }`
+      );
+    }, 8000);
+    return () => clearTimeout(t);
+  }, [pendingChain, tableCandidates, msgApi]);
+
 
   const [picking, setPicking] = useState(false);
   const [pickError, setPickError] = useState<{ error: string; answer?: string } | null>(null);
@@ -497,9 +529,9 @@ export function ReportWorkbench({
    *  fix 是「照这条错误再挑一次」：错误原文连同被挡下的那份答案一起回喂——模型是单发的。 */
   const onPickTables = async (
     fix?: { error: string; answer?: string },
-    opts?: { thenDraft?: boolean }
+    opts?: { thenDraft?: boolean; question?: string }
   ): Promise<boolean> => {
-    const asked = question.trim();
+    const asked = (opts?.question ?? question).trim();
     if (!asked) {
       msgApi.warning("先说要查什么，才知道要挑哪些表");
       return false;
@@ -516,7 +548,7 @@ export function ReportWorkbench({
       );
       return false;
     }
-    if (opts?.thenDraft) chainDraft.current = true;
+    if (opts?.thenDraft || opts?.question) chainDraft.current = true;
     else if (!fix) chainDraft.current = false;
     const id = ++pickRun.current;
     setPicking(true);
