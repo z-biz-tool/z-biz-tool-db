@@ -174,6 +174,7 @@ export function ReportWorkbench({
   // 否则每勾一张表都会先闪一条红色"列清单没读到"。
   const [colBusy, setColBusy] = useState<string[]>([]);
   const [picked, setPicked] = useState<string[]>([]);
+  const lastDraftRef = useRef<DraftResult | null>(null);
   // picked 也镜像一份到 ref：这文件里 await 之后再读 state 一定是旧快照（columnsRef 就是为这个坑存在的），
   // 「把缺的那张表加进目录并重问」这一键正是先补目录、再 await 列清单、然后马上起草。
   const pickedRef = useRef<string[]>(picked);
@@ -558,7 +559,14 @@ export function ReportWorkbench({
       for (const w of res.warnings) msgApi.warning(w);
       // 链条：挑表成了才起草。目录显式带上刚挑中的那几张，
       // 不靠"React 这会儿该渲染完了"这种时机（补表在 await 里，picked 还是旧快照）
-      if (chainDraft.current) await onDraft(undefined, keys);
+      if (chainDraft.current) {
+        const beforeDraft = lastDraftRef.current;
+        await onDraft(undefined, keys);
+        const d = lastDraftRef.current;
+        // 按钮写的是"再出图"就得真出图：起草成了就接着取数渲染。
+        // 认引用变化而不是读 draft state——那是 await 之前的快照。
+        if (d && d !== beforeDraft) await runRender(d.view, d.datasets);
+      }
       return true;
     } catch (e) {
       if (id !== pickRun.current) return false;
@@ -589,6 +597,9 @@ export function ReportWorkbench({
   };
 
   const applyDraft = (d: DraftResult, askedFor: string) => {
+    // 链条（挑完表接着起草出图）要在 await 之后拿到这一稿去取数：draft 这个 state
+    // 在 await 之后读到的还是旧快照，所以成功那一稿同时镜像到 ref
+    lastDraftRef.current = d;
     setDraft(d);
     setPayload(null);
     const text = JSON.stringify({ datasets: d.datasets, view: d.view }, null, 2);
@@ -1135,7 +1146,12 @@ export function ReportWorkbench({
           </Button>
           {/* 一句需求到出图之间隔着两步：先挑表（可以跨连接），再起草。
               挑表没过本机核对就不起草——目录里还是没那些表，起草只会撞回同一条拒因。 */}
-          <Tooltip title="先让 AI 从本机各连接的表里挑这次要用的，挑中了接着起草这张报表；挑表没过本机核对就停下来。">
+          <Tooltip
+            title={
+              "三步连到底：先让 AI 从本机各连接的表里挑这次要用的，再起草，过了本机校验就取数出图。" +
+              "挑表或起草任一环节没过本机核对就停在原地，不会拿上一版的图冒充新结果。"
+            }
+          >
             <Button
               block
               icon={<ThunderboltOutlined />}

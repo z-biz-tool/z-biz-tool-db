@@ -559,7 +559,8 @@ function invoke(cmd: string, args: any): Promise<any> {
       //   2. 点它之后 wire 上有没有同时出现错误原文和被拒的那一稿
       // 判"改对了"的条件也收紧到这两半都对上：只把 feedback 塞成任意非空字符串、
       // 或者拿编辑器里那份干净设计当底稿，都还是过不了。
-      if (window.__PROBE_FLAG("draftreject")) {
+      // 也认运行时开关：链条出图之后要再演一次"起草被拒"，只能中途改条件（URL 开关改不了）
+      if (window.__PROBE_FLAG("draftreject") || (window as any).__PROBE_DRAFTREJECT === true) {
         const d = JSON.parse(JSON.stringify((fixture as any).reports[0]));
         const bad = d.view.widgets.find((x: any) => x.type === "BAR");
         bad.encode.y = "profit_zz";
