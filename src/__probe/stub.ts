@@ -72,6 +72,15 @@ function mirrorDraft(question: string, catalog: any[]): any {
   };
 }
 
+/** 探查结果：名字来自 fixture.columns，类型来自 fixture.column_types。
+ *  column_types 里没有的列必须回空串——真实 sqlite 里不写类型的列就是这样，
+ *  探针要连这条腿一起跑，不能只测"每个列都有类型"的理想情况。 */
+function described(table: string): { name: string; data_type: string }[] {
+  const names: string[] = (fixture as any).columns[table] || [];
+  const types: Record<string, string> = (fixture as any).column_types?.[table] || {};
+  return names.map((name) => ({ name, data_type: types[name] || "" }));
+}
+
 function invoke(cmd: string, args: any): Promise<any> {
   push(cmd, args);
   const a = args || {};
@@ -94,7 +103,11 @@ function invoke(cmd: string, args: any): Promise<any> {
         if (window.__PROBE_ARG("descfail") === t) {
           return fail(`读取列清单失败：注入（表 ${t}）`);
         }
-        return Promise.resolve((fixture as any).columns[t] || []);
+        if (window.__PROBE_ARG("notypes") === t) {
+          // 整张表都探不到类型（真实 sqlite 无类型表就是这样）：提示词只能退回裸列名
+          return Promise.resolve(described(t).map((c) => ({ ...c, data_type: "" })));
+        }
+        return Promise.resolve(described(t));
       };
       return slow > 0
         ? new Promise((r) =>

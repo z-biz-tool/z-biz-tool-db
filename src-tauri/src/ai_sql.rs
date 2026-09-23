@@ -12,7 +12,7 @@
 use serde::Serialize;
 
 use crate::db::sql_classify;
-use crate::report::ai::{strip_fences, CatalogTable, Model, HttpModel, MAX_REPAIRS};
+use crate::report::ai::{strip_fences, column_list, CatalogTable, Model, HttpModel, MAX_REPAIRS};
 use crate::AIConfig;
 
 /// 进提示词的表数上限：SQL 编辑器对着一个连接，几十张表模型也抓不住重点
@@ -193,7 +193,7 @@ pub fn prompt(question: &str, catalog: &[CatalogTable], dialect: &str, feedback:
     let mut s = String::new();
     s.push_str(&format!(
         "你是数据库工程师。用 {} 方言写一条 SQL，只回 SQL 本身，不要解释、不要 markdown 围栏。\n\n\
-         表与列（表名和列名只能从这里取，编不出来的一律会被本机挡下）：\n",
+         表与列（表名和列名只能从这里取，编不出来的一律会被本机挡下；括号里是「列名 类型」）：\n",
         dialect
     ));
     for t in catalog {
@@ -203,7 +203,7 @@ pub fn prompt(question: &str, catalog: &[CatalogTable], dialect: &str, feedback:
             s.push_str(&format!(
                 "  · {}({})\n",
                 qualified(t),
-                t.columns.join(", ")
+                column_list(t)
             ));
         }
     }
@@ -212,7 +212,9 @@ pub fn prompt(question: &str, catalog: &[CatalogTable], dialect: &str, feedback:
          1. 只能一条语句；不要写 INSERT/UPDATE/DELETE/DROP，除非需求明确要改数据。\n\
          2. 表起了别名就用别名引用列，不要用库名以外的前缀。\n\
          3. 不确定的列宁可不选，也不要用 SELECT * 蒙；时间比较写成字符串比较。\n\
-         4. 需要限制行数时用 LIMIT。\n",
+         4. 需要限制行数时用 LIMIT。\n\
+         5. 按类型写条件：文本列别拿去求和，日期/数值列比较前先看清它是 int、decimal 还是字符串，\n\
+         \x20  类型不一致就先 CAST 对齐。\n",
     );
     s.push_str("\n需求：");
     s.push_str(question.trim());
@@ -722,17 +724,32 @@ pub async fn ai_sql_generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
 
+    /// `cols` 写 "name TYPE"（如 `amount decimal(12,2)`）就能带上类型，
+    /// 只写名字则类型留空——和提示词里的渲染格式互为逆运算。
     fn cat_table(conn: &str, db: &str, schema: &str, name: &str, cols: &[&str]) -> CatalogTable {
+        let mut column_types = HashMap::new();
+        let mut columns = Vec::new();
+        for c in cols {
+            match c.split_once(' ') {
+                Some((n, ty)) if !ty.trim().is_empty() => {
+                    columns.push(n.to_string());
+                    column_types.insert(n.to_string(), ty.trim().to_string());
+                }
+                _ => columns.push(c.to_string()),
+            }
+        }
         CatalogTable {
             connection_id: conn.into(),
             connection_name: conn.into(),
             database_type: db.into(),
             schema: schema.into(),
             table: name.into(),
-            columns: cols.iter().map(|c| c.to_string()).collect(),
+            columns,
+            column_types,
         }
     }
 
@@ -796,6 +813,34 @@ mod tests {
 
         let no_cols = prompt("随便", &[cat_table("crm", "postgresql", "", "customers", &[])], "postgresql", None);
         assert!(no_cols.contains("customers（本机没读到列清单）"), "{no_cols}");    }
+
+    /// 目录带类型时提示词要写成 `amount decimal(12,2)`，但列校验的口径不变：
+    /// 类型是给模型少犯错的，不是给校验用的（校验只认 columns 里的名字）。
+    #[test]
+    fn prompt_shows_types_while_validation_still_uses_names() {
+        let c = vec![cat_table(
+            "shop",
+            "mysql",
+            "",
+            "orders",
+            &["id int(11)", "amount decimal(12,2)", "status varchar(20)"],
+        )];
+        let p = prompt("按金额汇总", &c, "mysql", None);
+        assert!(p.contains("orders(id int(11), amount decimal(12,2), status varchar(20))"), "{p}");
+        assert!(p.contains("列名 类型"), "{p}");
+        let out = check_sql(
+            "SELECT status, SUM(amount) AS total FROM orders GROUP BY status",
+            &c,
+        )
+        .unwrap();
+        assert_eq!(out.tables, vec!["orders".to_string()]);
+        // 校验口径没变：带类型的目录仍按裸列名判存在与否，
+        // 报错里回给模型的真实列清单也不能被类型污染（否则模型照着抄就写进 SQL 了）
+        let e = check_sql("SELECT orders.idz FROM orders", &c).unwrap_err();
+        assert!(e.contains("orders.idz"), "{e}");
+        assert!(e.contains("id, amount, status"), "{e}");
+        assert!(!e.contains("decimal(12,2)"), "校验拒因里不该出现类型：{e}");
+    }
 
     // ==================== 从回复里挖 SQL ====================
 

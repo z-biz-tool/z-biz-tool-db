@@ -5,11 +5,15 @@ import ReactDOM from "react-dom/client";
 import "./stub";
 import { CONTRACT } from "./stub";
 import { installRoShim, installReaders } from "./ro_shim";
+import { installDriver } from "./driver";
 import App from "../App";
 import "../index.css";
 
 installRoShim(900, 320);
 installReaders();
+// callsOf / genCatalogSent 这些读数的口子两个探针入口都要有，
+// 不然"前端把类型送到了没有"只能靠猜。
+installDriver();
 (window as any).__CONTRACT = CONTRACT;
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(

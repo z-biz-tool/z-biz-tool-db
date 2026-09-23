@@ -42,6 +42,9 @@ pub struct CatalogTable {
     pub schema: String,
     pub table: String,
     pub columns: Vec<String>,
+    /// 列名 → 数据库类型。只进提示词，本机校验仍只比对 columns
+    #[serde(default)]
+    pub column_types: HashMap<String, String>,
 }
 
 /// 模型产出的一整张报表草稿
@@ -152,6 +155,23 @@ pub(crate) fn strip_fences(raw: &str) -> &str {
 
 // ==================== 提示词 ====================
 
+/// 列清单 → 给模型看的 `列名 类型` 形式。类型没探到就只写列名，
+/// 不能因为某一库不给类型就在提示词里留下 `amount ` 这种悬空空格。
+pub fn column_list(t: &CatalogTable) -> String {
+    t.columns
+        .iter()
+        .map(|c| {
+            let ty = t.column_types.get(c).map(|s| s.trim()).unwrap_or("");
+            if ty.is_empty() {
+                c.clone()
+            } else {
+                format!("{} {}", c, ty)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// 目录 → 文本块。同一个连接 id 下的表聚在一起，模型更容易做跨库决策。
 fn render_catalog(catalog: &[CatalogTable]) -> String {
     let mut lines: Vec<String> = Vec::new();
@@ -171,7 +191,7 @@ fn render_catalog(catalog: &[CatalogTable]) -> String {
         } else {
             format!("{}.{}", t.schema, t.table)
         };
-        lines.push(format!("    · {}({})", named, t.columns.join(", ")));
+        lines.push(format!("    · {}({})", named, column_list(t)));
     }
     lines.join("\n")
 }
@@ -181,7 +201,7 @@ pub fn prompt(question: &str, catalog: &[CatalogTable], feedback: Option<&str>) 
     let mut s = String::new();
     s.push_str(
         "你是数据库报表设计器。只输出一段 JSON，不要解释、不要 markdown 代码块。\n\n\
-         可用数据源与列（列名只能从这里取，禁止编造）：\n",
+         可用数据源与列（列名只能从这里取，禁止编造；括号里是「列名 类型」）：\n",
     );
     s.push_str(&render_catalog(catalog));
     s.push_str(
@@ -205,6 +225,8 @@ pub fn prompt(question: &str, catalog: &[CatalogTable], feedback: Option<&str>) 
          1. sources 只需 alias / connection_id / table；方言和列清单由本机目录填充，写了也会被覆盖。\n\
          2. 跨库：把不同 connection_id 的表放进同一个数据集，join 在本机内存里做，不要写 SQL。\n\
          3. 引用列：本表列直接写名字，需要消歧时写 别名.列名（如 u.city）。\n\
+         \x20  列名后面那个词是数据库真实类型：文本列别拿去 SUM；join 两边类型不一致时，\n\
+         \x20  用 CAST / toString 之类的函数把其中一边对齐，别假设它们天然能比。\n\
          4. 表达式支持 + - * /、比较、AND/OR/NOT、IS NULL、IN，以及函数 \
          ",
     );
@@ -507,6 +529,13 @@ mod tests {
     use super::super::view::{AggType, ChartType};
     use super::*;
 
+    fn types(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     fn catalog() -> Vec<CatalogTable> {
         vec![
             CatalogTable {
@@ -516,6 +545,12 @@ mod tests {
                 schema: String::new(),
                 table: "orders".into(),
                 columns: vec!["id".into(), "user_id".into(), "amount".into(), "status".into()],
+                column_types: types(&[
+                    ("id", "INTEGER"),
+                    ("user_id", "INTEGER"),
+                    ("amount", "REAL"),
+                    ("status", "TEXT"),
+                ]),
             },
             CatalogTable {
                 connection_id: "shop".into(),
@@ -524,6 +559,8 @@ mod tests {
                 schema: String::new(),
                 table: "users".into(),
                 columns: vec!["id".into(), "city".into(), "channel".into()],
+                // 这张表故意没类型：模型要能只看列名也起草成功
+                column_types: HashMap::new(),
             },
             CatalogTable {
                 connection_id: "crm".into(),
@@ -532,6 +569,7 @@ mod tests {
                 schema: "crm".into(),
                 table: "visits".into(),
                 columns: vec!["user_id".into(), "day".into(), "pv".into()],
+                column_types: types(&[("user_id", "bigint(20)"), ("day", "date"), ("pv", "int(11)")]),
             },
         ]
     }
@@ -608,9 +646,28 @@ mod tests {
             assert!(p.contains(f), "提示词漏了函数 {}", f);
         }
         assert!(p.contains("connection_id=shop"));
-        assert!(p.contains("orders(id, user_id, amount, status)"));
-        assert!(p.contains("crm.visits(user_id, day, pv)"));
+        assert!(p.contains("orders(id INTEGER, user_id INTEGER, amount REAL, status TEXT)"));
+        assert!(p.contains("crm.visits(user_id bigint(20), day date, pv int(11))"));
         assert!(!p.contains("password"), "提示词不该带凭据");
+    }
+
+    /// 类型只进提示词，不能渗进本机校验比对的列名清单。
+    /// 探不到类型的表必须渲染成裸列名，不能留下 `city ` 这种悬空空格。
+    #[test]
+    fn prompt_carries_types_when_known_and_bare_names_otherwise() {
+        let c = catalog();
+        let p = prompt("各城市成交额", &c, None);
+        // orders 带类型
+        assert!(p.contains("amount REAL"), "{}", p);
+        // users 没有类型 → 只有名字，且名字后面紧跟逗号或右括号
+        assert!(
+            p.contains("users(id, city, channel)"),
+            "无类型的表该渲染成裸列名：{}",
+            p
+        );
+        // 校验用的列名清单不含类型
+        let hit = c.iter().find(|t| t.table == "orders").unwrap();
+        assert_eq!(hit.columns, vec!["id", "user_id", "amount", "status"]);
     }
 
     #[test]

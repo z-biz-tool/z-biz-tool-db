@@ -69,7 +69,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAgentStore } from "./agent/AgentManager";
 import AgentPanel from "./agent/AgentPanel";
 import { ReportWorkbench } from "./report/ReportWorkbench";
-import { aiSqlGenerate, reportDescribeColumns } from "./report/api";
+import { aiSqlGenerate, catalogColumns, reportDescribeColumns } from "./report/api";
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
 import type { CatalogTable, SqlDraft } from "./report/types";
 
@@ -601,7 +601,7 @@ function App() {
               database_type: cfg.db_type,
               schema,
               table: name,
-              columns: cols,
+              ...catalogColumns(cols),
             };
             return { entry, failed: "" };
           } catch (e: any) {

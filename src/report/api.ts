@@ -7,6 +7,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CatalogTable,
+  ColumnInfo,
   DatasetPayload,
   DatasetSpec,
   DraftResult,
@@ -102,7 +103,28 @@ export const reportDescribeColumns = (
   config: BackendConfig,
   schema: string,
   table: string
-): Promise<string[]> => invoke<string[]>("report_describe_columns", { config, schema, table });
+): Promise<ColumnInfo[]> => invoke<ColumnInfo[]>("report_describe_columns", { config, schema, table });
+
+/** 探查结果 → 目录字段：columns 只放名字（本机校验比对的口径），类型另放一处 */
+export const catalogColumns = (cols: ColumnInfo[]) => ({
+  columns: cols.map((c) => c.name),
+  column_types: cols.reduce(
+    (m, c) => {
+      if (c.data_type) m[c.name] = c.data_type;
+      return m;
+    },
+    {} as Record<string, string>
+  ),
+});
+
+/** 给人看的列摘要，与提示词里的口径一致：有类型带类型，没类型只给名字 */
+export const columnSummary = (t: CatalogTable) =>
+  t.columns
+    .map((c) => {
+      const ty = t.column_types?.[c];
+      return ty ? `${c} ${ty}` : c;
+    })
+    .join(", ");
 
 export const listTables = (config: BackendConfig): Promise<TableSummary[]> =>
   invoke<TableSummary[]>("get_tables", { config });

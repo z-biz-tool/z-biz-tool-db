@@ -180,6 +180,13 @@ export interface ViewPayload {
   elapsed_ms: number;
 }
 
+/** 后端探查一列的结果：名字给本机校验用，类型只喂给模型 */
+export interface ColumnInfo {
+  name: string;
+  /** 数据库自报类型，如 `decimal(12,2)`；探不到就是空串 */
+  data_type: string;
+}
+
 /** 喂给模型的目录：只有结构信息，没有任何连接凭据 */
 export interface CatalogTable {
   connection_id: string;
@@ -188,6 +195,8 @@ export interface CatalogTable {
   schema?: string;
   table: string;
   columns: string[];
+  /** 列名 → 数据库类型。只进提示词，本机校验仍只比对 columns */
+  column_types?: Record<string, string>;
 }
 
 export interface ReportDraft {

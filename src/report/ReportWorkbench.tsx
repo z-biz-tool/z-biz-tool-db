@@ -39,6 +39,8 @@ import {
 } from "@ant-design/icons";
 import {
   aiReportDraft,
+  catalogColumns,
+  columnSummary,
   deleteReport,
   listTables,
   loadReports,
@@ -52,6 +54,7 @@ import {
 } from "./api";
 import type {
   CatalogTable,
+  ColumnInfo,
   DatasetSpec,
   DraftResult,
   SavedReport,
@@ -73,6 +76,10 @@ interface ConnState {
   error?: string;
 }
 
+/** 目录里这张表有多少列带着类型进提示词 */
+const typeCovered = (t: CatalogTable) =>
+  t.columns.filter((c) => (t.column_types?.[c] || "").trim()).length;
+
 export function ReportWorkbench({
   configs,
   aiConfig,
@@ -84,7 +91,7 @@ export function ReportWorkbench({
 }) {
   const [msgApi, msgHolder] = message.useMessage();
   const [connState, setConnState] = useState<Record<string, ConnState>>({});
-  const [columns, setColumns] = useState<Record<string, string[]>>({});
+  const [columns, setColumns] = useState<Record<string, ColumnInfo[]>>({});
   // 正在读列清单的表：面板要把它和"读失败"分开显示，
   // 否则每勾一张表都会先闪一条红色"列清单没读到"。
   const [colBusy, setColBusy] = useState<string[]>([]);
@@ -126,7 +133,7 @@ export function ReportWorkbench({
   const colInFlight = useRef<Map<string, Promise<void>>>(new Map());
   // state 是渲染快照，await 之后读它会拿到请求落地前的旧值，
   // 所以列清单同时镜像到 ref，起草时用 ref 现读。
-  const columnsRef = useRef<Record<string, string[]>>({});
+  const columnsRef = useRef<Record<string, ColumnInfo[]>>({});
 
   const aiReady = Boolean(aiConfig.base_url && aiConfig.api_key && aiConfig.model);
 
@@ -177,7 +184,7 @@ export function ReportWorkbench({
   /** 目录按"能不能拿去起草"分成两堆：连接已删、列清单为空的表都不能进目录。
    *  空列清单比缺连接更阴：后端 normalize_sources 会把它原样写进 schema 缓存，
    *  之后每次引用该表都报"未声明列清单"，三轮自我修正全烧在这上面。 */
-  const splitPicked = (colMap: Record<string, string[]>) => {
+  const splitPicked = (colMap: Record<string, ColumnInfo[]>) => {
     const byId = new Map(configs.map((c) => [c.id, c]));
     const ready: CatalogTable[] = [];
     const unusable: {
@@ -213,7 +220,7 @@ export function ReportWorkbench({
         database_type: cfg.db_type,
         schema: schema || "",
         table,
-        columns: cols,
+        ...catalogColumns(cols),
       });
     }
     return { ready, unusable };
@@ -543,9 +550,22 @@ export function ReportWorkbench({
           </Text>
         )}
         {catalog.map((t) => (
-          <Tooltip key={keyOf(t)} title={`${t.columns.join(", ")}\n方言：${t.database_type}`}>
+          <Tooltip
+            key={keyOf(t)}
+            title={
+              <div style={{ whiteSpace: "pre-wrap" }}>
+                {columnSummary(t)}
+                {"\n"}方言：{t.database_type}
+              </div>
+            }
+          >
             <Tag color="blue" style={{ margin: "4px 4px 0 0" }}>
               {t.connection_name}/{t.table} · {t.columns.length} 列
+              {/* 类型是模型写对过滤和 CAST 的前提，读到了几列要说得出来；
+                  一列都没有时不显示这条，免得把"没探到类型"当成正常状态 */}
+              {typeCovered(t)
+                ? ` · 模型可见类型 ${typeCovered(t)}/${t.columns.length}`
+                : ""}
             </Tag>
           </Tooltip>
         ))}

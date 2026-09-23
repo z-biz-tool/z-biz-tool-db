@@ -152,7 +152,16 @@ pub fn text_lit(raw: &str) -> Result<String, String> {
     Ok(format!("'{}'", raw.replace('\'', "''")))
 }
 
-/// 探查列名的 SQL。三种方言都保证"结果第一列即列名"，便于上层统一取值。
+/// 一列的结构信息。名字给本机校验用，类型只给模型看。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ColumnInfo {
+    pub name: String,
+    /// 数据库自报的类型，如 `decimal(12,2)`、`INTEGER`。取不到就是空串
+    #[serde(default)]
+    pub data_type: String,
+}
+
+/// 探查列清单的 SQL。三种方言都保证"第一列列名、第二列类型"，便于上层统一取值。
 pub fn describe_sql(dialect: &str, schema: &str, table: &str, database: &str) -> Result<String, String> {
     let tbl = assert_ident(table, "表")?;
     match dialect {
@@ -161,8 +170,9 @@ pub fn describe_sql(dialect: &str, schema: &str, table: &str, database: &str) ->
             if db.trim().is_empty() {
                 return Err("MySQL 探查列需要库名（连接配置里的数据库名）".to_string());
             }
+            // COLUMN_TYPE 比 DATA_TYPE 带长度/精度：decimal(12,2) 才能让模型知道要不要 CAST
             Ok(format!(
-                "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} ORDER BY ORDINAL_POSITION",
+                "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} ORDER BY ORDINAL_POSITION",
                 text_lit(db)?,
                 text_lit(&tbl)?
             ))
@@ -170,28 +180,28 @@ pub fn describe_sql(dialect: &str, schema: &str, table: &str, database: &str) ->
         "postgresql" => {
             let sch = if schema.trim().is_empty() { "public" } else { schema.trim() };
             Ok(format!(
-                "SELECT column_name FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
                 text_lit(sch)?,
                 text_lit(&tbl)?
             ))
         }
         // SQLite 一个连接就是一个文件，没有 schema 层；pragma_table_info 自 3.16 起可用
         "sqlite" => Ok(format!(
-            "SELECT name FROM pragma_table_info({}) ORDER BY cid",
+            "SELECT name, type FROM pragma_table_info({}) ORDER BY cid",
             text_lit(&tbl)?
         )),
         other => Err(format!("不支持的方言: {}", other)),
     }
 }
 
-/// 真实探查：拿到表的列名清单。
+/// 真实探查：拿到表的列名 + 类型清单。
 /// 这是"AI 幻觉列名"能被抓出来的前提——提示词里给的是数据库真实列，
 /// 校验时也比对的是数据库真实列，而不是 AI 自己编的那份。
-pub async fn describe_columns(
+pub async fn describe_columns_typed(
     cfg: &DBConfig,
     schema: &str,
     table: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ColumnInfo>, String> {
     let dialect = dispatch_db_type(cfg)?;
     let sql = describe_sql(dialect, schema, table, &cfg.database)?;
     let c = classify(&sql);
@@ -202,10 +212,19 @@ pub async fn describe_columns(
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         let v = dataset::tagged_to_value(r.first().unwrap_or(&serde_json::Value::Null));
-        match v.as_text() {
-            Some(s) => out.push(s),
-            None => return Err(format!("探查 {} 返回了非文本列名", table)),
-        }
+        let Some(name) = v.as_text() else {
+            return Err(format!("探查 {} 返回了非文本列名", table));
+        };
+        // 类型缺失不能整体失败：有的库（或建表时没写类型的 sqlite 列）就是给不出
+        let data_type = r
+            .get(1)
+            .map(dataset::tagged_to_value)
+            .and_then(|t| t.as_text())
+            .unwrap_or_default();
+        out.push(ColumnInfo {
+            name,
+            data_type: data_type.trim().to_string(),
+        });
     }
     if out.is_empty() {
         return Err(format!(
@@ -214,6 +233,19 @@ pub async fn describe_columns(
         ));
     }
     Ok(out)
+}
+
+/// 只要列名：本机校验比对的是名字，类型对校验没有意义。
+pub async fn describe_columns(
+    cfg: &DBConfig,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, String> {
+    Ok(describe_columns_typed(cfg, schema, table)
+        .await?
+        .into_iter()
+        .map(|c| c.name)
+        .collect())
 }
 
 /// 组装 schema 缓存：spec 自带的列清单优先，其次沿用调用方已给的缓存，
@@ -415,8 +447,8 @@ pub async fn report_describe_columns(
     config: DBConfig,
     schema: String,
     table: String,
-) -> Result<Vec<String>, String> {
-    describe_columns(&config, &schema, &table).await
+) -> Result<Vec<ColumnInfo>, String> {
+    describe_columns_typed(&config, &schema, &table).await
 }
 
 // ==================== 报表（视图 × 多数据集） ====================
@@ -565,6 +597,13 @@ mod tests {
     use crate::report::dataset::{JoinPair, JoinSpec, SortDir};
     use crate::report::table::{AggFunc, AggSpec};
 
+    fn col_types(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     fn sqlite_cfg(id: &str, path: &str) -> DBConfig {
         DBConfig {
             id: id.into(),
@@ -654,12 +693,16 @@ mod tests {
     fn describe_sql_shape_per_dialect() {
         assert_eq!(
             describe_sql("sqlite", "", "users", "").unwrap(),
-            "SELECT name FROM pragma_table_info('users') ORDER BY cid"
+            "SELECT name, type FROM pragma_table_info('users') ORDER BY cid"
         );
         let pg = describe_sql("postgresql", "", "users", "app").unwrap();
         assert!(pg.contains("table_schema = 'public'"), "{}", pg);
+        // 三种方言都必须第二列给类型，否则提示词里就只有裸列名
+        assert!(pg.contains("SELECT column_name, data_type"), "{}", pg);
         let my = describe_sql("mysql", "", "users", "shop").unwrap();
         assert!(my.contains("TABLE_SCHEMA = 'shop'"), "{}", my);
+        // MySQL 用 COLUMN_TYPE 而不是 DATA_TYPE：decimal(12,2) 的精度才留得住
+        assert!(my.contains("SELECT COLUMN_NAME, COLUMN_TYPE"), "{}", my);
         // 表名仍走标识符白名单
         assert!(describe_sql("mysql", "", "users; DROP x", "shop").is_err());
         assert!(describe_sql("oracle", "", "users", "").is_err());
@@ -721,11 +764,28 @@ mod tests {
     async fn describe_columns_reads_real_sqlite_columns() {
         let db = temp_db();
         let cfg = sqlite_cfg("lite", &path_in(&db, "lite.sqlite"));
-        run_dispatch(&cfg, "CREATE TABLE cust (id INTEGER, name TEXT, score REAL)")
-            .await
-            .unwrap();
+        // 最后一列故意不写类型：sqlite 允许，类型必须是空串而不是把整次探查打回
+        run_dispatch(
+            &cfg,
+            "CREATE TABLE cust (id INTEGER, name TEXT, score REAL, note)",
+        )
+        .await
+        .unwrap();
         let cols = describe_columns(&cfg, "", "cust").await.unwrap();
-        assert_eq!(cols, vec!["id", "name", "score"]);
+        assert_eq!(cols, vec!["id", "name", "score", "note"]);
+        let typed = describe_columns_typed(&cfg, "", "cust").await.unwrap();
+        assert_eq!(
+            typed
+                .iter()
+                .map(|c| (c.name.as_str(), c.data_type.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("id", "INTEGER"),
+                ("name", "TEXT"),
+                ("score", "REAL"),
+                ("note", "")
+            ]
+        );
         // 不存在的表必须明确报错，而不是回一个空清单让校验"意外通过"
         assert!(describe_columns(&cfg, "", "ghost").await.is_err());
     }
@@ -1045,6 +1105,7 @@ mod tests {
                 schema: String::new(),
                 table: "orders".into(),
                 columns: vec!["id".into(), "user_id".into(), "amount".into(), "status".into()],
+                column_types: col_types(&[("id", "INTEGER"), ("user_id", "INTEGER"), ("amount", "REAL"), ("status", "TEXT")]),
             },
             CatalogTable {
                 connection_id: "crm".into(),
@@ -1053,8 +1114,11 @@ mod tests {
                 schema: String::new(),
                 table: "users".into(),
                 columns: vec!["id".into(), "city".into()],
+                column_types: col_types(&[("id", "INTEGER"), ("city", "TEXT")]),
             },
         ];
+        // 提示词里带类型，本机校验比对的仍只是列名
+        assert!(ai::prompt("各城市成交额", &catalog, None).contains("amount REAL"));
         let raw = r#"好的，这是你要的看板：
         ```json
         {"datasets":[{"id":"city-gmv","name":"城市成交额","base":"o",

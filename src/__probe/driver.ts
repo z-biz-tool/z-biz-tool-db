@@ -38,6 +38,21 @@ function clickButton(text: string) {
   (window as any).__PROBE_CLICK(b);
 }
 
+/** 从某个下标起，某条命令收到的目录摘要 */
+function sentOf(cmd: string, from: number) {
+  return ((window as any).__PROBE_CALLS as any[])
+    .slice(from)
+    .filter((c: any) => c.cmd === cmd)
+    .map((c: any) =>
+      (c.args.catalog || []).map((t: any) => {
+        const cols: string[] = t.columns || [];
+        const typed: Record<string, string> = t.column_types || {};
+        const nTypes = cols.filter((x) => (typed[x] || "").trim()).length;
+        return `${t.connection_id}/${t.table}:${cols.length}/${nTypes}:${t.database_type}`;
+      })
+    );
+}
+
 export function installDriver() {
   const w = window as any;
   w.__probe = {
@@ -48,14 +63,10 @@ export function installDriver() {
     marks: () => w.__PROBE_CALLS.length,
     /** 从某个下标起，某条命令的调用次数 */
     callsOf: (cmd: string, from: number) => w.__PROBE_CALLS.slice(from).filter((c: any) => c.cmd === cmd),
-    /** 交给后端的目录摘要：连接/表:列数:方言，列数为 0 就是这次要堵的洞 */
-    catalogSent: (from: number) =>
-      w.__PROBE_CALLS
-        .slice(from)
-        .filter((c: any) => c.cmd === "ai_report_draft")
-        .map((c: any) =>
-          (c.args.catalog || []).map((t: any) => `${t.connection_id}/${t.table}:${t.columns.length}`)
-        ),
+    /** 交给后端的目录摘要：连接/表:列数:带类型的列数:方言。
+     *  列数为 0 就是 T-067 堵掉的那个洞；带类型的列数为 0 说明类型没送到模型眼前。 */
+    catalogSent: (from: number) => sentOf("ai_report_draft", from),
+    genCatalogSent: (from: number) => sentOf("ai_sql_generate", from),
     tags: () => Array.from(document.querySelectorAll(".ant-tag")).map((t) => (t.textContent || "").trim()),
     alerts: () =>
       Array.from(document.querySelectorAll(".ant-alert")).map((a) =>
