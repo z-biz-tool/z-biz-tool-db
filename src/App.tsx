@@ -2388,6 +2388,29 @@ function App() {
                       {aiLoading ? "生成中（每次尝试最长 60 秒）" : "生成 SQL"}
                     </Button>
                   </Form>
+                  {/* 与其让用户撞了墙再找出口，不如在撞之前就说清这一腿的边界在哪 */}
+                  {connections.length > 1 && (
+                    <div style={{ marginTop: 10 }}>
+                      <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 4 }}>
+                        {`这一腿只看得到当前连接（${
+                          selectedConnection?.name || "还没连上"
+                        }）的表；本机还有 ${
+                          connections.length - 1
+                        } 条连接的表要一起用，得走报表那条腿：各库分别取数，在本机内存里 join。`}
+                      </Text>
+                      <Button
+                        size="small"
+                        icon={<DashboardOutlined />}
+                        disabled={!aiNaturalLanguage.trim()}
+                        onClick={() => {
+                          setShowAiResultModal(false);
+                          goReport(aiNaturalLanguage, true);
+                        }}
+                      >
+                        把这句需求拿去跨库出图
+                      </Button>
+                    </div>
+                  )}
                   {aiDraftError && (
                     <Alert
                       type="error"
