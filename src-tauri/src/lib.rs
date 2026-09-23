@@ -89,7 +89,7 @@ pub struct QueryResult {
     /// T-031：是否被截断（超过 max_rows）
     #[serde(default)]
     pub truncated: bool,
-    /// T-031：总行数（截断时提供）
+    /// T-031：总行数；truncated 且这里是 0 表示"流式提前停止、总数没数过"（不是 0 行）
     #[serde(default)]
     pub total_rows: u64,
 }
@@ -880,6 +880,44 @@ async fn pg_run(pool: &PgPool, sql: &str) -> Result<RunOutput, String> {
     }
 }
 
+/// T-031：sqlite 走"边取边停"。`cap` 有值时按流取 cap+1 行——多拿那一行只为确定
+/// "后面还有没有"，取够就丢掉流（判据与连接可复用性见 tests::early_stop_streaming_saves_the_rest_of_the_fetch）。
+/// 返回的第二个值是"确实还有更多行"：这时总行数没数过，前端不能说"共 M 行"。
+/// mysql/postgres 不在本机可测的范围内，继续走 fetch_all + 事后截断。
+async fn sqlite_run_capped(
+    pool: &SqlitePool,
+    sql: &str,
+    cap: Option<usize>,
+) -> Result<(RunOutput, bool), String> {
+    use futures_util::TryStreamExt;
+    let Some(n) = cap.filter(|_| is_query_stmt(sql)) else {
+        return Ok((sqlite_run(pool, sql).await?, false));
+    };
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    let mut stream = sqlx::query(sql).fetch(&mut *conn);
+    let mut data: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut meta: Vec<ColumnMeta> = Vec::new();
+    let mut more = false;
+    while let Some(row) = stream.try_next().await.map_err(|e| e.to_string())? {
+        if data.len() >= n {
+            // 只多看这一行，不再往下物化
+            more = true;
+            break;
+        }
+        if meta.is_empty() {
+            meta = column_meta_from_row(row.columns());
+        }
+        let mut cells = Vec::with_capacity(row.columns().len());
+        for i in 0..row.columns().len() {
+            cells.push(sqlite_cell(&row, i));
+        }
+        data.push(cells);
+    }
+    drop(stream);
+    drop(conn);
+    Ok(((meta, data, 0, true), more))
+}
+
 async fn sqlite_run(pool: &SqlitePool, sql: &str) -> Result<RunOutput, String> {
     if is_query_stmt(sql) {
         let rows = sqlx::query(sql).fetch_all(pool).await.map_err(|e| e.to_string())?;
@@ -1235,6 +1273,9 @@ async fn execute_query_inner(
     let start = std::time::Instant::now();
     let db_type = dispatch_db_type(&config)?;
     let connect_start = std::time::Instant::now();
+    // 只有 sqlite + 有上限时走流式；Some(true) = 还有更多行没取，总数未数过
+    let cap = max_rows.map(|m| m as usize);
+    let mut streamed_more: Option<bool> = None;
     let dispatch_result = match db_type {
         "mysql" => {
             let pool = mysql_pool(&config).await?;
@@ -1249,7 +1290,10 @@ async fn execute_query_inner(
         "sqlite" => {
             let pool = sqlite_pool(&config).await?;
             let es = std::time::Instant::now();
-            sqlite_run(&pool, &sql).await.map(|r| (r.0, r.1, r.2, r.3, es))
+            sqlite_run_capped(&pool, &sql, cap).await.map(|(r, more)| {
+                streamed_more = if cap.is_some() { Some(more) } else { None };
+                (r.0, r.1, r.2, r.3, es)
+            })
         }
         _ => return Err("不支持的数据库类型".to_string()),
     };
@@ -1292,13 +1336,23 @@ async fn execute_query_inner(
     // T-022 generation 透传：UI 可携带并比对
     let generation = expected_generation.unwrap_or(0);
 
-    // T-031：max_rows 截断逻辑
+    // T-031：max_rows 截断。sqlite 那条已经在取数时停了，"还有更多"是确定的，
+    // 但总行数没数过——total_rows 给 0，由前端说"后面的行没取"而不是编一个总数。
     let max = max_rows.unwrap_or(u32::MAX) as usize;
-    let total_rows = rows.len() as u64;
-    let truncated = rows.len() > max;
-    if truncated {
-        rows.truncate(max);
-    }
+    let (total_rows, truncated) = match streamed_more {
+        Some(more) => (
+            if more { 0 } else { rows.len() as u64 },
+            more,
+        ),
+        None => {
+            let total = rows.len() as u64;
+            let cut = rows.len() > max;
+            if cut {
+                rows.truncate(max);
+            }
+            (total, cut)
+        }
+    };
 
     let mut result = QueryResult {
         id,
@@ -3325,6 +3379,94 @@ mod tests {
         } else {
             let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
         }
+    }
+
+    /// 生产路径的流式截断（T-031）：cap 比表行数小时取满就停并如实报"后面还有"，
+    /// 够大时给准确总数；每种情况都再查一次，证明提前丢掉流没把池子弄脏。
+    #[tokio::test]
+    async fn sqlite_run_capped_stops_early_and_keeps_the_pool_usable() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+
+        let dir = std::env::temp_dir().join(format!("zdb-cap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("t.sqlite");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(file.to_string_lossy().as_ref())
+                    .unwrap()
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for i in 1..=10 {
+            sqlx::query(&format!("INSERT INTO t VALUES ({i})"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // 截断：只取回 4 行，并且明确"后面还有"（总数没数过，前端不能说共几行）
+        let (out, more) = sqlite_run_capped(&pool, "SELECT id FROM t ORDER BY id", Some(4))
+            .await
+            .unwrap();
+        assert_eq!(out.1.len(), 4);
+        assert!(more);
+        assert!(!out.0.is_empty(), "流式路径也要把列元数据带回来");
+        assert_eq!(out.0.len(), 1);
+
+        // 上限够大：不截断，总数就是取回的行数
+        let (all, more2) = sqlite_run_capped(&pool, "SELECT id FROM t", Some(50))
+            .await
+            .unwrap();
+        assert_eq!(all.1.len(), 10);
+        assert!(!more2);
+
+        // 零行不能报成"被截断"
+        let (none, more3) = sqlite_run_capped(&pool, "SELECT id FROM t WHERE id < 0", Some(3))
+            .await
+            .unwrap();
+        assert!(none.1.is_empty());
+        assert!(!more3);
+
+        // 没有上限时走原来的整批路径
+        let (whole, more4) = sqlite_run_capped(&pool, "SELECT id FROM t", None).await.unwrap();
+        assert_eq!(whole.1.len(), 10);
+        assert!(!more4);
+
+        // 关键那一条：生产函数自己也得真的少取，而不只是"少返回"。
+        // 每行一个查询时才生成的 200KB blob，整批物化 vs 只取 5 行的耗时差就是证据
+        sqlx::query(&format!(
+            "CREATE TABLE big AS WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {ROWS}) SELECT n AS id FROM c",
+            ROWS = 120
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let heavy = "SELECT id, randomblob(200000) AS b FROM big";
+        let t0 = std::time::Instant::now();
+        let (all_rows, _) = sqlite_run_capped(&pool, heavy, None).await.unwrap();
+        let full_ms = t0.elapsed().as_millis().max(1);
+        let t1 = std::time::Instant::now();
+        let (few, more5) = sqlite_run_capped(&pool, heavy, Some(5)).await.unwrap();
+        let stop_ms = t1.elapsed().as_millis().max(1);
+        assert_eq!(all_rows.1.len(), 120);
+        assert_eq!(few.1.len(), 5);
+        assert!(more5);
+        assert!(
+            stop_ms * 4 < full_ms,
+            "只取 5 行用了 {}ms，整批 120 行用了 {}ms：生产路径没真少取",
+            stop_ms,
+            full_ms
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// T-031 的判据，不是生产路径：sqlx 0.8 上"边取边停"到底省不省后面的活，

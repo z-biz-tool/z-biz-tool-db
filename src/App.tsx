@@ -360,7 +360,9 @@ function App() {
       // 否则用户拿这份 CSV 去对账，少的行没人认领
       msgApi.success(
         resultMeta
-          ? `已导出 ${queryResults.length} 行到 CSV（这次结果共 ${resultMeta.total} 行，界面按上限只取回了 ${resultMeta.shown} 行）`
+          ? `已导出 ${queryResults.length} 行到 CSV（界面按上限只取回了 ${resultMeta.shown} 行${
+              resultMeta.total ? `，这次结果共 ${resultMeta.total} 行` : "，后面的行没取"
+            }）`
           : `已导出 ${queryResults.length} 行到 CSV`
       );
     } catch (e: any) {
@@ -487,10 +489,12 @@ function App() {
       useAgentStore.getState().addMessage({
         id: `${Date.now().toString(36)}-run`,
         role: "system",
+        // sqlite 走流式时总数没数过（total_rows = 0），这时只能说"后面还有"，
+        // 编一个总数出来就是拿界面的数当库里的数
         content: result.truncated
-          ? `已执行一条语句，结果共 ${result.total_rows} 行，界面按上限只取回 ${
+          ? `已执行一条语句，结果超过 ${result.rows?.length || 0} 行，界面按上限只取回前 ${
               result.rows?.length || 0
-            } 行，耗时 ${result.execution_time_ms || 0}ms`
+            } 行（后面的没取），耗时 ${result.execution_time_ms || 0}ms`
           : `已执行一条语句，返回 ${result.rows?.length || 0} 行，耗时 ${
               result.execution_time_ms || 0
             }ms`,
@@ -517,7 +521,7 @@ function App() {
       // 截断不能只报绿：这一屏看不到剩下的行，用户以为手里就是全量
       if (result.truncated) {
         msgApi.warning({
-          content: `查询执行成功，但结果共 ${result.total_rows} 行，界面按上限只画前 ${shown} 行——${timing}。要全量请调高上限或在语句里自己收口`,
+          content: `查询执行成功，但结果不止 ${shown} 行，界面按上限只画前 ${shown} 行（后面的没取）——${timing}。要全量请调高上限或在语句里自己收口`,
           duration: 6,
         });
       } else {
@@ -1883,11 +1887,17 @@ function App() {
                       title={
                         <Space size={6}>
                           {resultMeta
-                            ? `查询结果 (前 ${resultMeta.shown} 行 / 共 ${resultMeta.total} 行)`
+                            ? `查询结果 (前 ${resultMeta.shown} 行${
+                                resultMeta.total ? ` / 共 ${resultMeta.total} 行` : " · 后面还有"
+                              })`
                             : `查询结果 (${queryResults.length} 行)`}
                           {resultMeta && (
                             <Tooltip
-                              title={`界面上限 ${rowCap} 行：这次结果共 ${resultMeta.total} 行，只有前 ${resultMeta.shown} 行进表格与 CSV`}
+                              title={`界面上限 ${rowCap} 行：只有前 ${resultMeta.shown} 行进表格与 CSV${
+                                resultMeta.total
+                                  ? `，这次结果共 ${resultMeta.total} 行`
+                                  : "；sqlite 这条是取到上限就停，总行数没数过"
+                              }`}
                             >
                               <Tag color="orange">按上限截断</Tag>
                             </Tooltip>

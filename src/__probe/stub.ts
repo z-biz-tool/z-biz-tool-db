@@ -723,11 +723,14 @@ function invoke(cmd: string, args: any): Promise<any> {
       ]);
       const cap = Number(a.maxRows ?? a.max_rows ?? 0);
       const cut = cap > 0 && all.length > cap;
+      // 与 sqlite 流式那条同口径：取到上限就停，总行数没数过 → 0 = 未知（不是 0 行）。
+      // ?totalknown=1 当成 mysql/postgres 那半边（整批取回后截断，总数是准的）
+      const reportedTotal = cut && !window.__PROBE_FLAG("totalknown") ? 0 : all.length;
       return Promise.resolve({
         id: "probe-run-1",
         columns: ["id", "city", "amount"],
         truncated: cut,
-        total_rows: all.length,
+        total_rows: reportedTotal,
         column_meta: [
           { ordinal: 0, name: "id", native_type: "BIGINT", logical_type: "integer", nullable: false },
           { ordinal: 1, name: "city", native_type: "VARCHAR", logical_type: "text", nullable: true },
