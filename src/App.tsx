@@ -756,6 +756,48 @@ function App() {
     }
   };
 
+  /** 拒因点名的表到底躺在哪个连接里。只在"真有不认得的表 + 确实存在别的连接"时才多这一趟；
+   *  只认已经读到表清单的连接，问不到就说问不到。SQL 助手的错误卡与 Agent 气泡共用这一份。 */
+  const findTablesElsewhere = async (
+    names: string[]
+  ): Promise<{
+    found: { table: string; connection: string }[];
+    missing: string[];
+    failed: string[];
+  } | null> => {
+    const others = connections.filter((c) => c.id !== selectedConnection?.id);
+    if (!names.length || !others.length) return null;
+    const found: { table: string; connection: string }[] = [];
+    const failed: string[] = [];
+    const hit = new Set(names.map((n) => n.toLowerCase()));
+    for (const c of others) {
+      let list: TableSummary[] = [];
+      try {
+        list = await listTables(toBackendConfig(c));
+      } catch {
+        failed.push(c.name);
+        continue;
+      }
+      for (const t of list) {
+        const qualified = t.schema ? `${t.schema}.${t.name}` : t.name;
+        for (const n of names) {
+          if (!hit.has(n.toLowerCase())) continue;
+          if (
+            t.name.toLowerCase() === n.toLowerCase() ||
+            qualified.toLowerCase() === n.toLowerCase()
+          ) {
+            hit.delete(n.toLowerCase());
+            found.push({ table: n, connection: c.name || c.database || c.id });
+          }
+        }
+      }
+    }
+    // 一张都没点到、也没哪个连接问失败——那就是"哪儿都没有"，模型编的，改稿那条腿才对症
+    if (!found.length && !failed.length) return null;
+    const missing = names.filter((n) => !found.some((f) => f.table === n));
+    return { found, missing, failed };
+  };
+
   // 错误卡立起来之后，去别的连接问一遍表清单：只在真撞上"表不认得"且确实有别的连接时才多
   // 这一趟，平时不开这个口。清单是异步回来的，用户可能在这段时间里又生成了一稿或关了卡片，
   // 所以要拿序号认回最新那一轮，别让上一轮的结论挂在新卡片上。
@@ -767,44 +809,16 @@ function App() {
       return;
     }
     const names = unknownTablesOfVerdict(aiDraftError.detail);
-    const others = connections.filter((c) => c.id !== selectedConnection?.id);
-    if (!names.length || !others.length) {
+    if (!names.length) {
       crossDbSeq.current += 1;
       setCrossDb(null);
       return;
     }
     const seq = ++crossDbSeq.current;
-    (async () => {
-      const found: { table: string; connection: string }[] = [];
-      const failed: string[] = [];
-      const hit = new Set(names.map((n) => n.toLowerCase()));
-      for (const c of others) {
-        let list: TableSummary[] = [];
-        try {
-          list = await listTables(toBackendConfig(c));
-        } catch {
-          failed.push(c.name);
-          continue;
-        }
-        for (const t of list) {
-          const qualified = t.schema ? `${t.schema}.${t.name}` : t.name;
-          for (const n of names) {
-            if (!hit.has(n.toLowerCase())) continue;
-            if (
-              t.name.toLowerCase() === n.toLowerCase() ||
-              qualified.toLowerCase() === n.toLowerCase()
-            ) {
-              hit.delete(n.toLowerCase());
-              found.push({ table: n, connection: c.name || c.database || c.id });
-            }
-          }
-        }
-      }
-      if (crossDbSeq.current !== seq) return;
-      const missing = names.filter((n) => !found.some((f) => f.table === n));
-      // 一张都没点到、也没哪个连接问失败——那就是"哪儿都没有"，模型编的，改稿那条腿才对症
-      setCrossDb(found.length || failed.length ? { found, missing, failed } : null);
-    })();
+    void findTablesElsewhere(names).then((res) => {
+      // 清单是异步回来的，这段时间里可能又生成了一稿或关了卡片：只认最新那一轮
+      if (crossDbSeq.current === seq) setCrossDb(res);
+    });
   }, [aiDraftError, connections, selectedConnection]);
 
   // 四条解说链路（优化/解释/诊断/结果）只回文字，不动数据：
@@ -970,11 +984,23 @@ function App() {
       // 有被挡下的那条才给改稿单：模型没给出 SQL 时（请求没发出去、回复里没 SQL）
       // 两半缺一半，那一键只会让模型凭空重画
       const gone = rej.sql?.trim();
+      // "这张表其实在别的连接里"这一条 SQL 腿改不动：本腿只把当前连接的表交给模型。
+      // 认得出真身就把另一条腿的入口给出来，认不出就只留拒因（不编出口）。
+      const cross = await findTablesElsewhere(unknownTablesOfVerdict(rej.error));
+      // 那句"其实它在别的连接里"由面板按 cross 单独画：错误原文要保持原样，
+      // 「诊断这条报错」把整段话喂回模型会连自己加的提示一起诊断
       return {
         success: false,
         content: "",
         error: gone ? `${rej.error}\n被挡下的那条是：\n${gone}` : rej.error,
         fix: gone ? { question: text, error: rej.error, sql: gone } : undefined,
+        cross: cross?.found.length
+          ? {
+              question: text,
+              tables: cross.found.map((f) => f.table),
+              connections: [...new Set(cross.found.map((f) => f.connection))],
+            }
+          : undefined,
       };
     }
   };
@@ -2240,6 +2266,10 @@ function App() {
                     onUseSql={(sql) => {
                       setSqlCode(sql);
                       msgApi.success("已填进编辑器，运行前自己过一眼");
+                    }}
+                    onGoReport={(q) => {
+                      setShowAiResultModal(false);
+                      goReport(q);
                     }}
                   />
                 </div>

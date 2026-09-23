@@ -20,7 +20,7 @@ import {
 } from 'antd';
 import { RobotOutlined, SendOutlined } from '@ant-design/icons';
 import { useAgentStore } from '../agent/AgentManager';
-import type { AgentIntent } from '../agent/types';
+import type { AgentIntent, AgentMessage } from '../agent/types';
 
 const { TextArea } = Input;
 const { Text } = Typography;
@@ -51,9 +51,39 @@ export interface AgentPanelProps {
   onUseSql?: (sql: string) => void;
   /** 清空对话时的额外收尾：会话都没了，宿主据以改稿的"上一稿"也该作废 */
   onClear?: () => void;
+  /** 撞见"表在别的连接里"时把那句需求送去 AI 报表（那边能跨连接出图）。不给就不显示出口。 */
+  onGoReport?: (question: string) => void;
 }
 
-export function AgentPanel({ hint, onUseSql, onClear }: AgentPanelProps) {
+export function AgentPanel({ hint, onUseSql, onClear, onGoReport }: AgentPanelProps) {
+  /** "表其实在别的连接里"那一块：SQL 腿的失败现场（system）与问数回复（agent）都会带，
+   *  两处都要有出口，否则用户在气泡里看到一句解释却不知道下一步去哪。 */
+  const crossBlock = (msg: AgentMessage) =>
+    msg.cross ? (
+      <div style={{ marginTop: 6 }}>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {msg.cross.tables.join('、') +
+            ` 其实在连接「${msg.cross.connections.join('」「')}」里：` +
+            '一条 SQL 只能进一个库，这一腿的目录加不进它。'}
+        </Text>
+        {onGoReport && (
+          <div>
+            <Tooltip title="AI 报表能跨连接选表：各库分别取数，在本机内存里 join">
+              <Button
+                size="small"
+                type="primary"
+                style={{ marginTop: 4 }}
+                disabled={busy}
+                onClick={() => onGoReport(msg.cross?.question || '')}
+              >
+                拿去 AI 报表出图
+              </Button>
+            </Tooltip>
+          </div>
+        )}
+      </div>
+    ) : null;
+
   const [input, setInput] = useState('');
   const [intent, setIntent] = useState<AgentIntent>('query');
   const { messages, busy, ask, clear } = useAgentStore();
@@ -153,6 +183,7 @@ export function AgentPanel({ hint, onUseSql, onClear }: AgentPanelProps) {
                     >
                       诊断这条报错
                     </Button>
+                    {crossBlock(msg)}
                   </div>
                 ) : (
                   <Text type="secondary" style={{ fontSize: 12 }}>
@@ -230,6 +261,8 @@ export function AgentPanel({ hint, onUseSql, onClear }: AgentPanelProps) {
                     </Button>
                   </Tooltip>
                 )}
+
+                {crossBlock(msg)}
 
                 <Text type="secondary" style={{ fontSize: '12px', marginTop: 4 }}>
                   {new Date(msg.timestamp).toLocaleTimeString()}

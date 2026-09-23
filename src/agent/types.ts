@@ -5,6 +5,14 @@
  *  放在 AI 助手弹窗的按钮上更合适，进对话栏只会让用户以为打字有用。 */
 export type AgentIntent = 'query' | 'diagnose';
 
+/** 本机挡下的表其实躺在别的连接里：面板据此给出「拿去 AI 报表出图」，
+ *  question 是当初那句话，交接过去不用用户再抄一遍。 */
+export interface AgentCrossDb {
+  question: string;
+  tables: string[];
+  connections: string[];
+}
+
 export interface AgentMessage {
   id: string;
   /** system 是"发生过的事"（例如一条已执行的语句），不是用户打的话，别画成用户气泡 */
@@ -13,6 +21,7 @@ export interface AgentMessage {
   sql?: string;
   /** 带这个字段的 system 行是一次失败现场：面板据此给出「诊断这条报错」 */
   error?: string;
+  cross?: AgentCrossDb;
   /** 带这个字段的 agent 气泡是一次被本机挡下的稿子：面板据此给出「照这条错误改」 */
   fix?: SqlFixTicket;
   timestamp: number;
@@ -40,6 +49,7 @@ export interface AgentResponse {
   content: string;
   sql?: string;
   error?: string;
+  cross?: AgentCrossDb;
   /** 这一轮没过本机校验、且手上确有被拒的那条 SQL 时带回来 */
   fix?: SqlFixTicket;
 }
