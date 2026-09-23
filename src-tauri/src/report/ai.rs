@@ -135,8 +135,9 @@ fn object_at(text: &[char], start: usize) -> Option<String> {
     None
 }
 
-/// 去掉 ```...``` 包裹；没有围栏时原样返回
-fn strip_fences(raw: &str) -> &str {
+/// 去掉 ```...``` 包裹；没有围栏时原样返回。
+/// ai_sql 那条链也要剥围栏，所以对 crate 内可见
+pub(crate) fn strip_fences(raw: &str) -> &str {
     let t = raw.trim();
     let Some(open) = t.find("```") else { return t };
     let after = &t[open + 3..];

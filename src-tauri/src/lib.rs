@@ -16,6 +16,8 @@ mod security;
 mod secrets;
 #[path = "agent_service.rs"]
 mod agent_service;
+#[path = "ai_sql.rs"]
+mod ai_sql;
 pub mod report;
 
 // ================== 数据结构 ==================
@@ -961,33 +963,7 @@ async fn call_ai_service(config: &AIConfig, prompt: &str) -> Result<String, Stri
     report::ai::chat(config, prompt).await
 }
 
-// AI 生成 SQL（自然语言 → SQL）
-#[command]
-async fn ai_generate_sql(natural_language: String, tables_info: Vec<TableInfo>, config: AIConfig) -> Result<String, String> {
-    if config.base_url.is_empty() || config.api_key.is_empty() {
-        return Err("请先在设置中配置 AI 参数".to_string());
-    }
-    
-    let tables_detail = tables_info.iter()
-        .map(|t| format!("表名: {}, 估计行数: {}, 大小: {} bytes", 
-            t.name, t.row_estimate.unwrap_or(0), t.size_bytes.unwrap_or(0)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    
-    let prompt = format!(
-        "你是一个专业的数据库工程师。请根据以下表结构和自然语言描述，生成标准 SQL 语句。\n\n\
-         表结构:\n{}\n\n\
-         需求描述: {}\n\n\
-         要求:\n\
-         1. 只返回 SQL 语句，不要有额外解释\n\
-         2. 使用标准 SQL 语法\n\
-         3. 添加适当的注释说明\n\
-         SQL:",
-        tables_detail, natural_language
-    );
-    
-    call_ai_service(&config, &prompt).await
-}
+// AI 生成 SQL 在 ai_sql 模块：那里的提示词带真实列清单，产出还在本机校验。
 
 // ================== 本地 Agent 客户端 ==================
 
@@ -2436,7 +2412,7 @@ pub fn run() {
             delete_saved_query,
             get_ai_config,
             save_ai_config,
-            ai_generate_sql,
+            ai_sql::ai_sql_generate,
             ai_explain_results,
             ai_optimize_sql,
             ai_explain_sql,
