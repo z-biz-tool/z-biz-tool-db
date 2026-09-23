@@ -342,48 +342,110 @@ pub fn validate_view(
     view: &ViewSpec,
     schemas: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<String>, String> {
+    let (steps, problems) = check_view(view, schemas);
+    if !problems.is_empty() {
+        return Err(problem_list(&problems));
+    }
+    Ok(steps)
+}
+
+/// 只要"哪里不成立"，不要执行计划。起草那侧把它和数据集侧的问题并成一份清单，
+/// 让模型一轮就把整稿改干净，而不是三轮各撞一条。
+pub fn view_problems(view: &ViewSpec, schemas: &HashMap<String, Vec<String>>) -> Vec<String> {
+    check_view(view, schemas).1
+}
+
+/// 返回（执行计划片段，不成立之处）。problems 非空时 steps 不再可信，调用方只看 problems。
+///
+/// 一次把不成立的地方列全，而不是撞到第一处就停：自修复默认只有两轮预算，
+/// 逐条报等于让模型一轮只来得及改一个错；手改规格 JSON 的人更是改一处试一次。
+fn check_view(
+    view: &ViewSpec,
+    schemas: &HashMap<String, Vec<String>>,
+) -> (Vec<String>, Vec<String>) {
+    let mut steps: Vec<String> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
     if view.id.trim().is_empty() {
-        return Err("视图缺少 id".into());
+        problems.push("视图缺少 id".into());
     }
     if view.widgets.is_empty() {
-        return Err("视图没有任何组件".into());
+        problems.push("视图没有任何组件".into());
     }
-    let mut steps: Vec<String> = Vec::new();
     let mut ids: Vec<String> = Vec::new();
     for w in &view.widgets {
         if w.id.trim().is_empty() {
-            return Err("存在没有 id 的组件".into());
+            problems.push("存在没有 id 的组件".into());
+        } else if ids.contains(&w.id) {
+            problems.push(format!("组件 id {} 重复", w.id));
+        } else {
+            ids.push(w.id.clone());
         }
-        if ids.contains(&w.id) {
-            return Err(format!("组件 id {} 重复", w.id));
-        }
-        ids.push(w.id.clone());
-        let cols = schemas
-            .get(&w.dataset)
-            .ok_or_else(|| format!("组件 {} 绑定的数据集 {} 不存在", w.id, w.dataset))?;
-        if cols.is_empty() {
-            return Err(format!("数据集 {} 没有可输出的列", w.dataset));
-        }
-        // 组件 id 由外层统一包上：一张 20 个组件的看板上，"total_fee 不存在"
-        // 只有带着组件名才有人看得懂，AI 也才知道该改哪一条。
-        let described = validate_widget(w, cols)
-            .map_err(|e| format!("组件 {}（数据集 {}）：{}", w.id, w.dataset, e))?;
-        for f in &w.filters {
-            parse_expr(f, &AllowedColumns(cols.clone()))
-                .map_err(|e| format!("组件 {} 过滤条件 [{}]: {}", w.id, f, e))?;
-            steps.push(format!("WHERE {}", f));
-        }
-        steps.push(format!(
-            "WIDGET {} {} [{}] dataset={}",
-            w.id,
-            kind_name(w.kind),
-            described.join(" "),
-            w.dataset
-        ));
     }
-    let layout = resolve_layout(view)?;
-    steps.push(format!("LAYOUT {} 个组件", layout.len()));
-    Ok(steps)
+    // 组件都指不清是谁，再逐条报"某列不存在"只是把真因埋起来
+    if problems.is_empty() {
+        for w in &view.widgets {
+            let cols = match schemas.get(&w.dataset) {
+                Some(c) => c,
+                None => {
+                    problems.push(format!("组件 {} 绑定的数据集 {} 不存在", w.id, w.dataset));
+                    continue;
+                }
+            };
+            if cols.is_empty() {
+                problems.push(format!("数据集 {} 没有可输出的列", w.dataset));
+                continue;
+            }
+            // 组件 id 由这里统一包上：一张 20 个组件的看板上，"total_fee 不存在"
+            // 只有带着组件名才有人看得懂，AI 也才知道该改哪一条。
+            let described = match validate_widget(w, cols) {
+                Ok(d) => d,
+                Err(e) => {
+                    problems.push(format!("组件 {}（数据集 {}）：{}", w.id, w.dataset, e));
+                    continue;
+                }
+            };
+            let mut ok = true;
+            for f in &w.filters {
+                match parse_expr(f, &AllowedColumns(cols.clone())) {
+                    Ok(_) => steps.push(format!("WHERE {}", f)),
+                    Err(e) => {
+                        problems.push(format!("组件 {} 过滤条件 [{}]: {}", w.id, f, e));
+                        ok = false;
+                    }
+                }
+            }
+            if ok {
+                steps.push(format!(
+                    "WIDGET {} {} [{}] dataset={}",
+                    w.id,
+                    kind_name(w.kind),
+                    described.join(" "),
+                    w.dataset
+                ));
+            }
+        }
+        // 布局留到组件全对之后再评：一张列名就写错的稿子上再补一句"组件 X 缺少布局"，
+        // 说的是同一处笔误的连带，不是第二个问题。
+        if problems.is_empty() {
+            match resolve_layout(view) {
+                Ok(layout) => steps.push(format!("LAYOUT {} 个组件", layout.len())),
+                Err(e) => problems.push(e),
+            }
+        }
+    }
+    (steps, problems)
+}
+
+/// 一处就照原样说清，多处才编号——前端的错误卡是 pre-wrap，一行一条正好是清单。
+pub fn problem_list(problems: &[String]) -> String {
+    if problems.len() == 1 {
+        return problems[0].clone();
+    }
+    let mut out = format!("共 {} 处问题，一次全改完再跑：", problems.len());
+    for (i, p) in problems.iter().enumerate() {
+        out.push_str(&format!("\n{}. {}", i + 1, p));
+    }
+    out
 }
 
 /// 单组件校验，返回写进执行计划的描述片段。错误不带组件 id（由 validate_view 统一包）。
@@ -421,7 +483,7 @@ fn validate_widget(w: &WidgetSpec, cols: &[String]) -> Result<Vec<String>, Strin
         } else {
             let mut picked: Vec<String> = Vec::new();
             for c in &w.encode.columns {
-                let real = need_col(cols, Some(c), "展示列")?;
+                let real = need_col(cols, Some(c), "展示")?;
                 if picked.contains(&real) {
                     return Err(format!("展示列 {} 重复", c));
                 }
@@ -812,6 +874,74 @@ mod tests {
         assert!(validate_view(&view_of(vec![]), &schemas()).is_err());
         let dup = view_of(vec![widget(ChartType::Bar), widget(ChartType::Bar)]);
         assert!(validate_view(&dup, &schemas()).unwrap_err().contains("重复"));
+    }
+
+    /// 撞到第一处就停的校验，等于让模型用两轮自修复预算去撞三个错，手改 JSON 的人
+    /// 更是改一处试一次。一次列全，每条各带自己的组件 id。
+    #[test]
+    fn validate_lists_every_broken_widget_at_once() {
+        let mut bad_col = widget(ChartType::Bar);
+        bad_col.encode.y = Some("total_fee".into());
+        let mut ghost = widget(ChartType::Pie);
+        ghost.id = "w2".into();
+        ghost.dataset = "ghost".into();
+        let mut bad_filter = widget(ChartType::Line);
+        bad_filter.id = "w3".into();
+        bad_filter.filters = vec!["nope > 1".into()];
+        let err = validate_view(
+            &view_of(vec![bad_col, ghost, bad_filter]),
+            &schemas(),
+        )
+        .unwrap_err();
+        assert!(err.contains("共 3 处问题"), "{}", err);
+        // 三处各自说清是什么：列不在数据集、数据集不存在、过滤条件里的列不存在
+        assert!(err.contains("total_fee"), "{}", err);
+        assert!(err.contains("ghost"), "{}", err);
+        assert!(err.contains("nope > 1"), "{}", err);
+        for id in ["w1", "w2", "w3"] {
+            assert!(err.contains(id), "{} 没被点名：{}", id, err);
+        }
+        // 编号成清单：错误卡是 pre-wrap，一行一条才看得完
+        assert!(err.contains("\n1. "), "{}", err);
+        assert!(err.contains("\n3. "), "{}", err);
+    }
+
+    #[test]
+    fn a_single_problem_is_not_wrapped_in_a_list() {
+        let mut w = widget(ChartType::Bar);
+        w.encode.y = Some("total_fee".into());
+        let err = validate_view(&view_of(vec![w]), &schemas()).unwrap_err();
+        assert!(!err.contains("共 "), "{}", err);
+        assert!(!err.contains("1. "), "{}", err);
+    }
+
+    /// 列名就写错着的稿子，"组件 X 缺少布局"说的多半是同一处笔误的连带
+    #[test]
+    fn layout_is_blamed_only_after_the_widgets_are_right() {
+        let mut broken = widget(ChartType::Bar);
+        broken.encode.y = Some("total_fee".into());
+        let bad_layout = vec![WidgetLayout {
+            widget: "nope".into(),
+            x: 0,
+            y: 0,
+            w: 12,
+            h: 6,
+        }];
+        let v = ViewSpec {
+            layout: bad_layout.clone(),
+            ..view_of(vec![broken])
+        };
+        let err = validate_view(&v, &schemas()).unwrap_err();
+        assert!(err.contains("total_fee"), "{}", err);
+        assert!(!err.contains("布局"), "{}", err);
+        // 组件改对了，才轮到布局这条真问题开口
+        let ok = ViewSpec {
+            layout: bad_layout,
+            ..view_of(vec![widget(ChartType::Bar)])
+        };
+        assert!(validate_view(&ok, &schemas())
+            .unwrap_err()
+            .contains("布局"));
     }
 
     #[test]

@@ -113,6 +113,49 @@ const NEVER_INT_TY = [
   "date", "datetime", "smalldatetime", "time", "timestamp", "timestamptz", "uuid", "json", "jsonb",
 ];
 
+/** 镜像 view.rs 的两条本机规则：组件绑的数据集在不在、编码点名的列在不在该数据集输出里。
+ *  输出列取 fixture.validate.schemas——那是本机对这份 fixture 真算出来的结果，镜像不另猜一套。
+ *  要点是"一次列全"而不是撞到第一处就停：否则探针看不出清单有几条，
+ *  错误卡到底按不按行铺开也就无从判起。 */
+function viewProblems(view: any, specs: any[]): string[] {
+  const known = new Set(specs.map((d: any) => d.id));
+  const schemas: Record<string, string[]> = (fixture as any).validate.schemas;
+  const out: string[] = [];
+  for (const w of view.widgets || []) {
+    if (!known.has(w.dataset)) {
+      out.push(
+        `组件 ${w.id} 绑定的数据集 ${w.dataset} 不存在（现有：${[...known].join(", ") || "-"}）`
+      );
+      continue;
+    }
+    const cols = schemas[w.dataset];
+    if (!cols) continue;
+    const need = (what: string, col: any) => {
+      if (typeof col !== "string" || !col) return;
+      if (!cols.some((c) => c.toLowerCase() === col.toLowerCase()))
+        out.push(
+          `组件 ${w.id}（数据集 ${w.dataset}）：${what} 列 ${col} 不在数据集输出里（可用列：${cols.join(", ") || "-"}）`
+        );
+    };
+    const e = w.encode || {};
+    need("x", e.x);
+    need("y", e.y);
+    need("系列", e.series);
+    need("扇区", e.category);
+    need("数值", e.value);
+    for (const c of e.columns || []) need("展示", c);
+  }
+  return out;
+}
+
+/** 与 view.rs problem_list 同措辞：一处就照原样说，多处才编号 */
+function problemList(problems: string[]): string {
+  if (problems.length === 1) return problems[0];
+  return `共 ${problems.length} 处问题，一次全改完再跑：${problems
+    .map((p, i) => `\n${i + 1}. ${p}`)
+    .join("")}`;
+}
+
 /** 镜像 ai.rs join_key_warnings：连接键跨族按三档措辞（同族保持沉默）。
  *  左侧累计列的命名规则与执行期 plan_join_columns 一致（重名依次加 _2/_3）。 */
 function joinKeyWarnings(specs: any[], catalog: any[]): string[] {
@@ -265,6 +308,14 @@ function invoke(cmd: string, args: any): Promise<any> {
             );
           }
         }
+      }
+      // 只给 report_view_validate 镜像本机的一条规则：组件绑的数据集在不在、
+      // 编码里点名的列在不在该数据集输出里（后端 validate_view / need_col 的原话）。
+      // 一次列全而不是撞到第一处就停——不然探针里根本看不出"这份清单有几条"，
+      // 前端的错误卡是不是真按行铺开也无从判起。
+      if (cmd === "report_view_validate") {
+        const problems = viewProblems(a.view || {}, a.datasets || []);
+        if (problems.length) return fail(problemList(problems));
       }
       // 镜像 report_view_render 的按数据集降级：?dsfail=city-gmv 让那张集取数失败，
       // 挂在它上面的组件被摘掉、其余照常出；全部摘光时后端是整单报错而不是回空板面。

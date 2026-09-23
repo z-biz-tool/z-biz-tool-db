@@ -174,6 +174,20 @@ export function installDriver() {
           : "other";
       return `${kind}|${(a.textContent || "").trim().replace(/\s+/g, " ")}`;
     },
+    /** "本机拒绝了这一稿"那张错误卡：返回 `whiteSpace|行数|正文（换行写成 ⏎）`。
+     *  一次列全只有真按行铺开才算省了事，光数字符看不出清单有几条。 */
+    rejectCard: () => {
+      const a = Array.from(document.querySelectorAll(".ant-alert")).find((x) =>
+        (x.textContent || "").includes("本机拒绝了这一稿")
+      );
+      if (!a) return null;
+      const body =
+        (a.querySelector(".ant-alert-description div") as HTMLElement | null) ||
+        (a.querySelector(".ant-alert-description") as HTMLElement | null) ||
+        a;
+      const text = (body.textContent || "").trim();
+      return `${getComputedStyle(body).whiteSpace}|${text.split("\n").filter(Boolean).length}|${text.replace(/\n/g, " ⏎ ")}`;
+    },
     /** 画布上现在挂着哪几张图（按图卡标题认，没标题时 ChartCard 回退到组件 id） */
     chartTitles: () =>
       Array.from(document.querySelectorAll(".ant-card-head-title")).map((t) =>

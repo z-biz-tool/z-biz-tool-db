@@ -274,7 +274,8 @@ pub fn prompt(
     if let Some(fb) = feedback {
         s.push_str("\n\n上一稿没有通过本机校验，原因：\n");
         s.push_str(fb.trim());
-        s.push_str("\n请只修正这个问题，重新输出完整 JSON。");
+        // 校验一次列全，措辞就不能说"这个问题"：那等于叫模型只改第一条，剩下两轮照样撞
+        s.push_str("\n请把上面每一处都改到，重新输出完整 JSON。");
     }
     s
 }
@@ -556,27 +557,48 @@ pub fn check_draft(draft: ReportDraft, catalog: &[CatalogTable]) -> Result<Draft
     let mut columns: HashMap<String, Vec<String>> = HashMap::new();
     let mut ids: HashSet<String> = HashSet::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    // 计划就没过的数据集：挂在它上面的组件不必再逐条喊"数据集不存在"
+    let mut dead: HashSet<String> = HashSet::new();
 
     for ds in draft.datasets {
+        // 这两条不编号往下走：id 空或重复时"哪一条坏了"根本说不清
         if ds.id.trim().is_empty() {
             return Err("数据集缺少 id".into());
         }
         if !ids.insert(ds.id.clone()) {
             return Err(format!("数据集 id {} 重复", ds.id));
         }
-        let (sources, cache, types) = normalize_sources(&ds, catalog)?;
-        let ds = DatasetSpec { sources, ..ds };
-        let plan = super::dataset::plan_dataset(&ds, &cache)
-            .map_err(|e| format!("数据集 {}：{}", label_of(&ds), e))?;
-        steps.extend(plan.steps);
-        columns.insert(ds.id.clone(), plan.columns.clone());
-        // 类型族只在结构已经合法之后才评：列名都不存在的草稿，报错比告警有用
-        warnings.extend(join_key_warnings(&ds, &types));
-        datasets.push(ds);
+        let id = ds.id.clone();
+        match plan_draft_dataset(ds, catalog) {
+            Ok((ds, plan, types)) => {
+                steps.extend(plan.steps);
+                columns.insert(ds.id.clone(), plan.columns.clone());
+                // 类型族只在结构已经合法之后才评：列名都不存在的草稿，报错比告警有用
+                warnings.extend(join_key_warnings(&ds, &types));
+                datasets.push(ds);
+            }
+            Err(e) => {
+                problems.push(e);
+                dead.insert(id);
+            }
+        }
     }
 
-    let view_steps = super::view::validate_view(&draft.view, &columns)?;
-    let used: HashSet<&str> = draft.view.widgets.iter().map(|w| w.dataset.as_str()).collect();
+    // 一稿里几个数据集互不依赖，坏一个不该挡掉其余的校验；组件侧同理，
+    // 所以两侧的问题并成一份清单一次回喂，模型一轮就能把整稿改干净。
+    let view = strip_dead_widgets(&draft.view, &dead);
+    let all_collateral = view.widgets.is_empty() && !draft.view.widgets.is_empty();
+    if problems.is_empty() {
+        steps.extend(super::view::validate_view(&view, &columns)?);
+    } else {
+        // 组件全挂在死集上时不必再问组件侧：那时"视图没有任何组件"说的是上面那条的连带
+        if !all_collateral {
+            problems.extend(super::view::view_problems(&view, &columns));
+        }
+        return Err(super::view::problem_list(&problems));
+    }
+    let used: HashSet<&str> = view.widgets.iter().map(|w| w.dataset.as_str()).collect();
     for ds in &datasets {
         if !used.contains(ds.id.as_str()) {
             warnings.push(format!(
@@ -585,7 +607,6 @@ pub fn check_draft(draft: ReportDraft, catalog: &[CatalogTable]) -> Result<Draft
             ));
         }
     }
-    steps.extend(view_steps);
     Ok(DraftResult {
         datasets,
         view: draft.view,
@@ -594,6 +615,46 @@ pub fn check_draft(draft: ReportDraft, catalog: &[CatalogTable]) -> Result<Draft
         warnings,
         repairs: 0,
     })
+}
+
+/// 目录规范化 + 执行计划合成一步。错误文本已经带 "数据集 …" 前缀，调用方直接并入清单。
+fn plan_draft_dataset(
+    ds: DatasetSpec,
+    catalog: &[CatalogTable],
+) -> Result<(DatasetSpec, super::dataset::DatasetPlan, TypeIndex), String> {
+    let (sources, cache, types) = normalize_sources(&ds, catalog)?;
+    let ds = DatasetSpec { sources, ..ds };
+    let label = label_of(&ds);
+    let plan =
+        super::dataset::plan_dataset(&ds, &cache).map_err(|e| format!("数据集 {}：{}", label, e))?;
+    Ok((ds, plan, types))
+}
+
+/// 计划阶段就没过的数据集，挂在它上面的组件先摘掉：留着只会让清单上多出一串
+/// "组件 x 绑定的数据集 y 不存在"，而 y 其实存在，只是这次没计划通。
+fn strip_dead_widgets(view: &super::view::ViewSpec, dead: &HashSet<String>) -> super::view::ViewSpec {
+    if dead.is_empty() {
+        return view.clone();
+    }
+    let widgets: Vec<_> = view
+        .widgets
+        .iter()
+        .filter(|w| !dead.contains(w.dataset.as_str()))
+        .cloned()
+        .collect();
+    let layout = view
+        .layout
+        .iter()
+        .filter(|l| widgets.iter().any(|w| w.id == l.widget))
+        .cloned()
+        .collect();
+    super::view::ViewSpec {
+        id: view.id.clone(),
+        name: view.name.clone(),
+        version: view.version,
+        widgets,
+        layout,
+    }
 }
 
 // ==================== 模型调用 ====================
@@ -857,6 +918,18 @@ mod tests {
             .contains("找不到 JSON"));
     }
 
+    /// 校验一次列全之后，提示词不能再叫模型"只修正这个问题"——那等于叫它只改第一条，
+    /// 剩下几处照样要撞满两轮才收场。
+    #[test]
+    fn repair_prompt_asks_for_every_listed_problem() {
+        let fb = "共 2 处问题，一次全改完再跑：\n1. 数据集 d1：没有表 user\n2. 组件 w2（数据集 d2）：y 列 uv 不在数据集输出里";
+        let p = prompt("各城市成交额", &catalog(), None, Some(fb));
+        assert!(p.contains("共 2 处问题"), "反馈原文要整份进提示词：{}", p);
+        assert!(p.contains("没有表 user"), "{}", p);
+        assert!(!p.contains("只修正这个问题"), "{}", p);
+        assert!(p.contains("每一处"), "{}", p);
+    }
+
     #[test]
     fn prompt_lists_every_allowed_function_and_the_catalog() {
         let p = prompt("各城市成交额", &catalog(), None, None);
@@ -1009,9 +1082,82 @@ mod tests {
         assert!(err.contains("d1"), "{}", err);
     }
 
+    /// 自修复默认只有两轮预算：一稿里两个数据集各写错一处，逐条报就得三轮才改完，
+    /// 于是本地直接把整份清单回喂给模型。
+    #[test]
+    fn check_lists_every_broken_dataset_in_one_pass() {
+        let raw = draft_of(
+            &[
+                spec(
+                    "d1",
+                    "o",
+                    r#"[{"alias":"o","connection_id":"shop","table":"user"}]"#,
+                    r#""group_by":["city"]"#,
+                ),
+                spec(
+                    "d2",
+                    "v",
+                    r#"[{"alias":"v","connection_id":"crm","table":"visits"}]"#,
+                    r#""group_by":["hour"]"#,
+                ),
+            ],
+            &[serde_json::json!({
+                "id": "w1", "type": "BAR", "dataset": "d1",
+                "encode": { "x": "city", "y": "gmv" }
+            })],
+        );
+        let err = check_draft(parse_draft(&raw).unwrap(), &catalog()).unwrap_err();
+        assert!(err.contains("没有表 user"), "{}", err);
+        assert!(err.contains("hour"), "{}", err);
+        assert!(err.contains("共 2 处问题"), "{}", err);
+        // d1 上的组件不再跟着喊"数据集 d1 不存在"——那是同一条错的连带，
+        // 模型照着它改只会把组件挪到别处去
+        assert!(!err.contains("组件 w1"), "{}", err);
+    }
+
+    #[test]
+    fn check_pairs_a_dead_dataset_with_a_broken_widget() {
+        let raw = draft_of(
+            &[
+                spec(
+                    "d1",
+                    "o",
+                    r#"[{"alias":"o","connection_id":"shop","table":"user"}]"#,
+                    r#""group_by":["city"]"#,
+                ),
+                spec(
+                    "d2",
+                    "v",
+                    r#"[{"alias":"v","connection_id":"crm","table":"visits"}]"#,
+                    concat!(
+                        r#""group_by":["day"],"#,
+                        r#""aggregates":[{"output":"pv","func":"SUM","column":"pv"}]"#,
+                    ),
+                ),
+            ],
+            &[
+                serde_json::json!({
+                    "id": "w1", "type": "BAR", "dataset": "d1",
+                    "encode": { "x": "city", "y": "gmv" }
+                }),
+                serde_json::json!({
+                    "id": "w2", "type": "BAR", "dataset": "d2",
+                    "encode": { "x": "day", "y": "uv" }
+                }),
+            ],
+        );
+        let err = check_draft(parse_draft(&raw).unwrap(), &catalog()).unwrap_err();
+        // 数据集侧和组件侧的问题并成一份清单，一轮就都送到模型眼前
+        assert!(err.contains("没有表 user"), "{}", err);
+        assert!(err.contains("组件 w2"), "{}", err);
+        assert!(err.contains("uv"), "{}", err);
+        assert!(err.contains("共 2 处问题"), "{}", err);
+        assert!(!err.contains("组件 w1"), "{}", err);
+    }
+
     #[test]
     fn check_warns_about_a_dataset_nothing_renders() {
-        let visits = spec(
+            let visits = spec(
             "d2",
             "v",
             r#"[{"alias":"v","connection_id":"crm","table":"visits"}]"#,
