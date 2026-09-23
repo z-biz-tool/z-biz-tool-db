@@ -652,7 +652,9 @@ export function ReportWorkbench({
                   title="报表簿读不出来"
                   description={
                     <Space orientation="vertical" style={{ width: "100%" }}>
-                      <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
+                      <div
+                        style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}
+                      >
                         {reportsError}
                       </div>
                       <Text type="secondary" style={{ fontSize: 12 }}>
@@ -668,82 +670,80 @@ export function ReportWorkbench({
               ) : reportsLoading && reports.length === 0 ? (
                 <Spin style={{ display: "block", margin: "60px auto" }} />
               ) : reports.length === 0 ? (
-                  <Empty
-                    description="报表簿还是空的。跑通一稿后点「存入报表簿」，下次直接点开就能重跑。"
-                    style={{ marginTop: 60 }}
-                  />
-                ) : (
-                  <List
-                    dataSource={reports}
-                    renderItem={(r) => {
-                      const conns = [
-                        ...new Set(
-                          r.datasets.flatMap((d) => d.sources.map((s) => s.connection_id))
-                        ),
-                      ];
-                      const named = conns.map((id) => configs.find((c) => c.id === id)?.name || id);
-                      return (
-                        <List.Item
-                          key={r.id}
-                          actions={[
-                            <Button
-                              key="open"
-                              size="small"
-                              type="primary"
-                              ghost
-                              icon={<FolderOpenOutlined />}
-                              onClick={() => onOpenReport(r)}
-                            >
-                              打开并取数
-                            </Button>,
-                            <Popconfirm
-                              key="del"
-                              title={`移除「${r.name}」？`}
-                              description="只删本地这一条报表规格，不会动库里的数据。"
-                              okText="移除"
-                              // 应用没有挂 zh_CN 的 ConfigProvider，不显式给就是英文 Cancel
-                              cancelText="取消"
-                              okButtonProps={{ danger: true }}
-                              onConfirm={() => onDeleteReport(r)}
-                            >
-                              <Button size="small" danger type="text" icon={<DeleteOutlined />} />
-                            </Popconfirm>,
-                          ]}
-                        >
-                          <List.Item.Meta
-                            title={
-                              <Space size={6} wrap>
-                                <Text strong>{r.name}</Text>
-                                {r.id === openId && <Tag color="processing">当前</Tag>}
-                                <Tag color={conns.length > 1 ? "purple" : "default"}>
-                                  {conns.length > 1 ? `跨 ${conns.length} 库` : `单库`}
-                                </Tag>
-                                <Tag>{r.datasets.length} 数据集</Tag>
-                                <Tag>{r.view.widgets.length} 组件</Tag>
-                                <Text type="secondary" style={{ fontSize: 12 }}>
-                                  {new Date(r.updated_at * 1000).toLocaleString()}
-                                </Text>
-                              </Space>
-                            }
-                            description={
-                              <Space orientation="vertical" size={2} style={{ width: "100%" }}>
-                                {r.description && <Text>{r.description}</Text>}
+                <Empty
+                  description="报表簿还是空的。跑通一稿后点「存入报表簿」，下次直接点开就能重跑。"
+                  style={{ marginTop: 60 }}
+                />
+              ) : (
+                <List
+                  dataSource={reports}
+                  renderItem={(r) => {
+                    const conns = [
+                      ...new Set(r.datasets.flatMap((d) => d.sources.map((s) => s.connection_id))),
+                    ];
+                    const named = conns.map((id) => configs.find((c) => c.id === id)?.name || id);
+                    return (
+                      <List.Item
+                        key={r.id}
+                        actions={[
+                          <Button
+                            key="open"
+                            size="small"
+                            type="primary"
+                            ghost
+                            icon={<FolderOpenOutlined />}
+                            onClick={() => onOpenReport(r)}
+                          >
+                            打开并取数
+                          </Button>,
+                          <Popconfirm
+                            key="del"
+                            title={`移除「${r.name}」？`}
+                            description="只删本地这一条报表规格，不会动库里的数据。"
+                            okText="移除"
+                            // 应用没有挂 zh_CN 的 ConfigProvider，不显式给就是英文 Cancel
+                            cancelText="取消"
+                            okButtonProps={{ danger: true }}
+                            onConfirm={() => onDeleteReport(r)}
+                          >
+                            <Button size="small" danger type="text" icon={<DeleteOutlined />} />
+                          </Popconfirm>,
+                        ]}
+                      >
+                        <List.Item.Meta
+                          title={
+                            <Space size={6} wrap>
+                              <Text strong>{r.name}</Text>
+                              {r.id === openId && <Tag color="processing">当前</Tag>}
+                              <Tag color={conns.length > 1 ? "purple" : "default"}>
+                                {conns.length > 1 ? `跨 ${conns.length} 库` : `单库`}
+                              </Tag>
+                              <Tag>{r.datasets.length} 数据集</Tag>
+                              <Tag>{r.view.widgets.length} 组件</Tag>
+                              <Text type="secondary" style={{ fontSize: 12 }}>
+                                {new Date(r.updated_at * 1000).toLocaleString()}
+                              </Text>
+                            </Space>
+                          }
+                          description={
+                            <Space orientation="vertical" size={2} style={{ width: "100%" }}>
+                              {r.description && <Text>{r.description}</Text>}
+                              <Text type="secondary" style={{ fontSize: 12 }} ellipsis>
+                                连接：{named.join(" + ")}
+                              </Text>
+                              {r.question && (
                                 <Text type="secondary" style={{ fontSize: 12 }} ellipsis>
-                                  连接：{named.join(" + ")}
+                                  问题：{r.question}
                                 </Text>
-                                {r.question && (
-                                  <Text type="secondary" style={{ fontSize: 12 }} ellipsis>
-                                    问题：{r.question}
-                                  </Text>
-                                )}
-                              </Space>
-                            }
-                          />
-                        </List.Item>
-                      );
-                    }}
-                  />
-                ),
+                              )}
+                            </Space>
+                          }
+                        />
+                      </List.Item>
+                    );
+                  }}
+                />
+              ),
             },
             {
               key: "plan",
