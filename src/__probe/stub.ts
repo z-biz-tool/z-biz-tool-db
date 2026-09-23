@@ -154,6 +154,9 @@ function invoke(cmd: string, args: any): Promise<any> {
       return Promise.resolve((fixture as any).validate);
     case "ai_report_draft": {
       const cat: any[] = a.catalog || [];
+      // 后端 draft() 的第一道门槛就是空问题；探针不镜像的话，
+      // "前端拦住了"和"后端拒了"在探针里长得一模一样
+      if (!String(a.question || "").trim()) return fail("请先描述你想要什么报表");
       const hole = cat.find((t) => !(t.columns || []).length);
       // 镜像 normalize_sources + source_columns：目录项列清单为空时，缓存里
       // 这张表就是零列，模型任何一次引用都过不了校验，三轮修光也没用。

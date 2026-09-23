@@ -280,6 +280,12 @@ export function ReportWorkbench({
       onOpenAiSettings();
       return;
     }
+    // 空问题后端也会拒（ai.rs 里同一条门槛），但要等一个 IPC 往返才回来，
+    // 顶着的标题还是"本机拒绝了这一稿"——像在说模型编错了字段。
+    if (!question.trim()) {
+      msgApi.warning("先说要查什么，模型只能照着问题去挑表和字段");
+      return;
+    }
     if (picked.length === 0) {
       msgApi.warning("先选至少一张表，模型没有目录就只能编字段");
       return;
