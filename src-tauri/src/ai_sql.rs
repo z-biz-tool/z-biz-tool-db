@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::sql_classify;
 use crate::report::ai::{strip_fences, column_list, CatalogTable, Model, HttpModel, MAX_REPAIRS};
+use crate::report::view::problem_list;
 use crate::AIConfig;
 
 /// 进提示词的表数上限：SQL 编辑器对着一个连接，几十张表模型也抓不住重点
@@ -595,6 +596,9 @@ pub fn check_sql(sql: &str, catalog: &[CatalogTable]) -> Result<Checked, String>
     let refs = referenced_tables(&toks);
     let mut used: Vec<String> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
+    // 表不认得、列不认得是两类错，但模型一轮只读得到一份拒因：先报哪一类都等于让它
+    // 改完这处再撞下一处。两类攒成一份清单一次说完（与 view 腿 problem_list 同口径）。
+    let mut problems: Vec<String> = Vec::new();
     for r in &refs {
         if local.iter().any(|l| l == &r.to_ascii_lowercase()) {
             continue;
@@ -607,7 +611,7 @@ pub fn check_sql(sql: &str, catalog: &[CatalogTable]) -> Result<Checked, String>
     if !unknown.is_empty() {
         let mut avail: Vec<String> = catalog.iter().map(qualified).collect();
         avail.sort();
-        return Err(format!(
+        problems.push(format!(
             "SQL 里的表 {} 不在本次目录里（可用：{}）",
             unknown.join("、"),
             avail.join(", ")
@@ -647,7 +651,7 @@ pub fn check_sql(sql: &str, catalog: &[CatalogTable]) -> Result<Checked, String>
     if !bad.is_empty() {
         bad.sort();
         bad.dedup();
-        return Err(format!(
+        problems.push(format!(
             "SQL 用到了目录里不存在的列：{}。这些表的真实列是：{}",
             bad.join("、"),
             catalog
@@ -656,6 +660,9 @@ pub fn check_sql(sql: &str, catalog: &[CatalogTable]) -> Result<Checked, String>
                 .collect::<Vec<_>>()
                 .join("；")
         ));
+    }
+    if !problems.is_empty() {
+        return Err(problem_list(&problems));
     }
 
     let mut warnings: Vec<String> = Vec::new();
@@ -1028,6 +1035,27 @@ mod tests {
     }
 
     #[test]
+    fn check_names_a_bad_table_and_a_bad_column_in_one_verdict() {
+        // 表不认得、列不认得分两轮报，模型每轮只改得动一处，自修复就白跑一轮
+        let e = check_sql(
+            "SELECT o.net_amount, i.sku FROM orders o JOIN invoicez i ON o.id = i.id",
+            &catalog(),
+        )
+        .unwrap_err();
+        assert!(e.contains("共 2 处问题"), "{e}");
+        assert!(e.contains("invoicez 不在本次目录里"), "{e}");
+        assert!(e.contains("orders.net_amount"), "{e}");
+        // 一行一条：前端那张错误卡是 pre-wrap，挤成一行等于没列
+        assert!(e.contains("\n1. "), "{e}");
+        assert!(e.contains("\n2. "), "{e}");
+        // 认不出的限定名（i.sku 里那张表就不在目录里）不该再报一条"列不存在"
+        assert!(!e.contains("i.sku"), "{e}");
+        // 只有一处时照原样说清，不套"共 1 处"那层壳
+        let one = check_sql("SELECT * FROM invoicez", &catalog()).unwrap_err();
+        assert!(!one.contains("处问题"), "{one}");
+    }
+
+    #[test]
     fn check_ignores_dots_inside_string_literals() {
         let out = check_sql(
             "SELECT id FROM orders WHERE city = 'a.b' AND status <> 'x.y'",
@@ -1142,6 +1170,22 @@ mod tests {
         assert_eq!(prompts.len(), 2);
         assert!(prompts[1].contains("不在本次目录里"), "{}", prompts[1]);
         assert!(prompts[1].contains("invoicez"), "{}", prompts[1]);
+    }
+
+    #[tokio::test]
+    async fn one_round_of_repair_sees_both_kinds_of_mistake_at_once() {
+        // 累积拒因的真正收益：模型一次就拿到整份清单，改一轮就能两处都改对
+        let model = scripted(vec![
+            "SELECT o.net_amount FROM orders o JOIN invoicez i ON o.id = i.id".into(),
+            "SELECT o.amount FROM orders o".into(),
+        ]);
+        let out = generate(&model, "各城市成交额", &catalog(), 3, None, None).await.unwrap();
+        assert_eq!(out.repairs, 1);
+        let prompts = model.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("共 2 处问题"), "{}", prompts[1]);
+        assert!(prompts[1].contains("invoicez 不在本次目录里"), "{}", prompts[1]);
+        assert!(prompts[1].contains("orders.net_amount"), "{}", prompts[1]);
     }
 
     #[tokio::test]

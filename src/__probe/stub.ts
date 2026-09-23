@@ -280,6 +280,25 @@ function invoke(cmd: string, args: any): Promise<any> {
           sql: "SELECT city, total FROM invoicez",
         });
       }
+      // ?sqlboth=1 注入"表认不得 + 列认不得一次列全"那份清单（镜像 check_sql 走 problem_list）：
+      // 前端错误卡要真按行铺开，一键改稿要把整份清单原样带回去——只带回第一条就过不了这一腿。
+      if (window.__PROBE_FLAG("sqlboth")) {
+        const ticket = String(a.feedback || "");
+        if (!ticket.includes("invoicez") || !ticket.includes("orders.net_zz")) {
+          return fail({
+            error: problemList([
+              `SQL 里的表 invoicez 不在本次目录里（可用：${catalog
+                .map((t) => t.table)
+                .sort()
+                .join(", ")}）`,
+              `SQL 用到了目录里不存在的列：orders.net_zz。这些表的真实列是：${catalog
+                .map((t) => `${t.table} = [${(t.columns || []).join(", ")}]`)
+                .join("；")}`,
+            ]),
+            sql: "SELECT orders.net_zz FROM invoicez",
+          });
+        }
+      }
       // ?sqlreject=1 注入"模型编了一个不存在的列、本机把这条 SQL 挡下"：
       // 判"改对了"收紧到两半都对上——拒因要点名 net_zz，且带回来的底稿里真有这一列。
       // 只把 feedback 塞成任意非空字符串、或者拿上一轮成功那条当底稿，都还是过不了。
