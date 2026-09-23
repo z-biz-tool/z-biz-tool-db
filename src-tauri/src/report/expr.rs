@@ -841,8 +841,66 @@ pub fn ord_key(a: &Value, b: &Value) -> Option<i32> {
 }
 
 /// join 判等：任一侧 NULL 都不匹配（SQL 的 ON 语义）。
+///
+/// 这里刻意不走 `compare`：连接键跨库时最常见的形态是"同一个键两种写法"——
+/// MySQL 的 bigint 1001 对上 SQLite 里 TEXT 亲和的 "1001"，按 compare 的
+/// "一边文本就不可比" 会一行都配不上，做出来的报表静默空表。
+/// 判等口径换成规范化键（见 [`join_key_of`]），只对同值的整数写法放行。
+/// 过滤、group by 仍走 compare / group_eq，那两处必须保留 SQL 的三值语义。
 pub fn join_eq(a: &Value, b: &Value) -> bool {
-    matches!(compare(a, b), Some(std::cmp::Ordering::Equal))
+    match (join_key_of(a), join_key_of(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// 整数值键：Int、整数值的 Float、纯整数写法的 Text 都归一到这一个串，
+/// 所以比较是精确的十进制比对，不再受 f64 有效位（2^53）限制。
+fn int_key(i: i64) -> String {
+    format!("I{i}")
+}
+
+/// 严格整数写法：可选负号 + 纯 ASCII 数字，且不允许多余前导零（"0"、"-0" 合法）。
+/// 不 trim、不接受 `+`、不接受小数点：`"007"`、`"1.5"`、`" 1"` 都是一个独立的文本键，
+/// 而不是数值 7 / 1.5 / 1——前导零在订单号、邮编里是真实信息，糊上去会配出错的数据。
+fn parse_int_text(s: &str) -> Option<i64> {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if body.len() > 1 && body.starts_with('0') {
+        return None;
+    }
+    s.parse::<i64>().ok()
+}
+
+/// 连接键的规范化值：`None` 表示这个键不可能与任何东西匹配（NULL、NaN、±inf）。
+///
+/// 归一规则见 [`join_eq`] 的注释：整数值统一成 `I…`，文本统一成 `S…`，
+/// 非整数数值统一成 `#…`。三族互不重叠，所以桶键本身已经等价于判等结果。
+pub fn join_key_of(v: &Value) -> Option<String> {
+    match v {
+        Value::Null => None,
+        Value::Int(i) => Some(int_key(*i)),
+        Value::Bool(b) => Some(int_key(*b as i64)),
+        Value::Float(f) => {
+            if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
+                Some(int_key(*f as i64))
+            } else if f.is_finite() {
+                Some(format!("#{:?}", f))
+            } else {
+                None
+            }
+        }
+        Value::Text(s) => Some(match parse_int_text(s) {
+            Some(i) => int_key(i),
+            None => {
+                let mut o = String::from("S");
+                o.push_str(s);
+                o
+            }
+        }),
+    }
 }
 
 /// group by 判等：NULL 自成一组，因此 NULL == NULL 在这里为真。
@@ -854,9 +912,11 @@ pub fn group_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// 粗分组用的桶键：同桶内再用 join_eq / group_eq 精判。
+/// group by 用的桶键：同桶内再用 group_eq 精判，NULL 自成一组。
 /// Int(1) 与 Float(1.0) 必须落进同一个桶，所以数值统一按 f64 投影；
-/// 超过 2^53 的两个不同整数会撞桶，但精判会把它们分开，不影响正确性。
+/// 代价是超过 2^53 的两个不同整数会撞桶，而 group_eq 走 compare 的 f64 投影也分不开它们
+/// ——group by 大整数（如雪花 id）会并组，这是当前已知精度限制。
+/// join 不走这里，走 [`join_key_of`]，那边是精确十进制比对。
 pub fn bucket_of(v: &Value) -> String {
     match v {
         Value::Null => String::from("\0N"),
@@ -1307,5 +1367,62 @@ mod tests {
             let j = serde_json::to_string(&v).unwrap();
             assert_eq!(serde_json::from_str::<Value>(&j).unwrap(), v, "{}", j);
         }
+    }
+
+    #[test]
+    fn join_eq_tolerates_integer_writings_while_compare_stays_sql_strict() {
+        // join 侧：同一根键的两种写法必须算同一根键
+        for (a, b) in [
+            (Value::Int(1001), Value::Text("1001".into())),
+            (Value::Float(1001.0), Value::Text("1001".into())),
+            (Value::Bool(true), Value::Int(1)),
+            (Value::Bool(false), Value::Text("0".into())),
+            (Value::Int(-7), Value::Text("-7".into())),
+            (Value::Int(1), Value::Float(1.0)),
+        ] {
+            assert!(join_eq(&a, &b), "{:?} 与 {:?} 应该配上", a, b);
+        }
+
+        // 过滤/聚合侧不能被带松：文本与数值仍不可比，SQL 给 NULL
+        for (a, b) in [
+            (Value::Int(1001), Value::Text("1001".into())),
+            (Value::Int(5), Value::Text("apple".into())),
+        ] {
+            assert_eq!(cmp_eq(&a, &b), Value::Null, "{:?} = {:?} 在 SQL 里是 NULL", a, b);
+            assert!(
+                !group_eq(&a, &b),
+                "group by 不能跟着放宽：{:?} 与 {:?} 必须分属两组",
+                a,
+                b
+            );
+        }
+
+        // 前导零、小数、空串、带空格都仍是独立文本键
+        for (a, b) in [
+            (Value::Int(7), Value::Text("07".into())),
+            (Value::Float(1.5), Value::Text("1.5".into())),
+            (Value::Int(0), Value::Text(String::new())),
+            (Value::Int(1), Value::Text(" 1".into())),
+            (Value::Int(1), Value::Text("+1".into())),
+            (Value::Int(1), Value::Text("1.0".into())),
+        ] {
+            assert!(!join_eq(&a, &b), "{:?} 与 {:?} 不该配", a, b);
+        }
+
+        // NULL / 非有限浮点永不匹配，连自己都不配；但 group by 的 NULL 自成一组
+        for v in [Value::Null, Value::Float(f64::NAN), Value::Float(f64::NEG_INFINITY)] {
+            assert!(!join_eq(&v, &v), "{:?} 不该与自己配", v);
+        }
+        assert!(group_eq(&Value::Null, &Value::Null), "NULL 在 group by 里仍自成一组");
+
+        // 精确十进制比对：超出 f64 有效位的两个大整数不再错配
+        assert!(!join_eq(
+            &Value::Int(9_007_199_254_740_993),
+            &Value::Int(9_007_199_254_740_992)
+        ));
+        assert!(join_eq(
+            &Value::Int(9_007_199_254_740_993),
+            &Value::Text("9007199254740993".into())
+        ));
     }
 }

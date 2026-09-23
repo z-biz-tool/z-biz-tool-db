@@ -98,15 +98,22 @@ const BIN_TY = [
   "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bytea", "geometry",
   "geography", "image", "vector",
 ];
+function typeHead(ty: string): string {
+  return (String(ty || "").trim().toLowerCase().match(/^[a-z]+/) || [])[0] || "";
+}
 function familyOf(ty: string): string {
-  const head = (String(ty || "").trim().toLowerCase().match(/^[a-z]+/) || [])[0] || "";
+  const head = typeHead(ty);
   if (NUM_TY.includes(head)) return "num";
   if (TXT_TY.includes(head)) return "text";
   if (BIN_TY.includes(head)) return "bin";
   return "?";
 }
+/** 永远写不成整数键的文本类型：这一档仍然是必然空表 */
+const NEVER_INT_TY = [
+  "date", "datetime", "smalldatetime", "time", "timestamp", "timestamptz", "uuid", "json", "jsonb",
+];
 
-/** 镜像 ai.rs join_key_warnings：连接键跨族 ⇒ 内存 join 必然空表。
+/** 镜像 ai.rs join_key_warnings：连接键跨族按三档措辞（同族保持沉默）。
  *  左侧累计列的命名规则与执行期 plan_join_columns 一致（重名依次加 _2/_3）。 */
 function joinKeyWarnings(specs: any[], catalog: any[]): string[] {
   const out: string[] = [];
@@ -136,10 +143,14 @@ function joinKeyWarnings(specs: any[], catalog: any[]): string[] {
           (lf === "num" && rf === "text") || (lf === "text" && rf === "num") || binary;
         if (!l || !cross) continue;
         const why = binary
-          ? "有一边是二进制/大字段，取数时会被置成 NULL，而 NULL 连接键不可能匹配"
-          : "一边数值一边文本，内存 join 按值分桶比较（数值 #… / 文本 S…），相同的值也对不上";
+          ? "有一边是二进制/大字段，取数时会被置成 NULL，而 NULL 连接键不可能匹配——这一轮 join 一行都配不上，做出来的表会是空表；换一对两边同族的列"
+          : NEVER_INT_TY.includes(typeHead(lf === "text" ? l.ty : rty))
+            ? "一边数值一边文本，而日期、时间戳、uuid、json 这类值永远写不成整数键——这一轮 join 一行都配不上，做出来的表会是空表；换一对两边同族的列"
+            : "一边数值一边文本：join 按规范化的整数值比对，所以 bigint 1001 配得上文本「1001」；" +
+              "但文本侧带前导零、小数点或空格就仍然配不上（「007」配不上 7），" +
+              "这类不一致会静默少行甚至整轮空表——确认两边写法一致最稳妥";
         out.push(
-          `数据集 ${ds.id}（${ds.name}）：${l.label}（${l.ty || "类型未知"}）与 ${p.right}（${rty || "类型未知"}）做连接键，${why}——这一轮 join 一行都配不上，做出来的表会是空表；换一对两边同族的列`
+          `数据集 ${ds.id}（${ds.name}）：${l.label}（${l.ty || "类型未知"}）与 ${p.right}（${rty || "类型未知"}）做连接键，${why}`
         );
       }
       if (!right) continue;

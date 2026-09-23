@@ -227,8 +227,9 @@ pub fn prompt(question: &str, catalog: &[CatalogTable], feedback: Option<&str>) 
          2. 跨库：把不同 connection_id 的表放进同一个数据集，join 在本机内存里做，不要写 SQL。\n\
          3. 引用列：本表列直接写名字，需要消歧时写 别名.列名（如 u.city）。\n\
          \x20  列名后面那个词是数据库真实类型：文本列别拿去 SUM。\n\
-         \x20  joins[].on 只能写列名，不接受表达式或 CAST，而内存 join 按值分桶比较：\n\
-         \x20  一边 bigint 一边 varchar 会一行都配不上，两边连接键必须同族（都数值或都文本）。\n\
+         \x20  joins[].on 只能写列名，不接受表达式或 CAST。内存 join 按规范化整数值比对：\n\
+         \x20  bigint 1001 配得上 varchar「1001」，但带前导零的「007」配不上 7，\n\
+         \x20  日期/时间戳/uuid/json 这类文本配不上数值——连接键两边要同写法。\n\
          4. 表达式支持 + - * /、比较、AND/OR/NOT、IS NULL、IN，以及函数 \
          ",
     );
@@ -350,8 +351,9 @@ fn lower_types(t: &CatalogTable) -> HashMap<String, String> {
         .collect()
 }
 
-/// 连接键在内存 join 里会落进哪个值桶。bucket_of 给文本打 `S`、给数值打 `#`，
-/// 二进制和无法解码的单元格在取数阶段就被置成 NULL，而 NULL 键永不匹配。
+/// 连接键在数据库里属于哪个值族。join 比对走 `expr::join_key_of` 的规范化整数键，
+/// 所以数值与文本之间只是"写法要一致"的风险；二进制/大字段则在取数阶段就被置成 NULL，
+/// 而 NULL 连接键永不匹配，那是确定配不上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
     Numeric,
@@ -361,16 +363,19 @@ enum Family {
     Unknown,
 }
 
-/// 数据库自报类型 → 值桶。只看开头的词，所以 `decimal(12,2)`、`int(11)`、
-/// `double precision`、`character varying(64)`、`timestamp without time zone` 都能落对。
-fn family_of(ty: &str) -> Family {
-    let head: String = ty
-        .trim()
+/// 类型名开头的词。只看开头，所以 `decimal(12,2)`、`int(11)`、`double precision`、
+/// `character varying(64)`、`timestamp without time zone` 都能落对。
+fn type_head(ty: &str) -> String {
+    ty.trim()
         .to_ascii_lowercase()
         .chars()
         .take_while(|c| c.is_ascii_alphabetic())
-        .collect();
-    match head.as_str() {
+        .collect()
+}
+
+/// 数据库自报类型 → 值族。
+fn family_of(ty: &str) -> Family {
+    match type_head(ty).as_str() {
         "int" | "integer" | "tinyint" | "smallint" | "mediumint" | "bigint" | "int2"
         | "int4" | "int8" | "serial" | "bigserial" | "smallserial" | "float" | "double"
         | "real" | "decimal" | "dec" | "numeric" | "fixed" | "money" | "smallmoney"
@@ -409,7 +414,18 @@ fn show_ty(ty: &str) -> String {
     }
 }
 
-/// 两侧连接键是否注定配不上。返回原因文本（拼到告警里）。
+/// 文本族里有一类"永远写不成整数"的类型：日期、时间戳、uuid、json。
+/// 它们与数值列做连接键时不存在规范化容忍的可能，只能按必然空表报；
+/// varchar/char/text 那些则降级成"写法要一致"的提醒。
+fn text_never_integer(ty: &str) -> bool {
+    matches!(
+        type_head(ty).as_str(),
+        "date" | "datetime" | "smalldatetime" | "time" | "timestamp" | "timestamptz" | "uuid"
+            | "json" | "jsonb"
+    )
+}
+
+/// 两侧连接键的类型族差异。返回原因文本（拼到告警里）。
 fn key_conflict(
     lf: Family,
     rf: Family,
@@ -420,15 +436,23 @@ fn key_conflict(
 ) -> Option<String> {
     let why = match (lf, rf) {
         (Family::Binary, _) | (_, Family::Binary) => {
-            "有一边是二进制/大字段，取数时会被置成 NULL，而 NULL 连接键不可能匹配"
+            "有一边是二进制/大字段，取数时会被置成 NULL，而 NULL 连接键不可能匹配——这一轮 join 一行都配不上，做出来的表会是空表；换一对两边同族的列".to_string()
         }
         (Family::Numeric, Family::Text) | (Family::Text, Family::Numeric) => {
-            "一边数值一边文本，内存 join 按值分桶比较（数值 #… / 文本 S…），相同的值也对不上"
+            let text_ty = if lf == Family::Text { lty } else { rty };
+            if text_never_integer(text_ty) {
+                "一边数值一边文本，而日期、时间戳、uuid、json 这类值永远写不成整数键——这一轮 join 一行都配不上，做出来的表会是空表；换一对两边同族的列".to_string()
+            } else {
+                "一边数值一边文本：join 按规范化的整数值比对，所以 bigint 1001 配得上文本「1001」；\
+                 但文本侧带前导零、小数点或空格就仍然配不上（「007」配不上 7），\
+                 这类不一致会静默少行甚至整轮空表——确认两边写法一致最稳妥"
+                    .to_string()
+            }
         }
         _ => return None,
     };
     Some(format!(
-        "{}（{}）与 {}（{}）做连接键，{}——这一轮 join 一行都配不上，做出来的表会是空表；换一对两边同族的列",
+        "{}（{}）与 {}（{}）做连接键，{}",
         lcol,
         show_ty(lty),
         rcol,
@@ -828,6 +852,18 @@ mod tests {
         assert!(p.contains("重新输出完整 JSON"));
     }
 
+    /// 提示词里连接键那段必须与引擎实际口径一致：说"两边必须同族"会挡掉
+    /// 本来能跑的草稿（bigint 配 varchar 是跨库常态），说"随便配"又会换来静默空表。
+    #[test]
+    fn prompt_states_the_join_key_rule_the_engine_actually_applies() {
+        let p = prompt("q", &catalog(), None);
+        assert!(p.contains("只能写列名"), "表达式仍不接受：{}", p);
+        assert!(p.contains("配得上 varchar「1001」"), "要承认整数写法能跨族配：{}", p);
+        assert!(p.contains("「007」配不上 7"), "要说清前导零仍不配：{}", p);
+        assert!(p.contains("配不上数值"), "日期/uuid 这类仍配不上：{}", p);
+        assert!(!p.contains("必须同族"), "旧措辞已被引擎推翻：{}", p);
+    }
+
     #[test]
     fn ai_written_enums_survive_case_and_aliases() {
         let ds: DatasetSpec = serde_json::from_str(&spec(
@@ -988,7 +1024,7 @@ mod tests {
         }
     }
 
-    /// 三张表专门用来验连接键：orders(bigint) / ext(bigint + int) / att(varchar + blob)
+    /// 三张表专门用来验连接键：orders(bigint) / ext(bigint + int) / att(varchar + blob + datetime)
     fn typed_catalog() -> Vec<CatalogTable> {
         let t = |conn: &str, table: &str, cols: &[(&str, &str)]| CatalogTable {
             connection_id: conn.into(),
@@ -1014,7 +1050,15 @@ mod tests {
                 "ext",
                 &[("order_no", "bigint(20)"), ("city", "int(11)")],
             ),
-            t("crm", "att", &[("zone", "varchar(64)"), ("raw_key", "blob")]),
+            t(
+                "crm",
+                "att",
+                &[
+                    ("zone", "varchar(64)"),
+                    ("raw_key", "blob"),
+                    ("created_at", "datetime"),
+                ],
+            ),
         ]
     }
 
@@ -1041,37 +1085,49 @@ mod tests {
         )
     }
 
-    /// 这一条测的是"新能力补上之前根本看不见的洞"：
-    /// bigint 连接键配 varchar，内存 join 分桶不同（#… vs S…），做出的报表必然空表。
+    /// join 已按规范化整数比对，所以跨族的措辞分三档：varchar 只提醒"写法要一致"，
+    /// datetime/uuid 这类永远配不上的才说必然空表，二进制在取数阶段就被置成 NULL。
+    /// 同族则必须沉默——否则这条告警会退化成噪音，模型和用户都学会忽略它。
     #[test]
-    fn check_draft_warns_when_join_keys_can_never_match() {
+    fn check_draft_scales_the_join_key_warning_to_the_text_type() {
         let c = typed_catalog();
-        let bad = typed_ds(
-            r#"[{"alias":"o","connection_id":"shop","table":"orders"},{"alias":"a","connection_id":"crm","table":"att"}]"#,
-            &join_one("order_no", "a", "zone"),
-        );
-        let out = check_draft(parse_draft(&draft_of(&[bad], &[widget("d1", "BAR")])).unwrap(), &c)
-            .unwrap();
-        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
-        let w = &out.warnings[0];
+        let warn = |right_col: &str| {
+            let raw = typed_ds(
+                r#"[{"alias":"o","connection_id":"shop","table":"orders"},{"alias":"a","connection_id":"crm","table":"att"}]"#,
+                &join_one("order_no", "a", right_col),
+            );
+            let out =
+                check_draft(parse_draft(&draft_of(&[raw], &[widget("d1", "BAR")])).unwrap(), &c)
+                    .unwrap();
+            assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+            out.warnings[0].clone()
+        };
+
+        // 文本有可能就是整数写法：说清残余风险，不能再断言"一行都配不上"
+        let w = warn("zone");
         assert!(w.contains("d1"), "告警要带数据集 id：{}", w);
         assert!(w.contains("o.order_no"), "要指出左侧键：{}", w);
         assert!(w.contains("bigint(20)"), "要给出两侧真实类型：{}", w);
         assert!(w.contains("varchar(64)"), "要给出两侧真实类型：{}", w);
-        assert!(w.contains("空表"), "要说清后果，不然只是行黑话：{}", w);
+        assert!(w.contains("配得上"), "{} 要承认 1001 与「1001」已能配", w);
+        assert!(w.contains("前导零"), "{} 要说清残余风险是写法不一致", w);
+        assert!(
+            !w.contains("一行都配不上"),
+            "{} 不能再把可容忍的跨族说成必然空表",
+            w
+        );
+
+        // datetime 永远写不成整数键：这一档仍然是必然空表
+        let w = warn("created_at");
+        assert!(w.contains("永远写不成整数"), "{}", w);
+        assert!(w.contains("空表"), "{}", w);
 
         // 二进制键两边同族也配不上：取数阶段就被置成 NULL
-        let blob = typed_ds(
-            r#"[{"alias":"o","connection_id":"shop","table":"orders"},{"alias":"a","connection_id":"crm","table":"att"}]"#,
-            &join_one("order_no", "a", "raw_key"),
-        );
-        let out2 =
-            check_draft(parse_draft(&draft_of(&[blob], &[widget("d1", "BAR")])).unwrap(), &c)
-                .unwrap();
-        assert_eq!(out2.warnings.len(), 1, "{:?}", out2.warnings);
-        assert!(out2.warnings[0].contains("NULL"), "{:?}", out2.warnings[0]);
+        let w = warn("raw_key");
+        assert!(w.contains("NULL"), "{}", w);
+        assert!(w.contains("空表"), "{}", w);
 
-        // 同族连接键不能报警：否则这条告警就是噪音，模型和用户都会学着忽略它
+        // 同族连接键不能报警
         let good = typed_ds(
             r#"[{"alias":"o","connection_id":"shop","table":"orders"},{"alias":"x","connection_id":"crm","table":"ext"}]"#,
             &join_one("order_no", "x", "order_no"),

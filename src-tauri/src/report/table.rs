@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::expr::{bucket_of, group_eq, join_eq, ord_key, Expr, Value};
+use super::expr::{bucket_of, group_eq, join_eq, join_key_of, ord_key, Expr, Value};
 
 #[derive(Debug, Clone, Default)]
 pub struct Table {
@@ -209,6 +209,18 @@ fn key_buckets(vals: &[Value]) -> String {
     s
 }
 
+/// 复合连接键的桶：走规范化键（[`join_key_of`]），所以 MySQL 的 bigint 1001
+/// 能落进 SQLite 文本键 "1001" 所在的桶。任一侧含 NULL / NaN 时返回 None——
+/// 那一行不可能匹配，既不建索引也不探测。
+fn join_key_bucket(vals: &[Value]) -> Option<String> {
+    let mut s = String::new();
+    for v in vals {
+        s.push_str(&join_key_of(v)?);
+        s.push('\u{1}');
+    }
+    Some(s)
+}
+
 fn ensure_free_name(columns: &[String], name: &str) -> String {
     let dup = |cand: &str| columns.iter().any(|c| same_name(c, cand));
     if !dup(name) {
@@ -244,6 +256,7 @@ pub fn plan_join_columns(
 /// 多键 hash join。右表按连接键建桶，左表逐行探测。
 ///
 /// 复合键任一侧含 NULL 就不可能匹配；右表命中多行时按插入顺序扇出。
+/// 连接键按规范化值比对：bigint 1001 配得上 varchar "1001"，但 "007" 配不上 7。
 pub fn hash_join(
     left: &Table,
     right: &Table,
@@ -274,22 +287,22 @@ pub fn hash_join(
     let mut index: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, row) in right.rows.iter().enumerate() {
         let vals = key_values(row, &right_keys);
-        if vals.iter().any(|v| v.is_null()) {
-            continue;
+        if let Some(bk) = join_key_bucket(&vals) {
+            index.entry(bk).or_default().push(idx);
         }
-        index.entry(key_buckets(&vals)).or_default().push(idx);
     }
 
     let mut rows: Vec<HashMap<String, Value>> = Vec::new();
     for lrow in &left.rows {
         let lvals = key_values(lrow, &left_keys);
-        let null_key = lvals.iter().any(|v| v.is_null());
         let mut matched: Vec<&HashMap<String, Value>> = Vec::new();
-        if !null_key {
-            if let Some(bucket) = index.get(&key_buckets(&lvals)) {
+        if let Some(bk) = join_key_bucket(&lvals) {
+            if let Some(bucket) = index.get(&bk) {
                 for &ridx in bucket {
                     let rrow = &right.rows[ridx];
                     let rvals = key_values(rrow, &right_keys);
+                    // 桶键已经等价于判等，这一层精判只挡一件事：
+                    // 文本里出现分隔符 \u{1} 时，复合键的拼接会有歧义（["a\u{1}b", ""] 与 ["a", "\u{1}b"] 同串）
                     if lvals
                         .iter()
                         .zip(rvals.iter())
@@ -858,10 +871,91 @@ mod tests {
         assert_eq!(cell(&j, 0, "y"), Value::Text("a".into()));
         assert_eq!(cell(&j, 1, "y"), Value::Text("b".into()));
 
-        // 但文本 "10" 与数值 10 不可比，不能瞎配
+        // 文本 "10" 与数值 10 现在必须配上：跨库时同一根键一边是 bigint、
+        // 一边是 TEXT 亲和的 varchar，按旧口径拒绝会让跨库报表静默空表
         let left_txt = v(&["k"], &[vec![("k", Value::Text("10".into()))]]);
         let j2 = hash_join(&left_txt, &right, &[JoinKey::new("k", "k2")], JoinType::Inner).unwrap();
-        assert!(j2.is_empty(), "文本键与数值键不可比");
+        assert_eq!(j2.len(), 1, "整数写法的文本键要能配上数值键");
+        assert_eq!(cell(&j2, 0, "y"), Value::Text("a".into()));
+    }
+
+    #[test]
+    fn join_key_tolerance_covers_only_exact_integer_writings() {
+        let num = |vals: Vec<(Value, &str)>| {
+            v(
+                &["k", "tag"],
+                &vals.into_iter()
+                    .map(|(key, tag)| vec![("k", key), ("tag", Value::Text(tag.into()))])
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // 左：文本键的各种写法；右：数值键。只有纯整数写法能配上。
+        let right = num(vec![
+            (Value::Int(7), "int7"),
+            (Value::Int(0), "int0"),
+            (Value::Float(1.5), "float1.5"),
+        ]);
+
+        let cases = [
+            ("7", 1, "bigint 7 要配得上 varchar 7"),
+            ("07", 0, "前导零是真实键，不能当成 7"),
+            ("0", 1, "文本 0 配 Int(0)"),
+            ("-0", 1, "负零与 0 同值"),
+            ("7.0", 0, "带小数点的文本不算整数写法"),
+            ("1.5", 0, "小数不做跨族容忍"),
+            ("", 0, "空串不是 0"),
+            (" 7", 0, "带空格的文本就是另一个键"),
+            ("+7", 0, "正号写法不认"),
+            ("seven", 0, "纯文本键不与数值配"),
+        ];
+        for (txt, want, why) in cases {
+            let left = v(&["k"], &[vec![("k", Value::Text(txt.into()))]]);
+            let j = hash_join(&left, &right, &[JoinKey::new("k", "k")], JoinType::Inner).unwrap();
+            assert_eq!(j.len(), want, "文本 {:?} 期望 {} 行：{}", txt, want, why);
+        }
+
+        // Bool 仍与 1/0 同族（旧口径下 true 落 #1.0，与 Int(1) 同桶）
+        let bt = v(&["k"], &[vec![("k", Value::Bool(true))]]);
+        let bn = v(&["k"], &[vec![("k", Value::Int(1))]]);
+        let j = hash_join(&bt, &bn, &[JoinKey::new("k", "k")], JoinType::Inner).unwrap();
+        assert_eq!(j.len(), 1, "Bool true 仍要配得上 Int 1");
+        let btxt = v(&["k"], &[vec![("k", Value::Text("1".into()))]]);
+        let j = hash_join(&bt, &btxt, &[JoinKey::new("k", "k")], JoinType::Inner).unwrap();
+        assert_eq!(j.len(), 1, "Bool true 也配得上文本 1");
+
+        // NaN / ±inf 永不匹配，与 NULL 同义：SQL 里 NaN = NaN 不为真
+        for bad in [Value::Float(f64::NAN), Value::Float(f64::INFINITY)] {
+            let l = v(&["k"], &[vec![("k", bad.clone())]]);
+            let r = v(&["k"], &[vec![("k", bad.clone())]]);
+            let j = hash_join(&l, &r, &[JoinKey::new("k", "k")], JoinType::Inner).unwrap();
+            assert!(j.is_empty(), "{:?} 与自己都不该匹配", bad);
+        }
+
+        // 超过 2^53 的两个不同整数不再撞成一桶（旧口径按 f64 投影会错配）
+        let big_l = v(&["k"], &[vec![("k", Value::Int(9_007_199_254_740_993))]]);
+        let big_r = v(&["k"], &[vec![("k", Value::Int(9_007_199_254_740_992))]]);
+        let j = hash_join(&big_l, &big_r, &[JoinKey::new("k", "k")], JoinType::Inner).unwrap();
+        assert!(j.is_empty(), "两个不同的大整数不能配");
+
+        // 复合键里只要有一侧是 NULL / NaN，整行不参与
+        let mut u = users();
+        u.rows.push(
+            [("uid", Value::Null), ("name", Value::Text("ghost".into())), ("amount", Value::Int(1))]
+                .into_iter()
+                .map(|(k, val)| (k.to_string(), val))
+                .collect(),
+        );
+        let j = hash_join(
+            &orders(),
+            &u,
+            &[JoinKey::new("user_id", "uid"), JoinKey::new("day", "amount")],
+            JoinType::Left,
+        )
+        .unwrap();
+        assert!(
+            !j.rows.iter().any(|r| r.get("name") == Some(&Value::Text("ghost".into()))),
+            "NULL 键的行不该出现在任何一侧"
+        );
     }
 
     #[test]

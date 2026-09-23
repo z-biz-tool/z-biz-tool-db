@@ -1156,24 +1156,30 @@ mod tests {
         assert_eq!(payload.generated_sql.len(), 2);
     }
 
-    /// 连接键类型族告警不是玄学：同一份草稿只换连接键，
-    /// 空表就正按告警说的那样发生；换回同族则三行照出。
+    /// 跨库连接键的两条腿都要实测：文本侧写成 '01' 这种带前导零的键，规范化也救不回来，
+    /// 告警所说的空表真的发生；文本侧写成 '1' 时 join 按规范化整数配得上，
+    /// 此时仍提示写法风险但必须出行。同族连接键作对照——不然上面那条"空"不作数。
     #[tokio::test]
-    async fn warning_predicts_the_silently_empty_cross_db_join() {
+    async fn join_key_tolerance_and_warning_both_show_up_in_the_render() {
         use crate::report::ai::{self, CatalogTable};
         let db = temp_db();
         let (shop, crm) = seed_shop_crm(&db).await;
-        // 网页端的 uid 是文本：值一模一样，桶不一样（'1' → S1，1 → #1.0）
-        run_dispatch(&crm, "CREATE TABLE web_users (uid TEXT, city TEXT)")
-            .await
-            .unwrap();
-        for (uid, city) in [("1", "SH"), ("2", "BJ"), ("3", "SZ")] {
-            run_dispatch(
-                &crm,
-                &format!("INSERT INTO web_users VALUES ('{}', '{}')", uid, city),
-            )
-            .await
-            .unwrap();
+        // 网页端的 uid 是文本列：两张表只差写法（'01' 与 '1'）
+        for (table, prefix) in [("web_padded", "0"), ("web_plain", "")] {
+            run_dispatch(&crm, &format!("CREATE TABLE {} (uid TEXT, city TEXT)", table))
+                .await
+                .unwrap();
+            for (n, city) in [("1", "SH"), ("2", "BJ"), ("3", "SZ")] {
+                run_dispatch(
+                    &crm,
+                    &format!(
+                        "INSERT INTO {} VALUES ('{}{}', '{}')",
+                        table, prefix, n, city
+                    ),
+                )
+                .await
+                .unwrap();
+            }
         }
         let orders = CatalogTable {
             connection_id: "shop".into(),
@@ -1214,23 +1220,50 @@ mod tests {
             )
         };
 
-        let bad = ai::check_draft(
-            ai::parse_draft(&raw("web_users", "uid")).unwrap(),
-            &[orders.clone(), right("web_users", &[("uid", "TEXT"), ("city", "TEXT")])],
+        let text_uid = &[("uid", "TEXT"), ("city", "TEXT")][..];
+
+        // 前导零：规范化也救不回来，告警与空表同时出现
+        let padded = ai::check_draft(
+            ai::parse_draft(&raw("web_padded", "uid")).unwrap(),
+            &[orders.clone(), right("web_padded", text_uid)],
         )
         .unwrap();
-        assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
-        assert!(bad.warnings[0].contains("INTEGER"), "{}", bad.warnings[0]);
-        assert!(bad.warnings[0].contains("TEXT"), "{}", bad.warnings[0]);
-        let bad_payload = report_view_render(bad.view, bad.datasets, vec![shop.clone(), crm.clone()], None)
-            .await
-            .unwrap();
+        assert_eq!(padded.warnings.len(), 1, "{:?}", padded.warnings);
+        assert!(padded.warnings[0].contains("INTEGER"), "{}", padded.warnings[0]);
+        assert!(padded.warnings[0].contains("TEXT"), "{}", padded.warnings[0]);
+        let padded_payload =
+            report_view_render(padded.view, padded.datasets, vec![shop.clone(), crm.clone()], None)
+                .await
+                .unwrap();
         assert!(
-            bad_payload.charts[0].categories.is_empty(),
-            "告警说这一轮 join 配不上，结果它画出了图——告警在瞎报"
+            padded_payload.charts[0].categories.is_empty(),
+            "告警说这种写法配不上，结果它画出了图——告警在瞎报"
         );
 
-        // 同族连接键：既不告警，也必须真的出三行，否则上面的"空"不作数
+        // 纯整数写法：照样提示写法风险，但必须真出行，这才算容忍生效的证据
+        let plain = ai::check_draft(
+            ai::parse_draft(&raw("web_plain", "uid")).unwrap(),
+            &[orders.clone(), right("web_plain", text_uid)],
+        )
+        .unwrap();
+        assert_eq!(plain.warnings.len(), 1, "{:?}", plain.warnings);
+        assert!(
+            !plain.warnings[0].contains("一行都配不上"),
+            "既然下面就要出行，告警不能再断言一行都配不上：{}",
+            plain.warnings[0]
+        );
+        let plain_payload =
+            report_view_render(plain.view, plain.datasets, vec![shop.clone(), crm.clone()], None)
+                .await
+                .unwrap();
+        assert_eq!(
+            plain_payload.charts[0].categories.len(),
+            3,
+            "bigint 与文本 '1' 没配上：{:?}",
+            plain_payload.charts[0].categories
+        );
+
+        // 同族连接键：既不告警，也必须真的出三行
         let good = ai::check_draft(
             ai::parse_draft(&raw("users", "id")).unwrap(),
             &[orders, right("users", &[("id", "INTEGER"), ("city", "TEXT")])],
