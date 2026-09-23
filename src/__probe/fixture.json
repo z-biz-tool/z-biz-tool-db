@@ -1,644 +1,622 @@
 {
- "render": {
-  "charts": [
-   {
-    "categories": [],
-    "columns": [],
-    "kind": "KPI",
-    "row_count": 3,
-    "rows": [],
-    "series": [],
-    "title": "kpi-gmv",
-    "value": 300.0,
-    "warnings": [],
-    "widget": "kpi-gmv"
-   },
-   {
-    "categories": [
-     "SH",
-     "BJ",
-     "SZ"
+  "render": {
+    "charts": [
+      {
+        "categories": [],
+        "columns": [],
+        "kind": "KPI",
+        "row_count": 3,
+        "rows": [],
+        "series": [],
+        "title": "kpi-gmv",
+        "value": 300.0,
+        "warnings": [],
+        "widget": "kpi-gmv"
+      },
+      {
+        "categories": ["SH", "BJ", "SZ"],
+        "columns": [],
+        "kind": "BAR",
+        "row_count": 3,
+        "rows": [],
+        "series": [
+          {
+            "name": "-",
+            "values": [150.0, 80.0, 70.0]
+          }
+        ],
+        "title": "bar-city",
+        "value": null,
+        "warnings": [],
+        "widget": "bar-city"
+      },
+      {
+        "categories": [],
+        "columns": ["id", "amount"],
+        "kind": "TABLE",
+        "row_count": 2,
+        "rows": [
+          [5, 70.0],
+          [3, 80.0]
+        ],
+        "series": [],
+        "title": "tbl-orders",
+        "value": null,
+        "warnings": [],
+        "widget": "tbl-orders"
+      }
     ],
-    "columns": [],
-    "kind": "BAR",
-    "row_count": 3,
-    "rows": [],
-    "series": [
-     {
-      "name": "-",
-      "values": [
-       150.0,
-       80.0,
-       70.0
-      ]
-     }
+    "datasets": [
+      {
+        "columns": ["city", "gmv", "cnt"],
+        "elapsed_ms": 1,
+        "id": "city-gmv",
+        "name": "城市成交额",
+        "partial": false,
+        "rows": 3,
+        "truncated": []
+      },
+      {
+        "columns": ["id", "amount"],
+        "elapsed_ms": 0,
+        "id": "paid-orders",
+        "name": "已支付订单明细",
+        "partial": false,
+        "rows": 2,
+        "truncated": []
+      }
     ],
-    "title": "bar-city",
-    "value": null,
-    "warnings": [],
-    "widget": "bar-city"
-   },
-   {
-    "categories": [],
-    "columns": [
-     "id",
-     "amount"
+    "elapsed_ms": 4,
+    "generated_sql": [
+      {
+        "alias": "o",
+        "connection_id": "shop",
+        "connection_name": "shop",
+        "database_type": "sqlite",
+        "dataset": "city-gmv",
+        "sql": "SELECT * FROM \"orders\" LIMIT 50001"
+      },
+      {
+        "alias": "u",
+        "connection_id": "crm",
+        "connection_name": "crm",
+        "database_type": "sqlite",
+        "dataset": "city-gmv",
+        "sql": "SELECT * FROM \"users\" LIMIT 50001"
+      },
+      {
+        "alias": "o",
+        "connection_id": "shop",
+        "connection_name": "shop",
+        "database_type": "sqlite",
+        "dataset": "paid-orders",
+        "sql": "SELECT * FROM \"orders\" LIMIT 50001"
+      }
     ],
-    "kind": "TABLE",
-    "row_count": 2,
-    "rows": [
-     [
-      5,
-      70.0
-     ],
-     [
-      3,
-      80.0
-     ]
+    "layout": [
+      {
+        "h": 6,
+        "w": 12,
+        "widget": "kpi-gmv",
+        "x": 0,
+        "y": 0
+      },
+      {
+        "h": 6,
+        "w": 12,
+        "widget": "bar-city",
+        "x": 0,
+        "y": 6
+      },
+      {
+        "h": 6,
+        "w": 12,
+        "widget": "tbl-orders",
+        "x": 0,
+        "y": 12
+      }
     ],
-    "series": [],
-    "title": "tbl-orders",
-    "value": null,
-    "warnings": [],
-    "widget": "tbl-orders"
-   }
-  ],
-  "datasets": [
-   {
-    "columns": [
-     "city",
-     "gmv",
-     "cnt"
-    ],
-    "elapsed_ms": 1,
-    "id": "city-gmv",
-    "name": "城市成交额",
     "partial": false,
-    "rows": 3,
-    "truncated": []
-   },
-   {
-    "columns": [
-     "id",
-     "amount"
-    ],
-    "elapsed_ms": 0,
-    "id": "paid-orders",
-    "name": "已支付订单明细",
-    "partial": false,
-    "rows": 2,
-    "truncated": []
-   }
-  ],
-  "elapsed_ms": 4,
-  "generated_sql": [
-   {
-    "alias": "o",
-    "connection_id": "shop",
-    "connection_name": "shop",
-    "database_type": "sqlite",
-    "dataset": "city-gmv",
-    "sql": "SELECT * FROM \"orders\" LIMIT 50001"
-   },
-   {
-    "alias": "u",
-    "connection_id": "crm",
-    "connection_name": "crm",
-    "database_type": "sqlite",
-    "dataset": "city-gmv",
-    "sql": "SELECT * FROM \"users\" LIMIT 50001"
-   },
-   {
-    "alias": "o",
-    "connection_id": "shop",
-    "connection_name": "shop",
-    "database_type": "sqlite",
-    "dataset": "paid-orders",
-    "sql": "SELECT * FROM \"orders\" LIMIT 50001"
-   }
-  ],
-  "layout": [
-   {
-    "h": 6,
-    "w": 12,
-    "widget": "kpi-gmv",
-    "x": 0,
-    "y": 0
-   },
-   {
-    "h": 6,
-    "w": 12,
-    "widget": "bar-city",
-    "x": 0,
-    "y": 6
-   },
-   {
-    "h": 6,
-    "w": 12,
-    "widget": "tbl-orders",
-    "x": 0,
-    "y": 12
-   }
-  ],
-  "partial": false,
-  "steps": [
-   "WIDGET kpi-gmv KPI [SUM(gmv)] dataset=city-gmv",
-   "WIDGET bar-city BAR [x=city y=gmv RAW] dataset=city-gmv",
-   "WIDGET tbl-orders TABLE [COLUMNS id, amount] dataset=paid-orders",
-   "LAYOUT 3 个组件"
-  ]
- },
- "validate": {
-  "schemas": {
-   "city-gmv": [
-    "city",
-    "gmv",
-    "cnt"
-   ],
-   "paid-orders": [
-    "id",
-    "amount"
-   ]
+    "steps": [
+      "WIDGET kpi-gmv KPI [SUM(gmv)] dataset=city-gmv",
+      "WIDGET bar-city BAR [x=city y=gmv RAW] dataset=city-gmv",
+      "WIDGET tbl-orders TABLE [COLUMNS id, amount] dataset=paid-orders",
+      "LAYOUT 3 个组件"
+    ]
   },
-  "sqls": [
-   {
-    "alias": "o",
-    "connection_id": "shop",
-    "connection_name": "shop",
-    "database_type": "sqlite",
-    "dataset": "city-gmv",
-    "sql": "SELECT * FROM \"orders\" LIMIT 50001"
-   },
-   {
-    "alias": "u",
-    "connection_id": "crm",
-    "connection_name": "crm",
-    "database_type": "sqlite",
-    "dataset": "city-gmv",
-    "sql": "SELECT * FROM \"users\" LIMIT 50001"
-   },
-   {
-    "alias": "o",
-    "connection_id": "shop",
-    "connection_name": "shop",
-    "database_type": "sqlite",
-    "dataset": "paid-orders",
-    "sql": "SELECT * FROM \"orders\" LIMIT 50001"
-   }
-  ],
-  "steps": [
-   "WIDGET kpi-gmv KPI [SUM(gmv)] dataset=city-gmv",
-   "WIDGET bar-city BAR [x=city y=gmv RAW] dataset=city-gmv",
-   "WIDGET tbl-orders TABLE [COLUMNS id, amount] dataset=paid-orders",
-   "LAYOUT 3 个组件"
-  ]
- },
- "tables": {
-  "shop": [
-   {
-    "name": "orders",
-    "schema": "",
-    "row_estimate": 1200,
-    "size_bytes": 4096
-   }
-  ],
-  "crm": [
-   {
-    "name": "users",
-    "schema": "",
-    "row_estimate": 300,
-    "size_bytes": 1024
-   }
-  ]
- },
- "columns": {
-  "orders": [
-   "id",
-   "amount",
-   "city",
-   "status"
-  ],
-  "users": [
-   "id",
-   "name",
-   "channel"
-  ]
- },
- "reports": [
-  {
-   "id": "rb-cross",
-   "name": "成交看板（商城库 × 客户库）",
-   "description": "按城市看 GMV，跨两个连接",
-   "question": "按城市统计已支付订单的 GMV，并列出金额最高的 5 笔订单",
-   "datasets": [
+  "validate": {
+    "schemas": {
+      "city-gmv": ["city", "gmv", "cnt"],
+      "paid-orders": ["id", "amount"]
+    },
+    "sqls": [
+      {
+        "alias": "o",
+        "connection_id": "shop",
+        "connection_name": "shop",
+        "database_type": "sqlite",
+        "dataset": "city-gmv",
+        "sql": "SELECT * FROM \"orders\" LIMIT 50001"
+      },
+      {
+        "alias": "u",
+        "connection_id": "crm",
+        "connection_name": "crm",
+        "database_type": "sqlite",
+        "dataset": "city-gmv",
+        "sql": "SELECT * FROM \"users\" LIMIT 50001"
+      },
+      {
+        "alias": "o",
+        "connection_id": "shop",
+        "connection_name": "shop",
+        "database_type": "sqlite",
+        "dataset": "paid-orders",
+        "sql": "SELECT * FROM \"orders\" LIMIT 50001"
+      }
+    ],
+    "steps": [
+      "WIDGET kpi-gmv KPI [SUM(gmv)] dataset=city-gmv",
+      "WIDGET bar-city BAR [x=city y=gmv RAW] dataset=city-gmv",
+      "WIDGET tbl-orders TABLE [COLUMNS id, amount] dataset=paid-orders",
+      "LAYOUT 3 个组件"
+    ]
+  },
+  "tables": {
+    "shop": [
+      {
+        "name": "orders",
+        "schema": "",
+        "row_estimate": 1200,
+        "size_bytes": 4096
+      }
+    ],
+    "crm": [
+      {
+        "name": "users",
+        "schema": "",
+        "row_estimate": 300,
+        "size_bytes": 1024
+      }
+    ]
+  },
+  "columns": {
+    "orders": ["id", "amount", "city", "status"],
+    "users": ["id", "name", "channel"]
+  },
+  "reports": [
     {
-     "aggregates": [
-      {
-       "column": "amount",
-       "func": "Sum",
-       "output": "gmv"
-      },
-      {
-       "column": null,
-       "func": "Count",
-       "output": "cnt"
-      }
-     ],
-     "base": "o",
-     "computed": [],
-     "fields": [],
-     "filters": [
-      "status = 'paid'"
-     ],
-     "group_by": [
-      "city"
-     ],
-     "id": "city-gmv",
-     "joins": [
-      {
-       "kind": "Inner",
-       "on": [
+      "id": "rb-cross",
+      "name": "成交看板（商城库 × 客户库）",
+      "description": "按城市看 GMV，跨两个连接",
+      "question": "按城市统计已支付订单的 GMV，并列出金额最高的 5 笔订单",
+      "datasets": [
         {
-         "left": "user_id",
-         "right": "id"
+          "aggregates": [
+            {
+              "column": "amount",
+              "func": "Sum",
+              "output": "gmv"
+            },
+            {
+              "column": null,
+              "func": "Count",
+              "output": "cnt"
+            }
+          ],
+          "base": "o",
+          "computed": [],
+          "fields": [],
+          "filters": ["status = 'paid'"],
+          "group_by": ["city"],
+          "id": "city-gmv",
+          "joins": [
+            {
+              "kind": "Inner",
+              "on": [
+                {
+                  "left": "user_id",
+                  "right": "id"
+                }
+              ],
+              "source": "u"
+            }
+          ],
+          "limit": null,
+          "max_rows": null,
+          "name": "城市成交额",
+          "post_computed": [],
+          "sort": [
+            {
+              "column": "gmv",
+              "desc": true
+            }
+          ],
+          "sources": [
+            {
+              "alias": "o",
+              "columns": [],
+              "connection_id": "shop",
+              "database_type": "sqlite",
+              "schema": "",
+              "table": "orders"
+            },
+            {
+              "alias": "u",
+              "columns": [],
+              "connection_id": "crm",
+              "database_type": "sqlite",
+              "schema": "",
+              "table": "users"
+            }
+          ]
+        },
+        {
+          "aggregates": [],
+          "base": "o",
+          "computed": [],
+          "fields": ["id", "amount"],
+          "filters": ["status = 'paid'"],
+          "group_by": [],
+          "id": "paid-orders",
+          "joins": [],
+          "limit": 2,
+          "max_rows": null,
+          "name": "已支付订单明细",
+          "post_computed": [],
+          "sort": [
+            {
+              "column": "id",
+              "desc": true
+            }
+          ],
+          "sources": [
+            {
+              "alias": "o",
+              "columns": [],
+              "connection_id": "shop",
+              "database_type": "sqlite",
+              "schema": "",
+              "table": "orders"
+            }
+          ]
         }
-       ],
-       "source": "u"
-      }
-     ],
-     "limit": null,
-     "max_rows": null,
-     "name": "城市成交额",
-     "post_computed": [],
-     "sort": [
-      {
-       "column": "gmv",
-       "desc": true
-      }
-     ],
-     "sources": [
-      {
-       "alias": "o",
-       "columns": [],
-       "connection_id": "shop",
-       "database_type": "sqlite",
-       "schema": "",
-       "table": "orders"
+      ],
+      "view": {
+        "id": "shop-board",
+        "layout": [],
+        "name": "成交看板",
+        "version": 1,
+        "widgets": [
+          {
+            "agg": "RAW",
+            "dataset": "city-gmv",
+            "encode": {
+              "category": null,
+              "columns": [],
+              "series": null,
+              "value": null,
+              "x": null,
+              "y": "gmv"
+            },
+            "filters": [],
+            "id": "kpi-gmv",
+            "limit": null,
+            "title": "kpi-gmv",
+            "type": "KPI"
+          },
+          {
+            "agg": "RAW",
+            "dataset": "city-gmv",
+            "encode": {
+              "category": null,
+              "columns": [],
+              "series": null,
+              "value": null,
+              "x": "city",
+              "y": "gmv"
+            },
+            "filters": [],
+            "id": "bar-city",
+            "limit": null,
+            "title": "bar-city",
+            "type": "BAR"
+          },
+          {
+            "agg": "RAW",
+            "dataset": "paid-orders",
+            "encode": {
+              "category": null,
+              "columns": ["id", "amount"],
+              "series": null,
+              "value": null,
+              "x": null,
+              "y": null
+            },
+            "filters": [],
+            "id": "tbl-orders",
+            "limit": null,
+            "title": "tbl-orders",
+            "type": "TABLE"
+          }
+        ]
       },
-      {
-       "alias": "u",
-       "columns": [],
-       "connection_id": "crm",
-       "database_type": "sqlite",
-       "schema": "",
-       "table": "users"
-      }
-     ]
+      "created_at": 1758600000,
+      "updated_at": 1758690000
     },
     {
-     "aggregates": [],
-     "base": "o",
-     "computed": [],
-     "fields": [
-      "id",
-      "amount"
-     ],
-     "filters": [
-      "status = 'paid'"
-     ],
-     "group_by": [],
-     "id": "paid-orders",
-     "joins": [],
-     "limit": 2,
-     "max_rows": null,
-     "name": "已支付订单明细",
-     "post_computed": [],
-     "sort": [
-      {
-       "column": "id",
-       "desc": true
-      }
-     ],
-     "sources": [
-      {
-       "alias": "o",
-       "columns": [],
-       "connection_id": "shop",
-       "database_type": "sqlite",
-       "schema": "",
-       "table": "orders"
-      }
-     ]
-    }
-   ],
-   "view": {
-    "id": "shop-board",
-    "layout": [],
-    "name": "成交看板",
-    "version": 1,
-    "widgets": [
-     {
-      "agg": "RAW",
-      "dataset": "city-gmv",
-      "encode": {
-       "category": null,
-       "columns": [],
-       "series": null,
-       "value": null,
-       "x": null,
-       "y": "gmv"
-      },
-      "filters": [],
-      "id": "kpi-gmv",
-      "limit": null,
-      "title": "kpi-gmv",
-      "type": "KPI"
-     },
-     {
-      "agg": "RAW",
-      "dataset": "city-gmv",
-      "encode": {
-       "category": null,
-       "columns": [],
-       "series": null,
-       "value": null,
-       "x": "city",
-       "y": "gmv"
-      },
-      "filters": [],
-      "id": "bar-city",
-      "limit": null,
-      "title": "bar-city",
-      "type": "BAR"
-     },
-     {
-      "agg": "RAW",
-      "dataset": "paid-orders",
-      "encode": {
-       "category": null,
-       "columns": [
-        "id",
-        "amount"
-       ],
-       "series": null,
-       "value": null,
-       "x": null,
-       "y": null
-      },
-      "filters": [],
-      "id": "tbl-orders",
-      "limit": null,
-      "title": "tbl-orders",
-      "type": "TABLE"
-     }
-    ]
-   },
-   "created_at": 1758600000,
-   "updated_at": 1758690000
-  },
-  {
-   "id": "rb-single",
-   "name": "已支付订单明细",
-   "description": null,
-   "question": "列出已支付订单",
-   "datasets": [
-    {
-     "aggregates": [],
-     "base": "o",
-     "computed": [],
-     "fields": [
-      "id",
-      "amount"
-     ],
-     "filters": [
-      "status = 'paid'"
-     ],
-     "group_by": [],
-     "id": "paid-orders",
-     "joins": [],
-     "limit": 2,
-     "max_rows": null,
-     "name": "已支付订单明细",
-     "post_computed": [],
-     "sort": [
-      {
-       "column": "id",
-       "desc": true
-      }
-     ],
-     "sources": [
-      {
-       "alias": "o",
-       "columns": [],
-       "connection_id": "shop",
-       "database_type": "sqlite",
-       "schema": "",
-       "table": "orders"
-      }
-     ]
-    }
-   ],
-   "view": {
-    "id": "paid-only",
-    "name": "已支付订单明细",
-    "version": 1,
-    "widgets": [
-     {
-      "agg": "RAW",
-      "dataset": "paid-orders",
-      "encode": {
-       "category": null,
-       "columns": [
-        "id",
-        "amount"
-       ],
-       "series": null,
-       "value": null,
-       "x": null,
-       "y": null
-      },
-      "filters": [],
-      "id": "tbl-orders",
-      "limit": null,
-      "title": "tbl-orders",
-      "type": "TABLE"
-     }
-    ],
-    "layout": []
-   },
-   "created_at": 1758500000,
-   "updated_at": 1758580000
-  },
-  {
-   "id": "rb-gone",
-   "name": "连接已删的报表",
-   "description": "故障注入用",
-   "question": "",
-   "datasets": [
-    {
-     "aggregates": [
-      {
-       "column": "amount",
-       "func": "Sum",
-       "output": "gmv"
-      },
-      {
-       "column": null,
-       "func": "Count",
-       "output": "cnt"
-      }
-     ],
-     "base": "o",
-     "computed": [],
-     "fields": [],
-     "filters": [
-      "status = 'paid'"
-     ],
-     "group_by": [
-      "city"
-     ],
-     "id": "city-gmv",
-     "joins": [
-      {
-       "kind": "Inner",
-       "on": [
+      "id": "rb-single",
+      "name": "已支付订单明细",
+      "description": null,
+      "question": "列出已支付订单",
+      "datasets": [
         {
-         "left": "user_id",
-         "right": "id"
+          "aggregates": [],
+          "base": "o",
+          "computed": [],
+          "fields": ["id", "amount"],
+          "filters": ["status = 'paid'"],
+          "group_by": [],
+          "id": "paid-orders",
+          "joins": [],
+          "limit": 2,
+          "max_rows": null,
+          "name": "已支付订单明细",
+          "post_computed": [],
+          "sort": [
+            {
+              "column": "id",
+              "desc": true
+            }
+          ],
+          "sources": [
+            {
+              "alias": "o",
+              "columns": [],
+              "connection_id": "shop",
+              "database_type": "sqlite",
+              "schema": "",
+              "table": "orders"
+            }
+          ]
         }
-       ],
-       "source": "u"
-      }
-     ],
-     "limit": null,
-     "max_rows": null,
-     "name": "城市成交额",
-     "post_computed": [],
-     "sort": [
-      {
-       "column": "gmv",
-       "desc": true
-      }
-     ],
-     "sources": [
-      {
-       "alias": "o",
-       "columns": [],
-       "connection_id": "gone-conn",
-       "database_type": "sqlite",
-       "schema": "",
-       "table": "orders"
+      ],
+      "view": {
+        "id": "paid-only",
+        "name": "已支付订单明细",
+        "version": 1,
+        "widgets": [
+          {
+            "agg": "RAW",
+            "dataset": "paid-orders",
+            "encode": {
+              "category": null,
+              "columns": ["id", "amount"],
+              "series": null,
+              "value": null,
+              "x": null,
+              "y": null
+            },
+            "filters": [],
+            "id": "tbl-orders",
+            "limit": null,
+            "title": "tbl-orders",
+            "type": "TABLE"
+          }
+        ],
+        "layout": []
       },
-      {
-       "alias": "u",
-       "columns": [],
-       "connection_id": "gone-conn",
-       "database_type": "sqlite",
-       "schema": "",
-       "table": "users"
-      }
-     ]
+      "created_at": 1758500000,
+      "updated_at": 1758580000
     },
     {
-     "aggregates": [],
-     "base": "o",
-     "computed": [],
-     "fields": [
-      "id",
-      "amount"
-     ],
-     "filters": [
-      "status = 'paid'"
-     ],
-     "group_by": [],
-     "id": "paid-orders",
-     "joins": [],
-     "limit": 2,
-     "max_rows": null,
-     "name": "已支付订单明细",
-     "post_computed": [],
-     "sort": [
-      {
-       "column": "id",
-       "desc": true
-      }
-     ],
-     "sources": [
-      {
-       "alias": "o",
-       "columns": [],
-       "connection_id": "shop",
-       "database_type": "sqlite",
-       "schema": "",
-       "table": "orders"
-      }
-     ]
+      "id": "rb-gone",
+      "name": "连接已删的报表",
+      "description": "故障注入用",
+      "question": "",
+      "datasets": [
+        {
+          "aggregates": [
+            {
+              "column": "amount",
+              "func": "Sum",
+              "output": "gmv"
+            },
+            {
+              "column": null,
+              "func": "Count",
+              "output": "cnt"
+            }
+          ],
+          "base": "o",
+          "computed": [],
+          "fields": [],
+          "filters": ["status = 'paid'"],
+          "group_by": ["city"],
+          "id": "city-gmv",
+          "joins": [
+            {
+              "kind": "Inner",
+              "on": [
+                {
+                  "left": "user_id",
+                  "right": "id"
+                }
+              ],
+              "source": "u"
+            }
+          ],
+          "limit": null,
+          "max_rows": null,
+          "name": "城市成交额",
+          "post_computed": [],
+          "sort": [
+            {
+              "column": "gmv",
+              "desc": true
+            }
+          ],
+          "sources": [
+            {
+              "alias": "o",
+              "columns": [],
+              "connection_id": "gone-conn",
+              "database_type": "sqlite",
+              "schema": "",
+              "table": "orders"
+            },
+            {
+              "alias": "u",
+              "columns": [],
+              "connection_id": "gone-conn",
+              "database_type": "sqlite",
+              "schema": "",
+              "table": "users"
+            }
+          ]
+        },
+        {
+          "aggregates": [],
+          "base": "o",
+          "computed": [],
+          "fields": ["id", "amount"],
+          "filters": ["status = 'paid'"],
+          "group_by": [],
+          "id": "paid-orders",
+          "joins": [],
+          "limit": 2,
+          "max_rows": null,
+          "name": "已支付订单明细",
+          "post_computed": [],
+          "sort": [
+            {
+              "column": "id",
+              "desc": true
+            }
+          ],
+          "sources": [
+            {
+              "alias": "o",
+              "columns": [],
+              "connection_id": "shop",
+              "database_type": "sqlite",
+              "schema": "",
+              "table": "orders"
+            }
+          ]
+        }
+      ],
+      "view": {
+        "id": "shop-board",
+        "layout": [],
+        "name": "成交看板",
+        "version": 1,
+        "widgets": [
+          {
+            "agg": "RAW",
+            "dataset": "city-gmv",
+            "encode": {
+              "category": null,
+              "columns": [],
+              "series": null,
+              "value": null,
+              "x": null,
+              "y": "gmv"
+            },
+            "filters": [],
+            "id": "kpi-gmv",
+            "limit": null,
+            "title": "kpi-gmv",
+            "type": "KPI"
+          },
+          {
+            "agg": "RAW",
+            "dataset": "city-gmv",
+            "encode": {
+              "category": null,
+              "columns": [],
+              "series": null,
+              "value": null,
+              "x": "city",
+              "y": "gmv"
+            },
+            "filters": [],
+            "id": "bar-city",
+            "limit": null,
+            "title": "bar-city",
+            "type": "BAR"
+          },
+          {
+            "agg": "RAW",
+            "dataset": "paid-orders",
+            "encode": {
+              "category": null,
+              "columns": ["id", "amount"],
+              "series": null,
+              "value": null,
+              "x": null,
+              "y": null
+            },
+            "filters": [],
+            "id": "tbl-orders",
+            "limit": null,
+            "title": "tbl-orders",
+            "type": "TABLE"
+          }
+        ]
+      },
+      "created_at": 1758400000,
+      "updated_at": 1758480000
     }
-   ],
-   "view": {
-    "id": "shop-board",
-    "layout": [],
-    "name": "成交看板",
-    "version": 1,
-    "widgets": [
-     {
-      "agg": "RAW",
-      "dataset": "city-gmv",
-      "encode": {
-       "category": null,
-       "columns": [],
-       "series": null,
-       "value": null,
-       "x": null,
-       "y": "gmv"
-      },
-      "filters": [],
-      "id": "kpi-gmv",
-      "limit": null,
-      "title": "kpi-gmv",
-      "type": "KPI"
-     },
-     {
-      "agg": "RAW",
-      "dataset": "city-gmv",
-      "encode": {
-       "category": null,
-       "columns": [],
-       "series": null,
-       "value": null,
-       "x": "city",
-       "y": "gmv"
-      },
-      "filters": [],
-      "id": "bar-city",
-      "limit": null,
-      "title": "bar-city",
-      "type": "BAR"
-     },
-     {
-      "agg": "RAW",
-      "dataset": "paid-orders",
-      "encode": {
-       "category": null,
-       "columns": [
-        "id",
-        "amount"
-       ],
-       "series": null,
-       "value": null,
-       "x": null,
-       "y": null
-      },
-      "filters": [],
-      "id": "tbl-orders",
-      "limit": null,
-      "title": "tbl-orders",
-      "type": "TABLE"
-     }
-    ]
-   },
-   "created_at": 1758400000,
-   "updated_at": 1758480000
-  }
- ]
+  ],
+  "connections": [
+    {
+      "id": "shop",
+      "name": "商城库",
+      "db_type": "mysql",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "username": "root",
+      "password": "probe-pw",
+      "database": "shop"
+    },
+    {
+      "id": "crm",
+      "name": "客户库",
+      "db_type": "sqlite",
+      "host": "",
+      "port": 0,
+      "username": "",
+      "password": "",
+      "database": "crm.db"
+    }
+  ],
+  "ai_config": {
+    "base_url": "https://api.example.com/v1",
+    "api_key": "sk-probe",
+    "model": "probe-model"
+  },
+  "history": [
+    {
+      "id": "h1",
+      "sql": "SELECT 1",
+      "connection_id": "shop",
+      "connection_name": "商城库",
+      "timestamp": 1753000000,
+      "execution_time_ms": 12,
+      "success": true,
+      "error": null
+    }
+  ],
+  "saved_queries": [
+    {
+      "id": "s1",
+      "name": "昨日成交",
+      "sql": "SELECT * FROM orders",
+      "description": null,
+      "tags": ["报表"],
+      "created_at": 1753000000,
+      "updated_at": 1753000000
+    }
+  ]
 }

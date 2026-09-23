@@ -22,13 +22,10 @@ import {
   Typography,
   Alert,
   Spin,
+  Badge,
   Segmented,
 } from "antd";
-import {
-  buildGrant,
-  isLikelyWriteSql,
-  PendingApproval,
-} from "./ipc/approval";
+import { buildGrant, isLikelyWriteSql, PendingApproval } from "./ipc/approval";
 import type { ApprovalGrant } from "./ipc/approval";
 import { classifyError, errorDescription } from "./ipc/errors";
 
@@ -65,16 +62,20 @@ import {
   SnippetsOutlined,
   SearchOutlined,
   DashboardOutlined,
+  CheckCircleOutlined,
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 // 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
-import { useAgentStore } from './agent/AgentManager';
-import AgentPanel from './agent/AgentPanel';
+import { useAgentStore } from "./agent/AgentManager";
+import AgentPanel from "./agent/AgentPanel";
 import { ReportWorkbench } from "./report/ReportWorkbench";
+import { aiSqlGenerate, reportDescribeColumns } from "./report/api";
+import type { CatalogTable, SqlDraft } from "./report/types";
 
 // 渐变色主题常量
 const brandGradient = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
-const cardBgGradient = "linear-gradient(135deg, rgba(102,126,234,0.04) 0%, rgba(118,75,162,0.04) 100%)";
+const cardBgGradient =
+  "linear-gradient(135deg, rgba(102,126,234,0.04) 0%, rgba(118,75,162,0.04) 100%)";
 
 const { Header, Sider, Content } = Layout;
 const { TextArea } = Input;
@@ -201,8 +202,10 @@ function App() {
   // T-001 + T-002：以后端 column_meta 为准，零行结果仍有列定义
   const [queryColumnsMeta, setQueryColumnsMeta] = useState<ColumnMeta[]>([]);
   // T-044: 网格编辑状态
-  const [editingCell, setEditingCell] = useState<{ rowIndex: number; colIndex: number } | null>(null);
-  const [editValue, setEditValue] = useState<string>('');
+  const [editingCell, setEditingCell] = useState<{ rowIndex: number; colIndex: number } | null>(
+    null
+  );
+  const [editValue, setEditValue] = useState<string>("");
   const [changeSet, setChangeSet] = useState<Map<string, TaggedCell>>(new Map());
   // T-044: 记录变更数量用于UI显示
   // T-006：可写访问模式开关；S0 默认 false，写入命令将被后端拒绝
@@ -256,9 +259,7 @@ function App() {
   useEffect(() => {
     if (!historyLoaded) return;
     const t = setTimeout(() => {
-      invoke("save_query_history", { history }).catch((e) =>
-        msgApi.error(`保存历史失败：${e}`),
-      );
+      invoke("save_query_history", { history }).catch((e) => msgApi.error(`保存历史失败：${e}`));
     }, 500);
     return () => clearTimeout(t);
   }, [history, historyLoaded]);
@@ -289,7 +290,7 @@ function App() {
   // 这里不再做整体快照保存（避免与单条命令竞态）。
   const [showSaveQueryModal, setShowSaveQueryModal] = useState(false);
   const [editingSavedQuery, setEditingSavedQuery] = useState<SavedQuery | null>(null);
-  
+
   // T-036: 导出结果为 CSV
   const handleExportResults = () => {
     if (queryResults.length === 0) {
@@ -300,22 +301,22 @@ function App() {
       const headers = resultColumns.map((c) => c.title);
       const csvRows = queryResults.map((row) => {
         return row.map((cell) => {
-          if (cell.__kind === 'null') return 'NULL';
-          if (cell.__kind === 'binary') return '[BINARY]';
-          const val = String(cell.value ?? '');
+          if (cell.__kind === "null") return "NULL";
+          if (cell.__kind === "binary") return "[BINARY]";
+          const val = String(cell.value ?? "");
           // CSV 公式防护：字段以 = + - @ \t \n 开头时加前缀单引号
           if (/^[=+\-@\t\n]/.test(val)) return "'" + val;
           // 含逗号或引号时用双引号包裹
-          if (val.includes(',') || val.includes('"')) {
+          if (val.includes(",") || val.includes('"')) {
             return '"' + val.replace(/"/g, '""') + '"';
           }
           return val;
         });
       });
-      const csv = [headers.join(','), ...csvRows.map((r) => r.join(','))].join('\n');
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const csv = [headers.join(","), ...csvRows.map((r) => r.join(","))].join("\n");
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
       const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
+      const a = document.createElement("a");
       a.href = url;
       a.download = `query_results_${new Date().toISOString().slice(0, 10)}.csv`;
       a.click();
@@ -325,7 +326,7 @@ function App() {
       msgApi.error(`导出失败: ${e}`);
     }
   };
-  
+
   // AI 配置
   const [aiConfig, setAiConfig] = useState({
     baseUrl: "",
@@ -356,9 +357,9 @@ function App() {
       setPendingGrant(null);
       approvalPendingRef.current = resolve;
     });
-  
+
   // AI 功能状态
-  const [aiLoading] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
   const [aiResult, setAiResult] = useState<string>("");
   const [showAiResultModal, setShowAiResultModal] = useState(false);
   const [aiActiveTab, setAiActiveTab] = useState<string>("generate");
@@ -367,6 +368,13 @@ function App() {
   const [aiSqlForExplain, setAiSqlForExplain] = useState("");
   const [aiErrorMessage, setAiErrorMessage] = useState("");
   const [aiSqlForError, setAiSqlForError] = useState("");
+  // 生成 SQL 这条链的产出：SQL 之外还要把"依据哪几张表、被打回几次"露出来
+  const [aiGenTables, setAiGenTables] = useState<string[]>([]);
+  const [aiDraft, setAiDraft] = useState<SqlDraft | null>(null);
+  const [aiDraftError, setAiDraftError] = useState("");
+  // 前端预检就没过（列清单读不出来）和后端本机校验打回是两件事，
+  // 混成一个标题会让人以为模型编错了字段
+  const [aiDraftPrecheck, setAiDraftPrecheck] = useState(false);
 
   const [msgApi, msgContext] = message.useMessage();
 
@@ -385,10 +393,7 @@ function App() {
     let grant: ApprovalGrant | null | undefined = undefined;
     if (wantWrite && likelyWrite) {
       // 弹 Modal 等用户确认；环境暂取 selectedConnection.environment ?? "unknown"
-      grant = await requestApproval(
-        sqlCode,
-        (selectedConnection as any).environment ?? "unknown",
-      );
+      grant = await requestApproval(sqlCode, (selectedConnection as any).environment ?? "unknown");
       if (!grant) {
         // 用户取消
         msgApi.info("写入操作已取消");
@@ -405,10 +410,7 @@ function App() {
       });
 
       // 异步校验：标签或连接已切走 → 丢弃结果
-      if (
-        requestConnId !== selectedConnection?.id ||
-        requestTabId !== activeTabId
-      ) {
+      if (requestConnId !== selectedConnection?.id || requestTabId !== activeTabId) {
         msgApi.warning("连接或标签已切换，结果已丢弃（DB-11 防竞态）");
         return;
       }
@@ -420,14 +422,14 @@ function App() {
       // 添加到 Agent 历史
       useAgentStore.getState().addMessage({
         id: Date.now().toString(),
-        role: 'user',
+        role: "user",
         content: `执行查询: ${sqlCode}`,
         timestamp: Date.now(),
       });
 
       useAgentStore.getState().addMessage({
         id: (Date.now() + 1).toString(),
-        role: 'agent',
+        role: "agent",
         content: `查询返回 ${result.rows?.length || 0} 行结果`,
         sql: sqlCode,
         timestamp: Date.now(),
@@ -454,10 +456,7 @@ function App() {
         duration: 3,
       });
     } catch (e: any) {
-      if (
-        requestConnId !== selectedConnection?.id ||
-        requestTabId !== activeTabId
-      ) {
+      if (requestConnId !== selectedConnection?.id || requestTabId !== activeTabId) {
         return;
       }
       msgApi.error({
@@ -511,19 +510,16 @@ function App() {
 
   // 报表工作台要一次拿到所有连接的凭据（跨库 join 的每个源各自定位连接）。
   // 必须 memo：workbench 以 configs 为依赖去拉表清单，每次渲染换引用就会狂刷库。
-  const backendConfigs = useMemo(
-    () => connections.map((c) => toBackendConfig(c)),
-    [connections],
-  );
+  const backendConfigs = useMemo(() => connections.map((c) => toBackendConfig(c)), [connections]);
   const aiConfigForReport = useMemo(
     () => ({ base_url: aiConfig.baseUrl, api_key: aiConfig.apiKey, model: aiConfig.model }),
-    [aiConfig],
+    [aiConfig]
   );
 
   // 连接配置落盘
   const persistConnections = (list: DBConnection[]) => {
-    invoke("save_connections", { connections: list.map(toBackendConfig) }).catch(
-      (e) => msgApi.error(`保存连接配置失败: ${e}`)
+    invoke("save_connections", { connections: list.map(toBackendConfig) }).catch((e) =>
+      msgApi.error(`保存连接配置失败: ${e}`)
     );
   };
 
@@ -562,9 +558,10 @@ function App() {
       .catch(() => {});
   }, []);
 
-  // AI 功能 - 使用共享 Agent 组件
+  // AI 生成 SQL：自然语言 → 一条过了本机校验的 SQL（后端只看得见我们给的表与列）
   const handleAiGenerateSql = async () => {
-    if (!aiNaturalLanguage.trim()) {
+    const question = aiNaturalLanguage.trim();
+    if (!question) {
       msgApi.warning("请输入自然语言描述");
       return;
     }
@@ -572,18 +569,66 @@ function App() {
       msgApi.warning("请先连接数据库");
       return;
     }
-    
+    if (!aiConfig.baseUrl || !aiConfig.apiKey || !aiConfig.model) {
+      msgApi.warning("先配置 AI 服务地址、密钥与模型");
+      setShowAiConfigModal(true);
+      return;
+    }
+    // 没显式选表就退回左侧当前选中的那张：至少是用户自己点的表
+    const wanted = aiGenTables.length ? aiGenTables : selectedTable ? [selectedTable] : [];
+    if (!wanted.length) {
+      msgApi.warning("先勾选这次要用的表，模型没有列清单就只能编字段");
+      return;
+    }
+    const cfg = toBackendConfig(selectedConnection);
+    setAiLoading(true);
+    setAiDraft(null);
+    setAiDraftError("");
+    setAiDraftPrecheck(false);
     try {
-      const result = await useAgentStore.getState().query(aiNaturalLanguage);
-      
-      if (result.success && result.sql) {
-        setSqlCode(result.sql);
-        msgApi.success("SQL 已生成");
-      } else if (result.error) {
-        msgApi.error(`Agent 错误: ${result.error}`);
+      // 列清单读不到的表要丢掉：没有列清单，后端的列校验对那张表形同虚设
+      const built = await Promise.all(
+        wanted.map(async (name) => {
+          const schema = tables.find((t) => t.name === name)?.schema || "";
+          try {
+            const cols = await reportDescribeColumns(cfg, schema, name);
+            const entry: CatalogTable = {
+              connection_id: cfg.id,
+              connection_name: cfg.name,
+              database_type: cfg.db_type,
+              schema,
+              table: name,
+              columns: cols,
+            };
+            return { entry, failed: "" };
+          } catch (e: any) {
+            return { entry: null, failed: `${name}：${e}` };
+          }
+        })
+      );
+      const catalog = built.map((b) => b.entry).filter((t): t is CatalogTable => t !== null);
+      const failed = built.map((b) => b.failed).filter(Boolean);
+      if (!catalog.length) {
+        setAiDraftError(`没能读到任何表的列清单：\n${failed.join("\n")}`);
+        setAiDraftPrecheck(true);
+        msgApi.error("生成失败：列清单读不出来");
+        return;
       }
+      if (failed.length) msgApi.warning(`这些表读不到列清单，本次没带上：${failed.join("；")}`);
+      const draft = await aiSqlGenerate(question, catalog, aiConfigForReport);
+      setAiDraft(draft);
+      setSqlCode(draft.sql);
+      msgApi.success(
+        draft.repairs > 0
+          ? `已生成，本机校验打回 ${draft.repairs} 次后通过`
+          : "已生成并通过本机校验"
+      );
     } catch (e: any) {
-      msgApi.error(`AI 服务错误: ${e}`);
+      // 后端把本机校验的拒因原样带回来，别只留一句"失败"
+      setAiDraftError(String(e));
+      msgApi.error("生成失败");
+    } finally {
+      setAiLoading(false);
     }
   };
 
@@ -592,10 +637,10 @@ function App() {
       msgApi.warning("请输入要优化的 SQL");
       return;
     }
-    
+
     try {
       const result = await useAgentStore.getState().optimize(aiSqlForOptimize);
-      
+
       if (result.success && result.sql) {
         setAiResult(result.content);
         setShowAiResultModal(true);
@@ -612,10 +657,10 @@ function App() {
       msgApi.warning("请输入要解释的 SQL");
       return;
     }
-    
+
     try {
       const result = await useAgentStore.getState().optimize(aiSqlForExplain);
-      
+
       if (result.success) {
         setAiResult(result.content);
         setShowAiResultModal(true);
@@ -632,10 +677,10 @@ function App() {
       msgApi.warning("请输入错误信息和 SQL");
       return;
     }
-    
+
     try {
       const result = await useAgentStore.getState().diagnoseError(aiErrorMessage, aiSqlForError);
-      
+
       if (result.success) {
         setAiResult(result.content);
         setShowAiResultModal(true);
@@ -657,7 +702,7 @@ function App() {
     const sample = queryResults.slice(0, 100);
     try {
       const result = await useAgentStore.getState().analyze(sqlCode, sample);
-      
+
       if (result.success) {
         setAiResult(result.content);
         setShowAiResultModal(true);
@@ -700,24 +745,24 @@ function App() {
     setSelectedTable(null);
     setColumns([]);
     msgApi.success(`已连接到 ${connection.name}`);
-    
+
     // 设置 Agent 上下文
     useAgentStore.getState().setContext({
       connectionId: connection.id,
       databaseType: connection.type,
       databaseName: connection.database,
     });
-    
+
     try {
       const list = await invoke<TableInfo[]>("get_tables", { config: cfg });
       setTables(list);
-      
+
       // 更新 Agent 上下文的表信息
       useAgentStore.getState().setContext({
         connectionId: connection.id,
         databaseType: connection.type,
         databaseName: connection.database,
-        tables: list.map(t => ({
+        tables: list.map((t) => ({
           name: t.name,
           columns: [], // TODO: 从后端获取列信息
         })),
@@ -932,9 +977,7 @@ function App() {
     if (editingSavedQuery) {
       setSavedQueries(
         savedQueries.map((q) =>
-          q.id === editingSavedQuery.id
-            ? { ...q, ...values, updated_at: now }
-            : q
+          q.id === editingSavedQuery.id ? { ...q, ...values, updated_at: now } : q
         )
       );
       msgApi.success("已更新");
@@ -964,61 +1007,75 @@ function App() {
   // T-002：表格列定义使用后端 column_meta，不再用 Object.keys 推导列名
   // 零行结果依旧展示列头（A01 / A02）
   // T-044: 添加单元格编辑支持（双击编辑，change set 跟踪变更）
-  const resultColumns = queryColumnsMeta.length > 0
-    ? queryColumnsMeta.map((meta) => ({
-        title: (
-          <span>
-            {meta.name}
-            <Tag style={{ marginLeft: 6 }} color="blue">{meta.logical_type}</Tag>
-          </span>
-        ),
-        dataIndex: `col_${meta.ordinal}`,
-        key: `col_${meta.ordinal}`,
-        ellipsis: true,
-        onCell: (record: any, rowIndex?: number) => ({
-          onDoubleClick: () => {
-            if (rowIndex !== undefined && writeAccessEnabled) {
-              const cellValue = record[`col_${meta.ordinal}`];
-              setEditingCell({ rowIndex, colIndex: meta.ordinal });
-              setEditValue(cellValue?.value ?? '');
-            }
-          },
-          style: { cursor: writeAccessEnabled ? 'pointer' : 'default' },
-        }),
-        render: (_: any, record: any) => {
-          const cellKey = `${record.key}_${meta.ordinal}`;
-          const isEditing = editingCell?.rowIndex === record.key && editingCell?.colIndex === meta.ordinal;
-          
-          if (isEditing) {
-            return (
-              <Input
-                size="small"
-                value={editValue}
-                onChange={(e) => setEditValue(e.target.value)}
-                onPressEnter={() => {
-                  const newCell: TaggedCell = { __kind: 'text', value: editValue };
-                  const changeKey = cellKey;
-                  setChangeSet(prev => new Map(prev).set(changeKey, newCell));
-                  setEditingCell(null);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Escape') setEditingCell(null);
-                }}
-                autoFocus
-                style={{ width: '100%', fontSize: 12 }}
-              />
-            );
-          }
-          
-          const isChanged = changeSet.has(cellKey);
-          return (
-            <span style={isChanged ? { backgroundColor: 'rgba(82, 196, 26, 0.15)', padding: '1px 4px', borderRadius: 2 } : {}}>
-              {cellDisplay(record[`col_${meta.ordinal}`])}
+  const resultColumns =
+    queryColumnsMeta.length > 0
+      ? queryColumnsMeta.map((meta) => ({
+          title: (
+            <span>
+              {meta.name}
+              <Tag style={{ marginLeft: 6 }} color="blue">
+                {meta.logical_type}
+              </Tag>
             </span>
-          );
-        },
-      }))
-    : [];
+          ),
+          dataIndex: `col_${meta.ordinal}`,
+          key: `col_${meta.ordinal}`,
+          ellipsis: true,
+          onCell: (record: any, rowIndex?: number) => ({
+            onDoubleClick: () => {
+              if (rowIndex !== undefined && writeAccessEnabled) {
+                const cellValue = record[`col_${meta.ordinal}`];
+                setEditingCell({ rowIndex, colIndex: meta.ordinal });
+                setEditValue(cellValue?.value ?? "");
+              }
+            },
+            style: { cursor: writeAccessEnabled ? "pointer" : "default" },
+          }),
+          render: (_: any, record: any) => {
+            const cellKey = `${record.key}_${meta.ordinal}`;
+            const isEditing =
+              editingCell?.rowIndex === record.key && editingCell?.colIndex === meta.ordinal;
+
+            if (isEditing) {
+              return (
+                <Input
+                  size="small"
+                  value={editValue}
+                  onChange={(e) => setEditValue(e.target.value)}
+                  onPressEnter={() => {
+                    const newCell: TaggedCell = { __kind: "text", value: editValue };
+                    const changeKey = cellKey;
+                    setChangeSet((prev) => new Map(prev).set(changeKey, newCell));
+                    setEditingCell(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setEditingCell(null);
+                  }}
+                  autoFocus
+                  style={{ width: "100%", fontSize: 12 }}
+                />
+              );
+            }
+
+            const isChanged = changeSet.has(cellKey);
+            return (
+              <span
+                style={
+                  isChanged
+                    ? {
+                        backgroundColor: "rgba(82, 196, 26, 0.15)",
+                        padding: "1px 4px",
+                        borderRadius: 2,
+                      }
+                    : {}
+                }
+              >
+                {cellDisplay(record[`col_${meta.ordinal}`])}
+              </span>
+            );
+          },
+        }))
+      : [];
 
   return (
     <ConfigProvider
@@ -1027,21 +1084,40 @@ function App() {
       }}
     >
       <Layout style={{ height: "100vh" }}>
-        <Sider width={280} theme={darkMode ? "dark" : "light"} style={{ 
-          background: cardBgGradient,
-          borderRight: `1px solid var(--ant-color-border-secondary)`,
-        }}>
-          <div 
-            style={{ 
-              padding: "16px", 
+        <Sider
+          width={280}
+          theme={darkMode ? "dark" : "light"}
+          style={{
+            background: cardBgGradient,
+            borderRight: `1px solid var(--ant-color-border-secondary)`,
+          }}
+        >
+          <div
+            style={{
+              padding: "16px",
               borderBottom: `1px solid var(--ant-color-border-secondary)`,
               display: "flex",
               alignItems: "center",
               gap: 12,
             }}
           >
-            <DatabaseOutlined style={{ fontSize: "20px", background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }} />
-            <strong style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>数据库连接</strong>
+            <DatabaseOutlined
+              style={{
+                fontSize: "20px",
+                background: brandGradient,
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+              }}
+            />
+            <strong
+              style={{
+                background: brandGradient,
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+              }}
+            >
+              数据库连接
+            </strong>
           </div>
           <div style={{ padding: "8px" }}>
             <Space orientation="vertical" style={{ width: "100%" }}>
@@ -1054,7 +1130,7 @@ function App() {
                   form.resetFields();
                   setShowConnectionModal(true);
                 }}
-                style={{ 
+                style={{
                   borderRadius: 8,
                   background: brandGradient,
                   boxShadow: "0 4px 12px rgba(102,126,234,0.3)",
@@ -1086,13 +1162,15 @@ function App() {
             theme={darkMode ? "dark" : "light"}
             style={{
               borderRight: 0,
-              background: 'transparent',
+              background: "transparent",
             }}
             items={connections.map((conn) => ({
               key: conn.id,
               icon: <DatabaseOutlined />,
               label: (
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div
+                  style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}
+                >
                   <span>{conn.name}</span>
                   <Space size="small">
                     <Tooltip title="编辑">
@@ -1151,9 +1229,7 @@ function App() {
               )}
             </Space>
             <Space>
-              <Text type="secondary">
-                {selectedConnection?.host || "未连接"}
-              </Text>
+              <Text type="secondary">{selectedConnection?.host || "未连接"}</Text>
               <Switch
                 checked={darkMode}
                 onChange={setDarkMode}
@@ -1165,12 +1241,12 @@ function App() {
                   <Button
                     type="primary"
                     icon={<RobotOutlined />}
-                    onClick={() => setShowAiConfigModal(true)}
+                    onClick={() => setShowAiResultModal(true)}
                   />
                 </Tooltip>
-                <Tooltip title="设置">
-                  <SettingOutlined 
-                    style={{ fontSize: "16px", cursor: "pointer" }} 
+                <Tooltip title="AI 服务设置">
+                  <SettingOutlined
+                    style={{ fontSize: "16px", cursor: "pointer" }}
                     onClick={() => setShowAiConfigModal(true)}
                   />
                 </Tooltip>
@@ -1189,9 +1265,9 @@ function App() {
             ) : isConnected ? (
               <>
                 {/* 多标签页 */}
-                <div 
-                  style={{ 
-                    padding: "8px 16px 0", 
+                <div
+                  style={{
+                    padding: "8px 16px 0",
                     borderBottom: `1px solid var(--ant-color-border-secondary)`,
                     background: cardBgGradient,
                     borderRadius: 16,
@@ -1217,13 +1293,30 @@ function App() {
                 {/* 主体三栏布局 */}
                 <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
                   {/* 左：表结构 */}
-                  <div style={{ width: "240px", borderRight: `1px solid var(--ant-color-border-secondary)`, overflow: "auto", padding: 8 }}>
+                  <div
+                    style={{
+                      width: "240px",
+                      borderRight: `1px solid var(--ant-color-border-secondary)`,
+                      overflow: "auto",
+                      padding: 8,
+                    }}
+                  >
                     <Card
                       size="small"
-                      title={<Space><TableOutlined />表结构{tables.length > 0 && ` (${tables.length})`}</Space>}
+                      title={
+                        <Space>
+                          <TableOutlined />
+                          表结构{tables.length > 0 && ` (${tables.length})`}
+                        </Space>
+                      }
                       extra={
                         <Tooltip title="刷新表列表">
-                          <Button size="small" type="text" icon={<SyncOutlined />} onClick={refreshTables} />
+                          <Button
+                            size="small"
+                            type="text"
+                            icon={<SyncOutlined />}
+                            onClick={refreshTables}
+                          />
                         </Tooltip>
                       }
                       style={{
@@ -1238,13 +1331,15 @@ function App() {
                           style={{
                             padding: "6px 8px",
                             cursor: "pointer",
-                            background: selectedTable === t.name ? "rgba(102,126,234,0.1)" : undefined,
+                            background:
+                              selectedTable === t.name ? "rgba(102,126,234,0.1)" : undefined,
                             borderRadius: 6,
                             transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
                           }}
                           onMouseEnter={(e) => {
                             if (selectedTable !== t.name) {
-                              (e.currentTarget as HTMLElement).style.background = "rgba(102,126,234,0.05)";
+                              (e.currentTarget as HTMLElement).style.background =
+                                "rgba(102,126,234,0.05)";
                             }
                           }}
                           onMouseLeave={(e) => {
@@ -1262,15 +1357,27 @@ function App() {
                         </div>
                       ))}
                       {selectedTable && (
-                        <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px dashed var(--ant-color-border-secondary)` }}>
+                        <div
+                          style={{
+                            marginTop: 12,
+                            paddingTop: 12,
+                            borderTop: `1px dashed var(--ant-color-border-secondary)`,
+                          }}
+                        >
                           <Text strong>{selectedTable} 字段：</Text>
                           {columns.map((c) => (
                             <div key={c.name} style={{ marginTop: 6, fontSize: 12 }}>
                               <Space size={4}>
-                                {c.is_primary && <Tag color="gold" style={{ margin: 0 }}>PK</Tag>}
+                                {c.is_primary && (
+                                  <Tag color="gold" style={{ margin: 0 }}>
+                                    PK
+                                  </Tag>
+                                )}
                                 <span style={{ fontWeight: 500 }}>{c.name}</span>
                               </Space>
-                              <div style={{ color: "var(--ant-color-text-secondary)", marginLeft: 20 }}>
+                              <div
+                                style={{ color: "var(--ant-color-text-secondary)", marginLeft: 20 }}
+                              >
                                 {c.data_type}
                                 {!c.nullable && <span style={{ marginLeft: 4 }}>NOT NULL</span>}
                               </div>
@@ -1286,27 +1393,31 @@ function App() {
                     {/* SQL 编辑器 */}
                     <Card
                       size="small"
-                      style={{ 
-                        marginBottom: 8, 
+                      style={{
+                        marginBottom: 8,
                         flex: "0 0 auto",
                         borderRadius: 12,
                         background: cardBgGradient,
                       }}
                       title={
-                        <span style={{ 
-                          fontWeight: 600,
-                          background: brandGradient,
-                          WebkitBackgroundClip: "text",
-                          WebkitTextFillColor: "transparent",
-                          backgroundImage: brandGradient,
-                        }}>SQL 编辑器</span>
+                        <span
+                          style={{
+                            fontWeight: 600,
+                            background: brandGradient,
+                            WebkitBackgroundClip: "text",
+                            WebkitTextFillColor: "transparent",
+                            backgroundImage: brandGradient,
+                          }}
+                        >
+                          SQL 编辑器
+                        </span>
                       }
                       extra={
                         <Space>
                           <Tooltip title="保存为常用查询">
-                            <Button 
-                              size="small" 
-                              icon={<StarOutlined />} 
+                            <Button
+                              size="small"
+                              icon={<StarOutlined />}
                               onClick={() => {
                                 setEditingSavedQuery(null);
                                 setShowSaveQueryModal(true);
@@ -1316,23 +1427,27 @@ function App() {
                               收藏
                             </Button>
                           </Tooltip>
-                          <Button 
-                            size="small" 
-                            icon={<FormatPainterOutlined />} 
+                          <Button
+                            size="small"
+                            icon={<FormatPainterOutlined />}
                             onClick={formatSQL}
                             style={{ borderRadius: 6 }}
                           >
                             格式化
                           </Button>
-                          <Button 
-                            size="small" 
-                            icon={<CopyOutlined />} 
+                          <Button
+                            size="small"
+                            icon={<CopyOutlined />}
                             onClick={() => copy(sqlCode)}
                             style={{ borderRadius: 6 }}
                           >
                             复制
                           </Button>
-                          <Tooltip title={writeAccessEnabled ? "可写：可执行 DML/DDL" : "只读：禁止写入，DB-06"}>
+                          <Tooltip
+                            title={
+                              writeAccessEnabled ? "可写：可执行 DML/DDL" : "只读：禁止写入，DB-06"
+                            }
+                          >
                             <Switch
                               size="small"
                               checked={writeAccessEnabled}
@@ -1359,18 +1474,14 @@ function App() {
                       }
                     >
                       {/* T-029: CodeMirror 6 SQL 编辑器 */}
-                      <SqlEditor
-                        value={sqlCode}
-                        onChange={setSqlCode}
-                        height="150px"
-                      />
+                      <SqlEditor value={sqlCode} onChange={setSqlCode} height="150px" />
                     </Card>
 
                     {/* 查询结果 */}
                     <Card
                       size="small"
-                      style={{ 
-                        flex: 1, 
+                      style={{
+                        flex: 1,
                         overflow: "hidden",
                         borderRadius: 12,
                         background: cardBgGradient,
@@ -1381,7 +1492,14 @@ function App() {
                           {changeSet.size > 0 && (
                             <Tag color="green">已修改 {changeSet.size} 项</Tag>
                           )}
-                          <Button size="small" icon={<SaveOutlined />} onClick={handleExportResults} style={{ borderRadius: 6 }}>导出</Button>
+                          <Button
+                            size="small"
+                            icon={<SaveOutlined />}
+                            onClick={handleExportResults}
+                            style={{ borderRadius: 6 }}
+                          >
+                            导出
+                          </Button>
                           {changeSet.size > 0 && writeAccessEnabled && (
                             <Button
                               size="small"
@@ -1403,7 +1521,9 @@ function App() {
                         columns={resultColumns}
                         dataSource={queryResults.map((row, index) => {
                           // T-001：按 ordinal 映射到列，便于大结果/同名列不丢数据
-                          const obj: Record<string, TaggedCell> & { key: number } = { key: index } as any;
+                          const obj: Record<string, TaggedCell> & { key: number } = {
+                            key: index,
+                          } as any;
                           row.forEach((cell, ord) => {
                             obj[`col_${ord}`] = cell;
                           });
@@ -1412,21 +1532,36 @@ function App() {
                         size="small"
                         virtual
                         scroll={{ x: "max-content", y: 400 }}
-                        pagination={{ pageSize: 100, showSizeChanger: true, pageSizeOptions: ["50", "100", "200", "500"] }}
+                        pagination={{
+                          pageSize: 100,
+                          showSizeChanger: true,
+                          pageSizeOptions: ["50", "100", "200", "500"],
+                        }}
                         style={{ borderRadius: 8 }}
                       />
                     </Card>
                   </div>
 
                   {/* 右：历史 + 收藏 */}
-                  <div style={{ width: "280px", borderLeft: `1px solid var(--ant-color-border-secondary)`, overflow: "auto" }}>
+                  <div
+                    style={{
+                      width: "280px",
+                      borderLeft: `1px solid var(--ant-color-border-secondary)`,
+                      overflow: "auto",
+                    }}
+                  >
                     <Tabs
                       size="small"
                       style={{ padding: 8 }}
                       items={[
                         {
                           key: "history",
-                          label: <span><HistoryOutlined style={{ color: brandGradient }} />历史</span>,
+                          label: (
+                            <span>
+                              <HistoryOutlined style={{ color: brandGradient }} />
+                              历史
+                            </span>
+                          ),
                           children: (
                             <div style={{ maxHeight: "calc(100vh - 200px)", overflow: "auto" }}>
                               {/* T-035: 历史搜索和过滤 */}
@@ -1447,44 +1582,64 @@ function App() {
                                   );
                                 })
                                 .map((h) => (
-                                <div
-                                  key={h.id}
-                                  onClick={() => setSqlCode(h.sql)}
-                                  style={{
-                                    padding: 8,
-                                    cursor: "pointer",
-                                    borderBottom: `1px solid var(--ant-color-border-secondary)`,
-                                    transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
-                                  }}
-                                  onMouseEnter={(e) => {
-                                    (e.currentTarget as HTMLElement).style.background = "rgba(102,126,234,0.05)";
-                                  }}
-                                  onMouseLeave={(e) => {
-                                    (e.currentTarget as HTMLElement).style.background = "transparent";
-                                  }}
-                                >
-                                  <Space orientation="vertical" size={2} style={{ width: "100%" }}>
-                                    <Space style={{ width: "100%", justifyContent: "space-between" }}>
-                                      <Tag color={h.success ? "success" : "error"} style={{ margin: 0 }}>
-                                        {h.execution_time_ms}ms
-                                      </Tag>
-                                      <Text type="secondary" style={{ fontSize: 11 }}>
-                                        {new Date(h.timestamp * 1000).toLocaleTimeString()}
+                                  <div
+                                    key={h.id}
+                                    onClick={() => setSqlCode(h.sql)}
+                                    style={{
+                                      padding: 8,
+                                      cursor: "pointer",
+                                      borderBottom: `1px solid var(--ant-color-border-secondary)`,
+                                      transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
+                                    }}
+                                    onMouseEnter={(e) => {
+                                      (e.currentTarget as HTMLElement).style.background =
+                                        "rgba(102,126,234,0.05)";
+                                    }}
+                                    onMouseLeave={(e) => {
+                                      (e.currentTarget as HTMLElement).style.background =
+                                        "transparent";
+                                    }}
+                                  >
+                                    <Space
+                                      orientation="vertical"
+                                      size={2}
+                                      style={{ width: "100%" }}
+                                    >
+                                      <Space
+                                        style={{ width: "100%", justifyContent: "space-between" }}
+                                      >
+                                        <Tag
+                                          color={h.success ? "success" : "error"}
+                                          style={{ margin: 0 }}
+                                        >
+                                          {h.execution_time_ms}ms
+                                        </Tag>
+                                        <Text type="secondary" style={{ fontSize: 11 }}>
+                                          {new Date(h.timestamp * 1000).toLocaleTimeString()}
+                                        </Text>
+                                      </Space>
+                                      <Text
+                                        code
+                                        style={{ fontSize: 11, display: "block" }}
+                                        ellipsis
+                                      >
+                                        {h.sql}
                                       </Text>
                                     </Space>
-                                    <Text code style={{ fontSize: 11, display: "block" }} ellipsis>
-                                      {h.sql}
-                                    </Text>
-                                  </Space>
-                                </div>
-                              ))}
+                                  </div>
+                                ))}
                               {history.length === 0 && <Empty description="暂无查询历史" />}
                             </div>
                           ),
                         },
                         {
                           key: "saved",
-                          label: <span><StarFilled style={{ color: "#faad14" }} />常用</span>,
+                          label: (
+                            <span>
+                              <StarFilled style={{ color: "#faad14" }} />
+                              常用
+                            </span>
+                          ),
                           children: (
                             <div style={{ maxHeight: "calc(100vh - 200px)", overflow: "auto" }}>
                               {savedQueries.map((q) => (
@@ -1497,14 +1652,18 @@ function App() {
                                     transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
                                   }}
                                   onMouseEnter={(e) => {
-                                    (e.currentTarget as HTMLElement).style.background = "rgba(102,126,234,0.05)";
+                                    (e.currentTarget as HTMLElement).style.background =
+                                      "rgba(102,126,234,0.05)";
                                   }}
                                   onMouseLeave={(e) => {
-                                    (e.currentTarget as HTMLElement).style.background = "transparent";
+                                    (e.currentTarget as HTMLElement).style.background =
+                                      "transparent";
                                   }}
                                 >
                                   <Space orientation="vertical" size={2} style={{ width: "100%" }}>
-                                    <Space style={{ width: "100%", justifyContent: "space-between" }}>
+                                    <Space
+                                      style={{ width: "100%", justifyContent: "space-between" }}
+                                    >
                                       <strong style={{ fontSize: 13 }}>{q.name}</strong>
                                       <Space size={4}>
                                         <EditOutlined
@@ -1517,7 +1676,9 @@ function App() {
                                         <DeleteOutlined
                                           onClick={(e) => {
                                             e.stopPropagation();
-                                            setSavedQueries(savedQueries.filter((s) => s.id !== q.id));
+                                            setSavedQueries(
+                                              savedQueries.filter((s) => s.id !== q.id)
+                                            );
                                             msgApi.success("已删除");
                                           }}
                                         />
@@ -1533,7 +1694,11 @@ function App() {
                                     </Text>
                                     <Space size={4} wrap>
                                       {q.tags.map((t) => (
-                                        <Tag key={t} color="blue" style={{ fontSize: 10, margin: 0 }}>
+                                        <Tag
+                                          key={t}
+                                          color="blue"
+                                          style={{ fontSize: 10, margin: 0 }}
+                                        >
                                           {t}
                                         </Tag>
                                       ))}
@@ -1561,8 +1726,24 @@ function App() {
                   color: "var(--ant-color-text-secondary)",
                 }}
               >
-                <DatabaseOutlined style={{ fontSize: "64px", marginBottom: "16px", background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }} />
-                <h2 style={{ background: brandGradient, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>数据库管理工具</h2>
+                <DatabaseOutlined
+                  style={{
+                    fontSize: "64px",
+                    marginBottom: "16px",
+                    background: brandGradient,
+                    WebkitBackgroundClip: "text",
+                    WebkitTextFillColor: "transparent",
+                  }}
+                />
+                <h2
+                  style={{
+                    background: brandGradient,
+                    WebkitBackgroundClip: "text",
+                    WebkitTextFillColor: "transparent",
+                  }}
+                >
+                  数据库管理工具
+                </h2>
                 <p>请从左侧选择一个连接或创建新连接</p>
               </div>
             )}
@@ -1624,11 +1805,7 @@ function App() {
                     </Form.Item>
                   )}
                   {!isSqlite && (
-                    <Form.Item
-                      name="username"
-                      label="用户名"
-                      rules={[{ required: !isSqlite }]}
-                    >
+                    <Form.Item name="username" label="用户名" rules={[{ required: !isSqlite }]}>
                       <Input placeholder="例如：root" />
                     </Form.Item>
                   )}
@@ -1708,25 +1885,25 @@ function App() {
           onFinish={handleSaveAiConfig}
           initialValues={aiConfig}
         >
-          <Alert 
-            title="AI 助手功能" 
+          <Alert
+            title="AI 助手功能"
             description="配置 AI 服务参数后，可使用自然语言生成 SQL、SQL 优化、错误诊断等功能。"
             type="info"
             style={{ marginBottom: 16 }}
           />
-          
+
           <Form.Item name="baseUrl" label="API 地址" rules={[{ required: true }]}>
             <Input placeholder="例如：https://maas-coding-api.cn-huabei-1.xf-yun.com/v2" />
           </Form.Item>
-          
+
           <Form.Item name="apiKey" label="API Key" rules={[{ required: true }]}>
             <Input.Password placeholder="格式：APIKey:APISecret" />
           </Form.Item>
-          
+
           <Form.Item name="model" label="模型" rules={[{ required: true }]}>
             <Input placeholder="例如：xop3qwencodernext" />
           </Form.Item>
-          
+
           <Form.Item style={{ textAlign: "right", marginBottom: 0 }}>
             <Button type="primary" htmlType="submit">
               保存配置
@@ -1755,7 +1932,12 @@ function App() {
           items={[
             {
               key: "agent",
-              label: <Space><RobotOutlined />Agent 对话</Space>,
+              label: (
+                <Space>
+                  <RobotOutlined />
+                  Agent 对话
+                </Space>
+              ),
               children: (
                 <div style={{ height: 480 }}>
                   <AgentPanel />
@@ -1764,10 +1946,41 @@ function App() {
             },
             {
               key: "generate",
-              label: <Space><SnippetsOutlined />生成 SQL</Space>,
+              label: (
+                <Space>
+                  <SnippetsOutlined />
+                  生成 SQL
+                </Space>
+              ),
               children: (
                 <div style={{ marginTop: 16 }}>
                   <Form layout="vertical">
+                    <Form.Item
+                      label="这次要用的表"
+                      help={
+                        aiGenTables.length || !selectedTable
+                          ? "模型只能在这些表的真实字段里挑，编出来的字段会被本机挡下"
+                          : `没选就用左侧当前选中的 ${selectedTable}`
+                      }
+                    >
+                      <Select
+                        mode="multiple"
+                        style={{ width: "100%" }}
+                        value={aiGenTables}
+                        onChange={setAiGenTables}
+                        maxTagCount="responsive"
+                        optionFilterProp="label"
+                        placeholder={
+                          tables.length
+                            ? "选择参与本次查询的表"
+                            : "当前连接还没有表清单，先在左侧连上数据库"
+                        }
+                        options={tables.map((t) => ({
+                          value: t.name,
+                          label: t.schema ? `${t.schema}.${t.name}` : t.name,
+                        }))}
+                      />
+                    </Form.Item>
                     <Form.Item label="自然语言描述">
                       <TextArea
                         value={aiNaturalLanguage}
@@ -1780,18 +1993,113 @@ function App() {
                       type="primary"
                       icon={<BulbOutlined />}
                       onClick={handleAiGenerateSql}
-                      disabled={aiLoading || !selectedConnection}
+                      loading={aiLoading}
+                      disabled={!selectedConnection}
                       block
                     >
-                      {aiLoading ? <Spin size="small" /> : "生成 SQL"}
+                      {aiLoading ? "生成中（每次尝试最长 60 秒）" : "生成 SQL"}
                     </Button>
                   </Form>
+                  {aiDraftError && (
+                    <Alert
+                      type="error"
+                      showIcon
+                      closable
+                      onClose={() => setAiDraftError("")}
+                      style={{ marginTop: 12 }}
+                      title={
+                        aiDraftPrecheck ? "列清单没读到，这一稿根本没发给模型" : "本机拒绝了这一稿"
+                      }
+                      description={
+                        <div
+                          style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}
+                        >
+                          {aiDraftError}
+                        </div>
+                      }
+                    />
+                  )}
+                  {aiDraft && (
+                    <Card
+                      size="small"
+                      style={{ marginTop: 12 }}
+                      title={
+                        <Space size={4}>
+                          <CheckCircleOutlined style={{ color: "#52c41a" }} />
+                          已填入编辑器
+                        </Space>
+                      }
+                      extra={
+                        <Space size={4}>
+                          <Tag color="blue">{aiDraft.dialect}</Tag>
+                          <Tooltip title="模型被本机校验打回并自我修正的次数">
+                            <Badge
+                              count={aiDraft.repairs}
+                              showZero
+                              color={aiDraft.repairs > 0 ? "#faad14" : "#52c41a"}
+                            />
+                          </Tooltip>
+                        </Space>
+                      }
+                    >
+                      <pre
+                        style={{
+                          margin: 0,
+                          whiteSpace: "pre-wrap",
+                          wordBreak: "break-all",
+                          fontSize: 12,
+                          fontFamily: "monospace",
+                        }}
+                      >
+                        {aiDraft.sql}
+                      </pre>
+                      <div style={{ marginTop: 8 }}>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          依据：
+                        </Text>
+                        {aiDraft.tables.length ? (
+                          aiDraft.tables.map((t) => (
+                            <Tag key={t} style={{ marginBottom: 4 }}>
+                              {t}
+                            </Tag>
+                          ))
+                        ) : (
+                          <Text type="secondary" style={{ fontSize: 12 }}>
+                            没有引用目录里的表
+                          </Text>
+                        )}
+                      </div>
+                      {aiDraft.warnings.map((w) => (
+                        <Alert
+                          key={w}
+                          type="warning"
+                          showIcon
+                          title={w}
+                          style={{ padding: 4, marginTop: 4 }}
+                        />
+                      ))}
+                      <Space style={{ marginTop: 8 }}>
+                        <Button
+                          size="small"
+                          icon={<CopyOutlined />}
+                          onClick={() => copy(aiDraft.sql)}
+                        >
+                          复制
+                        </Button>
+                      </Space>
+                    </Card>
+                  )}
                 </div>
               ),
             },
             {
               key: "optimize",
-              label: <Space><CodeOutlined />优化 SQL</Space>,
+              label: (
+                <Space>
+                  <CodeOutlined />
+                  优化 SQL
+                </Space>
+              ),
               children: (
                 <div style={{ marginTop: 16 }}>
                   <Form layout="vertical">
@@ -1818,7 +2126,12 @@ function App() {
             },
             {
               key: "explain",
-              label: <Space><ApiOutlined />解释 SQL</Space>,
+              label: (
+                <Space>
+                  <ApiOutlined />
+                  解释 SQL
+                </Space>
+              ),
               children: (
                 <div style={{ marginTop: 16 }}>
                   <Form layout="vertical">
@@ -1845,7 +2158,12 @@ function App() {
             },
             {
               key: "diagnose",
-              label: <Space><BugOutlined />错误诊断</Space>,
+              label: (
+                <Space>
+                  <BugOutlined />
+                  错误诊断
+                </Space>
+              ),
               children: (
                 <div style={{ marginTop: 16 }}>
                   <Form layout="vertical">
@@ -1879,7 +2197,12 @@ function App() {
             },
             {
               key: "explainResults",
-              label: <Space><DatabaseOutlined />解释结果</Space>,
+              label: (
+                <Space>
+                  <DatabaseOutlined />
+                  解释结果
+                </Space>
+              ),
               children: (
                 <div style={{ marginTop: 16 }}>
                   <Alert
@@ -1902,7 +2225,7 @@ function App() {
             },
           ]}
         />
-        
+
         {aiResult && (
           <Card
             title="AI 回答"

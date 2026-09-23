@@ -205,6 +205,16 @@ export interface DraftResult {
   repairs: number;
 }
 
+/** ai_sql_generate 的返回：一条过了本机校验的 SQL，以及它是凭什么被校验的 */
+export interface SqlDraft {
+  sql: string;
+  /** 这条 SQL 命中的目录内表，UI 用它说明"依据是什么" */
+  tables: string[];
+  dialect: string;
+  warnings: string[];
+  repairs: number;
+}
+
 /** 报表簿条目：存的是 spec 而不是结果，落盘在后端 queries.rs */
 export interface SavedReport {
   id: string;

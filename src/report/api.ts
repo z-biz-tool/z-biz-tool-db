@@ -11,6 +11,7 @@ import type {
   DatasetSpec,
   DraftResult,
   SavedReport,
+  SqlDraft,
   SqlPreview,
   ValidationReport,
   ViewPayload,
@@ -52,6 +53,15 @@ export const aiReportDraft = (
   maxRepairs?: number
 ): Promise<DraftResult> =>
   invoke<DraftResult>("ai_report_draft", { question, catalog, config, maxRepairs });
+
+/** 自然语言 → 一条 SQL。表与列由本机目录限定，编出来的字段会被后端打回 */
+export const aiSqlGenerate = (
+  question: string,
+  catalog: CatalogTable[],
+  config: AIConfig,
+  maxRepairs?: number
+): Promise<SqlDraft> =>
+  invoke<SqlDraft>("ai_sql_generate", { question, catalog, config, maxRepairs });
 
 export const reportDatasetValidate = (
   spec: DatasetSpec,
