@@ -406,6 +406,20 @@ export function installDriver() {
         );
         return (sel?.textContent || "").trim() || "?";
       }),
+    /** 报表错误卡上那块"这张表没进目录"的提示：null = 根本没这块。
+     *  每块带上它自己的按钮文案——一键究竟把哪张表从哪个连接拉进目录，得读得出来。 */
+    catalogAddCard: () => {
+      const boxes = Array.from(document.querySelectorAll(".ai-catalog-add"));
+      if (!boxes.length) return null;
+      return boxes
+        .map((b) => {
+          const btns = Array.from(b.querySelectorAll("button")).map(
+            (x) => (x.textContent || "").trim()
+          );
+          return `${(b.textContent || "").trim().replace(/\s+/g, " ")}||${btns.join("、")}`;
+        })
+        .join("\n");
+    },
     tags: () => Array.from(document.querySelectorAll(".ant-tag")).map((t) => (t.textContent || "").trim()),    alerts: () =>
       Array.from(document.querySelectorAll(".ant-alert")).map((a) =>
         (a.textContent || "").trim().replace(/\s+/g, " ").slice(0, 160)

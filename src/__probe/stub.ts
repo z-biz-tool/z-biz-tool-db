@@ -443,6 +443,34 @@ function invoke(cmd: string, args: any): Promise<any> {
       if (window.__PROBE_FLAG("draftbroken")) {
         return fail("重试 3 次后仍未通过本地校验：回复里找不到 JSON 对象（模型回复被截断了）");
       }
+      // ?draftx=crm.users 注入"这一稿用了一张没勾进报表目录的表"（镜像 DraftReject：拒因 + 被拒那一稿）。
+      // 判"这一轮该不该再挡"只看目录里现在有没有这张表：挂在哪个连接下都算，
+      // 因为「加进目录并重问」这一键补的是目录——下一轮 wire 上的目录里真有了它，才算闭环。
+      if (window.__PROBE_ARG("draftx")) {
+        const [conn, table] = String(window.__PROBE_ARG("draftx")).split(".");
+        const named = cat.some(
+          (t: any) => String(t.table).toLowerCase() === String(table).toLowerCase()
+        );
+        if (!named) {
+          const d = JSON.parse(JSON.stringify((fixture as any).reports[0]));
+          // 只留"第一张源 + 注入那张"：底稿里再留着别的没勾进目录的表，
+          // 探针就会量出一条拒因根本没点名的补表入口（假阳性，且是真做不出的事）
+          const ds0 = d.datasets[0];
+          const second = ds0.sources[1] || { ...ds0.sources[0], alias: "x1" };
+          ds0.sources = [ds0.sources[0], { ...second, connection_id: conn, table }];
+          ds0.joins = (ds0.joins || []).filter((j: any) =>
+            ds0.sources.some((s: any) => s.alias === j.source)
+          );
+          const avail =
+            ((fixture as any).tables[conn] || []).map((t: any) => t.name).join(", ") || "无";
+          return fail({
+            error:
+              `重试 3 次后仍未通过本机校验：数据集 ${ds0.id}：` +
+              `连接 ${conn} 里没有表 ${table}（可用表：${avail}）`,
+            draft: { datasets: d.datasets, view: d.view },
+          });
+        }
+      }
       // ?draftreject=1 注入"模型编了字段、本机把这一稿挡下来"：
       // 拒因里点名的那一列只在被拒的那一稿里存在，所以回执必须是 {error, draft} 两半，
       // 与后端 DraftReject 同形。探针里要靠这条腿量两件事：

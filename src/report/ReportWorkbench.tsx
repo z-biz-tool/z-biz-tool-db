@@ -94,6 +94,18 @@ interface ConnState {
   error?: string;
 }
 
+/** 被拒那一稿里引用了、但没进本次目录的一张表，以及本机找到的真身 */
+interface UnpickedSource {
+  /** 模型写的那个源对应的目录键（连接+schema+表） */
+  key: string;
+  table: string;
+  /** 模型把它挂在哪个连接下（名字，供人读） */
+  wanted: string;
+  /** true = 那个连接里确有这张表，只是没勾进来；false = 挂错了连接 */
+  rightConn: boolean;
+  targets: { key: string; conn: string }[];
+}
+
 /** 目录里这张表有多少列带着类型进提示词 */
 const typeCovered = (t: CatalogTable) =>
   t.columns.filter((c) => (t.column_types?.[c] || "").trim()).length;
@@ -145,6 +157,12 @@ export function ReportWorkbench({
   // 否则每勾一张表都会先闪一条红色"列清单没读到"。
   const [colBusy, setColBusy] = useState<string[]>([]);
   const [picked, setPicked] = useState<string[]>([]);
+  // picked 也镜像一份到 ref：这文件里 await 之后再读 state 一定是旧快照（columnsRef 就是为这个坑存在的），
+  // 「把缺的那张表加进目录并重问」这一键正是先补目录、再 await 列清单、然后马上起草。
+  const pickedRef = useRef<string[]>(picked);
+  pickedRef.current = picked;
+  // 错误卡上「加进目录并重问」正在处理的那张表（按钮的 loading 只挂它自己那一个）
+  const [addingTable, setAddingTable] = useState("");
   const [question, setQuestion] = useState("");
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [specText, setSpecText] = useState("");
@@ -258,7 +276,7 @@ export function ReportWorkbench({
       why: string;
       retry: boolean;
     }[] = [];
-    for (const k of picked) {
+    for (const k of pickedRef.current) {
       const [connId, schema, table] = k.split("\u0000");
       const cfg = byId.get(connId);
       if (!cfg) {
@@ -323,7 +341,7 @@ export function ReportWorkbench({
 
   /** 起草前的前置闸：把在飞的列清单等完，缺的补读一次，然后重新分组 */
   const readyCatalogForDraft = async () => {
-    const keys = picked.filter((k) => !(columnsRef.current[k] || []).length);
+    const keys = pickedRef.current.filter((k) => !(columnsRef.current[k] || []).length);
     if (keys.length) await Promise.allSettled(keys.map(ensureColumns));
     return splitPicked(columnsRef.current);
   };
@@ -335,6 +353,75 @@ export function ReportWorkbench({
       label: `${t.schema ? `${t.schema}.` : ""}${t.name}`,
     })),
   }));
+
+  /** 被拒那一稿用到、却没进本次报表目录的表。
+   *  不去 parse 拒因文字（句式会改，被拒的那一稿本身就是结构化的：sources 里写着
+   *  它把哪张表挂在哪个连接下），也不猜——真身只在"已经读到表清单"的连接里找，
+   *  没读到的那些不能拿来断言"这张表不存在"。 */
+  const unpicked = useMemo(() => {
+    const draft = error?.fix?.draft;
+    if (!draft?.datasets?.length) return [] as UnpickedSource[];
+    const keyOfTable = (connection_id: string, schema: string | undefined, table: string) =>
+      keyOf({ connection_id, schema: schema || "", table }).toLowerCase();
+    const inCatalog = new Set(
+      catalog.map((t) => keyOfTable(t.connection_id, t.schema, t.table))
+    );
+    const nameOf = (id: string) => configs.find((c) => c.id === id)?.name || id;
+    const out: UnpickedSource[] = [];
+    const seen = new Set<string>();
+    for (const ds of draft.datasets) {
+      for (const s of ds.sources || []) {
+        const key = keyOfTable(s.connection_id, s.schema, s.table);
+        // 已经在目录里 = 撞的是别的错（列名、聚合），这里不该插话
+        if (inCatalog.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        const targets: { key: string; conn: string }[] = [];
+        for (const c of configs) {
+          const st = connState[c.id];
+          if (!st || st.loading) continue;
+          for (const t of st.tables || []) {
+            if (t.name.toLowerCase() !== s.table.toLowerCase()) continue;
+            if (s.schema && (t.schema || "").toLowerCase() !== s.schema.toLowerCase()) continue;
+            targets.push({
+              key: keyOf({ connection_id: c.id, schema: t.schema || "", table: t.name }),
+              conn: c.name || c.id,
+            });
+          }
+        }
+        if (!targets.length) continue;
+        out.push({
+          key,
+          table: s.table,
+          wanted: nameOf(s.connection_id),
+          // 模型挂的那个连接里本来就有这张表 → 只是没勾进来；挂在别处 → 得点名它其实在哪
+          rightConn: targets.some((t) => t.key.toLowerCase() === key),
+          targets,
+        });
+      }
+    }
+    return out;
+  }, [error, catalog, configs, connState]);
+
+  /** 一键把那张表接进目录，等列清单真读到再重问：清单没落地就重问，下一轮还是撞在同一条上 */
+  const addAndRedraft = async (u: UnpickedSource, t: { key: string; conn: string }) => {
+    const fix = error?.fix;
+    setAddingTable(t.key);
+    try {
+      setPicked((p) =>
+        p.some((k) => k.toLowerCase() === t.key.toLowerCase()) ? p : [...p, t.key]
+      );
+      await ensureColumns(t.key);
+      const cols = columnsRef.current[t.key] || [];
+      if (!cols.length) {
+        msgApi.warning(`${t.conn}.${u.table} 的列清单还是没读到，先别重问`);
+        return;
+      }
+      msgApi.success(`${t.conn}.${u.table} 已进目录（${cols.length} 列）`);
+      if (fix) await onDraft(fix);
+    } finally {
+      setAddingTable("");
+    }
+  };
 
   /** 清空是"从零开始"那条退路：规格 JSON 被起草前置闸拦下时，如果这个入口只在
    *  渲染过之后才出现，用户就只剩"自己把 JSON 修好"一条路。 */
@@ -378,7 +465,7 @@ export function ReportWorkbench({
       msgApi.warning("先说要查什么，模型只能照着问题去挑表和字段");
       return;
     }
-    if (picked.length === 0) {
+    if (!pickedRef.current.length) {
       msgApi.warning("先选至少一张表，模型没有目录就只能编字段");
       return;
     }
@@ -918,9 +1005,48 @@ export function ReportWorkbench({
               ) : null
             }
             description={
-              <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
-                {error.detail}
-              </div>
+              <>
+                <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
+                  {error.detail}
+                </div>
+                {/* 模型只能用勾进目录的表：这张表本机有、只是没勾上时，"照着错误再改一轮"
+                    改不动它——目录里没有它，怎么改都过不了列校验。所以这里补的是目录，不是稿子。 */}
+                {unpicked.map((u) => (
+                  <div
+                    key={u.key}
+                    className="ai-catalog-add"
+                    style={{
+                      marginTop: 8,
+                      padding: "8px 10px",
+                      borderRadius: 6,
+                      borderLeft: "3px solid #1677ff",
+                      background: "rgba(22,119,255,0.08)",
+                      fontSize: 12,
+                    }}
+                  >
+                    <div>
+                      {u.rightConn
+                        ? `${u.table} 本机有这个连接，也确实有这张表，只是还没勾进报表目录——模型只能看见勾进来的表，所以这一稿它填不出这张表的字段。`
+                        : `这一稿把 ${u.table} 挂在 ${u.wanted} 下，但它在 ${u.targets
+                            .map((t) => `「${t.conn}」`)
+                            .join("、")}。报表目录是跨连接的：勾上真身那张，再重问一次就能拼上。`}
+                    </div>
+                    <Space size={4} wrap style={{ marginTop: 6 }}>
+                      {u.targets.map((t) => (
+                        <Button
+                          key={t.key}
+                          size="small"
+                          type="primary"
+                          loading={addingTable === t.key}
+                          onClick={() => void addAndRedraft(u, t)}
+                        >
+                          {`把 ${t.conn}.${u.table} 加进目录并重问`}
+                        </Button>
+                      ))}
+                    </Space>
+                  </div>
+                ))}
+              </>
             }
           />
         )}
