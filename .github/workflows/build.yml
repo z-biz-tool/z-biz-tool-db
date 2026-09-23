@@ -43,7 +43,10 @@ jobs:
           npm install --registry=https://registry.npmmirror.com
 
       - name: Frontend typecheck
-        run: npx tsc --noEmit -p tsconfig.json || echo "tsc reported errors; see above"
+        # 原来写的是 `npx tsc --noEmit || echo "tsc reported errors; see above"`：tsc 失败时 echo
+        # 成功退出，这一步永远是绿的，类型错误全部被吞掉。本机实测当前 main 是 0 error，
+        # 所以直接去掉 `|| echo`，让它按本来该有的方式失败。
+        run: npx tsc --noEmit -p tsconfig.json
 
       - name: Cargo check (lib + tests)
         working-directory: src-tauri
