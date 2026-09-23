@@ -40,6 +40,25 @@ pub struct PriorDraft {
     pub sql: String,
 }
 
+/// 本机挡下这条 SQL 时的回执：错误原文 + 被挡下的那一条。
+///
+/// 模型是单发的，下一轮看不见自己上一轮写了什么。只把"SQL 用到了目录里不存在的列：
+/// orders.net_amount"喂回去，它连"上一稿"指的是哪条都对不上，所以拒因要连同被拒的
+/// SQL 一起交出去——前端那一键「照这条错误改」缺任何一半都是在凭空重写。
+#[derive(Debug, Clone, Serialize)]
+pub struct SqlReject {
+    pub error: String,
+    /// 被挡下的最后一条 SQL。请求没发出去、或模型回复里根本没挖出 SQL 时没有
+    pub sql: Option<String>,
+}
+
+impl SqlReject {
+    /// 还没见到模型输出的 SQL 就被拒（空问题、请求发不出去）：没有底稿可带
+    fn of(error: impl Into<String>) -> Self {
+        SqlReject { error: error.into(), sql: None }
+    }
+}
+
 /// 目录里出现过的表名（含 schema 限定的写法），以及每张表的列清单
 struct Index {
     /// 小写表名 → 目录项
@@ -245,7 +264,9 @@ pub fn prompt(
     if let Some(fb) = feedback {
         s.push_str("\n\n上一稿没有通过本机校验，原因：\n");
         s.push_str(fb.trim());
-        s.push_str("\n请只修正这个问题，重新输出完整 SQL。");
+        // 一条拒因里可能点了好几个字段（不存在的列是一次列全的），说"只修正这个问题"
+        // 等于放任模型改一处就交回来，下一轮又撞在另一处
+        s.push_str("\n上面点名的每一处都要改到位，重新输出完整 SQL。");
     }
     s
 }
@@ -668,21 +689,27 @@ fn dialect_of(catalog: &[CatalogTable]) -> String {
 
 /// 生成：问一次 → 本机校验 → 不通过就把错误原文回喂，最多 repairs 次。
 /// prior 是上一稿，追问式改稿时带上；改出来的稿子照样过本机校验。
+/// feedback 是"上一稿被本机挡下"的拒因：点「照这条错误改」时前端会把拒因和被拒的
+/// 那条 SQL 一起送回来，缺哪一半模型都是在凭空重写。
+/// 失败时带回 SqlReject：拒因 + 被挡下的那条 SQL（还没见到模型写的 SQL 就没有底稿）。
 pub async fn generate(
     model: &dyn Model,
     question: &str,
     catalog: &[CatalogTable],
     repairs: u8,
     prior: Option<&PriorDraft>,
-) -> Result<SqlDraft, String> {
+    feedback: Option<&str>,
+) -> Result<SqlDraft, SqlReject> {
     if question.trim().is_empty() {
-        return Err("先描述你想查什么".into());
+        return Err(SqlReject::of("先描述你想查什么"));
     }
     // 空白的上一稿只会往提示词里塞噪音，当作没带
     let prior = prior.filter(|p| !p.sql.trim().is_empty());
     if catalog.is_empty() {
-        return Err("先选至少一张表，模型没有列清单就只能编字段".into());
+        return Err(SqlReject::of("先选至少一张表，模型没有列清单就只能编字段"));
     }
+    // 空白的错误单和没带一样
+    let mut feedback = feedback.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let mut kept = catalog;
     let mut trim: Option<String> = None;
     if catalog.len() > MAX_TABLES {
@@ -695,12 +722,13 @@ pub async fn generate(
     }
     let dialect = dialect_of(kept);
     let rounds = repairs.min(MAX_REPAIRS);
-    let mut feedback: Option<String> = None;
     let mut last = String::new();
+    let mut rejected: Option<String> = None;
     for round in 0..=rounds {
         let raw = model
             .complete(prompt(question, kept, &dialect, prior, feedback.as_deref()))
-            .await?;
+            .await
+            .map_err(SqlReject::of)?;
         let sql = match extract_sql(&raw) {
             Ok(s) => s,
             Err(e) => {
@@ -715,6 +743,8 @@ pub async fn generate(
             Err(e) => {
                 last = e;
                 feedback = Some(last.clone());
+                // 攒下的是模型自己写的那一条，不是校验器修好的那份
+                rejected = Some(sql);
                 continue;
             }
         };
@@ -730,14 +760,14 @@ pub async fn generate(
             repairs: round,
         });
     }
-    Err(format!(
-        "重试 {} 次后仍未通过本机校验：{}",
-        rounds + 1,
-        last
-    ))
+    Err(SqlReject {
+        error: format!("重试 {} 次后仍未通过本机校验：{}", rounds + 1, last),
+        sql: rejected,
+    })
 }
 
 /// 自然语言 → 一条 SQL（已过本机校验）。执行仍由用户自己点，且写操作走审批门禁。
+/// 没过校验时 reject 出 SqlReject（拒因 + 被挡下的那条 SQL），供 UI 一键回喂。
 #[tauri::command]
 pub async fn ai_sql_generate(
     question: String,
@@ -745,14 +775,16 @@ pub async fn ai_sql_generate(
     config: AIConfig,
     max_repairs: Option<u8>,
     prior: Option<PriorDraft>,
-) -> Result<SqlDraft, String> {
-    let model = HttpModel::new(config)?;
+    feedback: Option<String>,
+) -> Result<SqlDraft, SqlReject> {
+    let model = HttpModel::new(config).map_err(SqlReject::of)?;
     generate(
         &model,
         &question,
         &catalog,
         max_repairs.unwrap_or(2),
         prior.as_ref(),
+        feedback.as_deref(),
     )
     .await
 }
@@ -1101,7 +1133,7 @@ mod tests {
             "SELECT city, total FROM invoicez".into(),
             "```sql\nSELECT city, SUM(amount) AS total FROM orders GROUP BY city;\n```".into(),
         ]);
-        let out = generate(&model, "各城市成交额", &catalog(), 3, None).await.unwrap();
+        let out = generate(&model, "各城市成交额", &catalog(), 3, None, None).await.unwrap();
         assert_eq!(out.repairs, 1);
         assert_eq!(out.sql, "SELECT city, SUM(amount) AS total FROM orders GROUP BY city");
         assert_eq!(out.dialect, "mysql");
@@ -1115,9 +1147,9 @@ mod tests {
     #[tokio::test]
     async fn generate_gives_up_after_the_last_round_and_says_why() {
         let model = scripted(vec!["SELECT * FROM ghost_a".into(), "SELECT * FROM ghost_b".into()]);
-        let e = generate(&model, "随便查查", &catalog(), 1, None).await.unwrap_err();
-        assert!(e.contains("重试 2 次"), "{e}");
-        assert!(e.contains("ghost_b"), "{e}");
+        let e = generate(&model, "随便查查", &catalog(), 1, None, None).await.unwrap_err();
+        assert!(e.error.contains("重试 2 次"), "{e:?}");
+        assert!(e.error.contains("ghost_b"), "{e:?}");
         assert_eq!(model.prompts.lock().unwrap().len(), 2);
     }
 
@@ -1128,7 +1160,7 @@ mod tests {
             big.push(cat_table("shop", "mysql", "", &format!("t{i}"), &["id"]));
         }
         let model = scripted(vec!["SELECT id FROM t24".into()]);
-        let out = generate(&model, "查 t24", &big, 2, None).await.unwrap();
+        let out = generate(&model, "查 t24", &big, 2, None, None).await.unwrap();
         assert_eq!(out.sql, "SELECT id FROM t24");
         assert!(
             out.warnings.iter().any(|w| w.contains("只带了前 20 张")),
@@ -1143,8 +1175,12 @@ mod tests {
     #[tokio::test]
     async fn generate_refuses_before_bothering_the_model() {
         let model = scripted(vec![]);
-        assert!(generate(&model, "  ", &catalog(), 1, None).await.is_err());
-        assert!(generate(&model, "查订单", &[], 1, None).await.is_err());
+        // 还没见到模型输出的 SQL 就被挡下：回执里不该凭空带出一条"底稿"
+        for (question, cat) in [("  ", catalog()), ("查订单", vec![])] {
+            let e = generate(&model, question, &cat, 1, None, None).await.unwrap_err();
+            assert!(!e.error.is_empty(), "{e:?}");
+            assert!(e.sql.is_none(), "前置闸没有底稿可带：{e:?}");
+        }
         assert!(model.prompts.lock().unwrap().is_empty());
     }
 
@@ -1156,8 +1192,9 @@ mod tests {
                 Box::pin(async { Err("AI 服务请求失败: 连接超时".into()) })
             }
         }
-        let e = generate(&Down, "查订单", &catalog(), 3, None).await.unwrap_err();
-        assert_eq!(e, "AI 服务请求失败: 连接超时");
+        let e = generate(&Down, "查订单", &catalog(), 3, None, None).await.unwrap_err();
+        assert_eq!(e.error, "AI 服务请求失败: 连接超时");
+        assert!(e.sql.is_none(), "{e:?}");
     }
 
     fn prior_draft(question: &str, sql: &str) -> PriorDraft {
@@ -1174,6 +1211,7 @@ mod tests {
             &catalog(),
             1,
             Some(&prior_draft("上次的需求串", "   \n  ")),
+            None,
         )
         .await
         .unwrap();
@@ -1192,7 +1230,7 @@ mod tests {
             "SELECT city, SUM(amount) AS total FROM orders GROUP BY city".into(),
         ]);
         let p = prior_draft("各城市成交额", "SELECT id, city FROM orders WHERE status = 'paid'");
-        let out = generate(&model, "再按月拆开", &catalog(), 3, Some(&p)).await.unwrap();
+        let out = generate(&model, "再按月拆开", &catalog(), 3, Some(&p), None).await.unwrap();
         assert_eq!(out.repairs, 1);
         assert_eq!(out.sql, "SELECT city, SUM(amount) AS total FROM orders GROUP BY city");
         let ps = model.prompts.lock().unwrap();
@@ -1213,12 +1251,79 @@ mod tests {
         let bad = "SELECT o.city, o.net_amount FROM orders o";
         let model = scripted(vec![bad.into(), bad.into()]);
         let p = prior_draft("各城市成交额", bad);
-        let e = generate(&model, "把金额换成税前的", &catalog(), 1, Some(&p))
+        let e = generate(&model, "把金额换成税前的", &catalog(), 1, Some(&p), None)
             .await
             .unwrap_err();
-        assert!(e.contains("重试 2 次"), "{e}");
-        assert!(e.contains("orders.net_amount"), "{e}");
+        assert!(e.error.contains("重试 2 次"), "{e:?}");
+        assert!(e.error.contains("orders.net_amount"), "{e:?}");
         assert_eq!(model.prompts.lock().unwrap().len(), 2);
+    }
+
+    /// 被本机挡下的那条 SQL 必须跟着拒因一起回来：模型是单发的，
+    /// 只把"orders.net_amount 不存在"喂回去，它连自己刚写的是哪条都不知道。
+    #[tokio::test]
+    async fn a_rejected_sql_comes_back_with_the_verdict() {
+        let model = scripted(vec!["SELECT o.city, o.net_amount FROM orders o".into()]);
+        let e = generate(&model, "各城市成交额", &catalog(), 0, None, None)
+            .await
+            .unwrap_err();
+        assert!(e.error.contains("orders.net_amount"), "{e:?}");
+        // 带回来的是模型自己写的那一条（剥过围栏和尾分号），不是校验器修好的
+        assert_eq!(e.sql.as_deref(), Some("SELECT o.city, o.net_amount FROM orders o"));
+        // 过到线上一份不落的形状：前端就按 {error, sql} 这两个键解
+        let wire = serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            wire
+                .as_object()
+                .map(|m| m.keys().map(|k| k.as_str()).collect::<Vec<_>>()),
+            Some(vec!["error", "sql"])
+        );
+        assert_eq!(wire["sql"], serde_json::json!("SELECT o.city, o.net_amount FROM orders o"));
+    }
+
+    /// 一键「照这条错误改」：拒因和被拒的那条 SQL 要在第一次请求就同时到场，
+    /// 并且改出来的那条照样过本机校验——只回喂错误、或只带回旧 SQL，都修不好。
+    #[tokio::test]
+    async fn the_verdict_and_the_rejected_sql_reach_the_first_round_together() {
+        let bad = "SELECT o.city, o.net_amount FROM orders o";
+        // 只准备一条好答案：错误单和旧 SQL 在第一轮就同时到场，模型一次改对才算这次
+        // 请求没白头发（脚本给多条的话，第二轮起是后端自己在修，量不到这一键）
+        let model = scripted(vec!["SELECT o.city, o.amount FROM orders o".into()]);
+        let ticket = format!("重试 1 次后仍未通过本机校验：SQL 用到了目录里不存在的列：orders.net_amount");
+        let out = generate(
+            &model,
+            "各城市成交额",
+            &catalog(),
+            2,
+            Some(&prior_draft("各城市成交额", bad)),
+            Some(&ticket),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.repairs, 0, "第一次改成就该算一次通过，不用又攒一轮重试");
+        assert_eq!(out.sql, "SELECT o.city, o.amount FROM orders o");
+        let ps = model.prompts.lock().unwrap();
+        assert_eq!(ps.len(), 1);
+        assert!(ps[0].contains("上一稿没有通过本机校验"), "{}", ps[0]);
+        assert!(ps[0].contains("orders.net_amount"), "{}", ps[0]);
+        // 错误单和被拒的那一稿同时在场，模型才知道要改的是哪一条
+        assert!(ps[0].contains(bad), "{}", ps[0]);
+        assert!(ps[0].contains("请在它基础上"), "{}", ps[0]);
+        // 一条错误单里可能点了好几个字段，措辞不能只让模型改一处
+        assert!(ps[0].contains("每一处"), "{}", ps[0]);
+    }
+
+    /// 空白拒因（前端把 undefined 传成空串）不该往提示词里塞一段"上一稿没通过校验"
+    #[tokio::test]
+    async fn a_blank_verdict_is_not_seeded_into_the_prompt() {
+        let model = scripted(vec!["SELECT o.city FROM orders o".into()]);
+        let out = generate(&model, "查城市", &catalog(), 1, None, Some("  \n "))
+            .await
+            .unwrap();
+        assert_eq!(out.sql, "SELECT o.city FROM orders o");
+        let ps = model.prompts.lock().unwrap();
+        assert_eq!(ps.len(), 1);
+        assert!(!ps[0].contains("上一稿没有通过本机校验"), "{}", ps[0]);
     }
 
     #[test]

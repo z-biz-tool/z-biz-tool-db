@@ -94,6 +94,49 @@ export function installDriver() {
             ((d.view || {}).widgets || []).length
           }||${JSON.stringify(d).includes("profit_zz")}`;
         }),
+    /** 从某个下标起，生成 SQL 有没有把本机拒因回喂：'拒因长度…拒因结尾||底稿SQL||底稿里有没有被点名的那一列'。
+     *  'null' = 前端判定不该带（普通生成或追问），'undefined' = 连键都没上 wire。
+     *  只看 feedback 分不清"喂了错误却没喂被拒的那条"——模型是单发的，缺哪一半都是在凭空重写。 */
+    genFeedbackSent: (from: number) =>
+      (w.__PROBE_CALLS as any[])
+        .slice(from)
+        .filter((c: any) => c.cmd === "ai_sql_generate")
+        .map((c: any) => {
+          const fb = c.args.feedback;
+          if (fb == null) return String(fb);
+          const base = String((c.args.prior || {}).sql || "");
+          return `${String(fb).length}…${String(fb).slice(-18)}||${base}||${base.includes("net_zz")}`;
+        }),
+    /** AI 助手弹窗里那句自然语言需求：按 placeholder 认栏，别抓第一个 textarea
+     *  （页面上 CodeMirror、规格 JSON、Agent 输入框都是 textarea）。 */
+    setAiQuestion: (text: string) => {
+      const ta = Array.from(
+        document.querySelectorAll<HTMLTextAreaElement>(".ant-modal textarea")
+      ).find((t) => (t.placeholder || "").includes("自然语言描述"));
+      if (!ta) throw new Error("AI 助手弹窗里没有「自然语言描述」那一栏（先开弹窗并切到生成 SQL 页）");
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+      setter.call(ta, text);
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+    },
+    /** 文案正好等于 text 的按钮：子串匹配会命中隔壁（"生成 SQL" 撞上意图「生成 SQL」、
+     *  "执行" 撞上收藏弹窗），所以这里只认全等，多一个就报出来。 */
+    clickExact: async (text: string) => {
+      const hits = (Array.from(document.querySelectorAll("button")) as HTMLButtonElement[]).filter(
+        (b) => (b.textContent || "").trim() === text
+      );
+      if (!hits.length) throw new Error(`没有文案正好是「${text}」的按钮`);
+      if (hits.length > 1) throw new Error(`「${text}」按钮有 ${hits.length} 个，认不出点哪个`);
+      if (hits[0].disabled) throw new Error(`按钮「${text}」是禁用状态`);
+      w.__PROBE_CLICK(hits[0]);
+      await sleep(300);
+    },
+    /** 挂着「照这条错误改」入口的按钮文案（报表腿与 SQL 腿共用这一句话，两处都量得动） */
+    fixButtons: () =>
+      Array.from(document.querySelectorAll("button"))
+        .filter((b) => (b.textContent || "").includes("照这条错误改"))
+        .map((b) => (b.textContent || "").trim()),
+    /** 编辑器当前内容：改好的那条 SQL 有没有真落进编辑器，看这个 */
+    editorText: () => (document.querySelector(".cm-content")?.textContent || "").trim(),
     /** 写规格 JSON 编辑器（手搓/写坏都走这条）。按 placeholder 认栏，别按内容认：
      *  写坏之后内容里就没有 connection_id 了。 */
     setSpec: async (text: string) => {

@@ -63,6 +63,7 @@ import {
   SearchOutlined,
   DashboardOutlined,
   CheckCircleOutlined,
+  ThunderboltOutlined,
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 // 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
@@ -72,7 +73,7 @@ import { ReportWorkbench } from "./report/ReportWorkbench";
 import { aiSqlGenerate, catalogColumns, reportDescribeColumns } from "./report/api";
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
 import type { BackendConfig } from "./report/api";
-import type { CatalogTable, SqlDraft } from "./report/types";
+import type { CatalogTable, SqlDraft, SqlReject } from "./report/types";
 import type { AgentAskContext, AgentIntent, AgentResponse } from "./agent/types";
 
 // 渐变色主题常量
@@ -86,6 +87,17 @@ const { Text } = Typography;
 
 // Rust 风格可空类型
 type Option<T> = T | null;
+
+/** 本机挡下这条 SQL 之后，回喂给模型所需的工单：拒因 + 被挡下的那一条 + 当时那句需求。
+ *  缺 SQL 那一半就等于让模型对着"orders.net_amount 不存在"凭空猜自己刚写了什么。 */
+type SqlFix = { question: string; error: string; sql: string };
+
+/** Tauri v2 会把 Rust 侧的 `Err(SqlReject)` 原样抛成对象，`String(e)` 只会得到
+ *  [object Object]；但前置门槛那类仍是纯文本，两种形状都得能拆开。 */
+const asSqlReject = (e: unknown): SqlReject => {
+  if (e && typeof e === "object" && typeof (e as SqlReject).error === "string") return e as SqlReject;
+  return { error: String(e), sql: null };
+};
 
 // 类型定义
 interface DBConnection {
@@ -374,10 +386,11 @@ function App() {
   // 生成 SQL 这条链的产出：SQL 之外还要把"依据哪几张表、被打回几次"露出来
   const [aiGenTables, setAiGenTables] = useState<string[]>([]);
   const [aiDraft, setAiDraft] = useState<SqlDraft | null>(null);
-  const [aiDraftError, setAiDraftError] = useState("");
-  // 前端预检就没过（列清单读不出来）和后端本机校验打回是两件事，
-  // 混成一个标题会让人以为模型编错了字段
-  const [aiDraftPrecheck, setAiDraftPrecheck] = useState(false);
+  // 生成 SQL 这条链的失败现场：标题按"卡在哪一步"分开写，正文是拒因原文（多行按行铺开）。
+  // fix 有值 = 本机挡下了一稿并把它带了回来，错误卡上才有「让 AI 照这条错误改」可点。
+  const [aiDraftError, setAiDraftError] = useState<
+    { title: string; detail: string; fix?: SqlFix } | null
+  >(null);
   // 四条解说链路的失败原因，显示在弹窗里而不是只闪一句 toast
   const [aiTextError, setAiTextError] = useState("");
 
@@ -609,26 +622,38 @@ function App() {
   const catalogKey = (catalog: CatalogTable[]) =>
     catalog.map((t) => `${t.connection_id}/${t.schema}/${t.table}`).sort().join(",");
 
-  const generateSql = async (question: string, catalog: CatalogTable[]) => {
+  const generateSql = async (question: string, catalog: CatalogTable[], fix?: SqlFix) => {
     const key = catalogKey(catalog);
     const last = aiPriorRef.current;
-    // 同一句需求再点一次生成 = 重来一次，不该把上一稿喂回去让它"改"自己
-    const prior = last && last.key === key && last.question !== question
-      ? { question: last.question, sql: last.sql }
-      : null;
-    const draft = await aiSqlGenerate(question, catalog, aiConfigForReport, undefined, prior);
+    // 照错误改时，底稿就是被本机挡下的那一条（连同拒因一起回喂）；
+    // 普通生成才走"上一稿"那套：同一句需求再点一次 = 重来一次，不该把上一稿喂回去让它"改"自己
+    const prior = fix
+      ? { question: fix.question, sql: fix.sql }
+      : last && last.key === key && last.question !== question
+        ? { question: last.question, sql: last.sql }
+        : null;
+    const draft = await aiSqlGenerate(
+      question,
+      catalog,
+      aiConfigForReport,
+      undefined,
+      prior,
+      fix?.error ?? null
+    );
     // 只成功之后才把这一稿记成新的上一稿：这一轮失败时，旧稿仍是可用的底稿
     aiPriorRef.current = { key, question, sql: draft.sql };
     return {
       draft,
-      builtOn: prior ? prior.question : null,
+      builtOn: prior && !fix ? prior.question : null,
       // 上一稿还在、却因为范围变了没被用上，得说清楚不是"接着改"
       droppedPrior: !!last && !prior && last.key !== key,
+      fixed: !!fix,
     };
   };
 
   // AI 生成 SQL：自然语言 → 一条过了本机校验的 SQL（后端只看得见我们给的表与列）
-  const handleAiGenerateSql = async () => {
+  // fix 来自错误卡上那一键：把拒因和被挡下的那条 SQL 一起交回去，改完仍过同一套校验
+  const handleAiGenerateSql = async (fix?: SqlFix) => {
     const question = aiNaturalLanguage.trim();
     if (!question) {
       msgApi.warning("请输入自然语言描述");
@@ -652,27 +677,30 @@ function App() {
     const cfg = toBackendConfig(selectedConnection);
     setAiLoading(true);
     setAiDraft(null);
-    setAiDraftError("");
-    setAiDraftPrecheck(false);
+    setAiDraftError(null);
     try {
       const { catalog, failed } = await buildAiCatalog(wanted, cfg);
       if (!catalog.length) {
-        setAiDraftError(`没能读到任何表的列清单：\n${failed.join("\n")}`);
-        setAiDraftPrecheck(true);
+        setAiDraftError({
+          title: "列清单没读到，这一稿根本没发给模型",
+          detail: `没能读到任何表的列清单：\n${failed.join("\n")}`,
+        });
         msgApi.error("生成失败：列清单读不出来");
         return;
       }
       if (failed.length) msgApi.warning(`这些表读不到列清单，本次没带上：${failed.join("；")}`);
-      const { draft, builtOn, droppedPrior } = await generateSql(question, catalog);
+      const { draft, builtOn, droppedPrior, fixed } = await generateSql(question, catalog, fix);
       setAiDraft(draft);
       setSqlCode(draft.sql);
       msgApi.success(
         [
-          builtOn
-            ? `在上一稿（${builtOn}）基础上改`
-            : droppedPrior
-              ? "本次表目录和上一稿不同，这一稿是从零写的"
-              : "",
+          fixed
+            ? "照本机拒因在被拒的那条 SQL 上改"
+            : builtOn
+              ? `在上一稿（${builtOn}）基础上改`
+              : droppedPrior
+                ? "本次表目录和上一稿不同，这一稿是从零写的"
+                : "",
           draft.repairs > 0
             ? `已生成，本机校验打回 ${draft.repairs} 次后通过`
             : "已生成并通过本机校验",
@@ -681,9 +709,21 @@ function App() {
           .join("；")
       );
     } catch (e: any) {
-      // 后端把本机校验的拒因原样带回来，别只留一句"失败"
-      setAiDraftError(String(e));
-      msgApi.error("生成失败");
+      // 后端把本机校验的拒因原样带回来，别只留一句"失败"。
+      // 拒因里点到哪一列、哪张表，只有连同被挡下的那条 SQL 一起回喂才改得动——
+      // 模型是单发的，下一轮根本看不见自己刚写的那条。
+      const rej = asSqlReject(e);
+      const gone = rej.sql?.trim();
+      const next: SqlFix | undefined = gone ? { question, error: rej.error, sql: gone } : undefined;
+      const hint = next
+        ? "\n\n（可以点右上角「让 AI 照这条错误改」：把上面这条错误单和被挡下的那条 SQL 一起交回去）"
+        : "";
+      setAiDraftError({
+        title: "本机拒绝了这一稿",
+        detail: `${rej.error}${hint}`,
+        fix: next,
+      });
+      msgApi.error(next ? "没过本机校验，可以照这条错误改" : "生成失败");
     } finally {
       setAiLoading(false);
     }
@@ -844,8 +884,17 @@ function App() {
       // 不直接盖编辑器：面板留了「填进编辑器」，什么时候落由用户定
       return { success: true, content: lines.join("\n"), sql: draft.sql };
     } catch (e: any) {
-      // 后端把 HTTP 状态码与本机校验的拒因原样带回来，别只留一句"失败"
-      return { success: false, content: "", error: String(e) };
+      // 后端把 HTTP 状态码与本机校验的拒因原样带回来，别只留一句"失败"。
+      // 被拒时抛的是 SqlReject 对象，直接 String() 会打成 [object Object]。
+      const rej = asSqlReject(e);
+      // 面板这条链还没有「照这条错误改」那一键，所以把被挡下的那条一起贴出来，
+      // 用户至少能看出模型刚写的是哪条、要改的是哪一处
+      const gone = rej.sql?.trim();
+      return {
+        success: false,
+        content: "",
+        error: gone ? `${rej.error}\n被挡下的那条是：\n${gone}` : rej.error,
+      };
     }
   };
 
@@ -2142,7 +2191,7 @@ function App() {
                     <Button
                       type="primary"
                       icon={<BulbOutlined />}
-                      onClick={handleAiGenerateSql}
+                      onClick={() => handleAiGenerateSql()}
                       loading={aiLoading}
                       disabled={!selectedConnection}
                       block
@@ -2155,17 +2204,30 @@ function App() {
                       type="error"
                       showIcon
                       closable
-                      onClose={() => setAiDraftError("")}
+                      onClose={() => setAiDraftError(null)}
                       style={{ marginTop: 12 }}
-                      title={
-                        aiDraftPrecheck ? "列清单没读到，这一稿根本没发给模型" : "本机拒绝了这一稿"
-                      }
+                      title={aiDraftError.title}
                       description={
                         <div
                           style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}
                         >
-                          {aiDraftError}
+                          {aiDraftError.detail}
                         </div>
+                      }
+                      action={
+                        aiDraftError.fix ? (
+                          <Tooltip title="把上面的拒因和被挡下的那条 SQL 一起回喂给模型，让它改完再过一遍本机校验">
+                            <Button
+                              size="small"
+                              danger
+                              icon={<ThunderboltOutlined />}
+                              loading={aiLoading}
+                              onClick={() => handleAiGenerateSql(aiDraftError.fix)}
+                            >
+                              让 AI 照这条错误改
+                            </Button>
+                          </Tooltip>
+                        ) : null
                       }
                     />
                   )}

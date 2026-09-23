@@ -74,15 +74,26 @@ export const aiReportDraft = (
 
 /** 自然语言 → 一条 SQL。表与列由本机目录限定，编出来的字段会被后端打回。
  *  prior 是上一稿：追问式改稿时带上，后端会在提示词里请模型在旧稿上改，
- *  改出来的稿子过的还是同一套本机校验（旧稿里的编造字段照样会被拦下）。 */
+ *  改出来的稿子过的还是同一套本机校验（旧稿里的编造字段照样会被拦下）。
+ *  feedback 是上一稿被本机挡下的原因（SqlReject.error）：点「让 AI 照这条错误改」时，
+ *  前端把那个 error 和被挡下的 sql 一起带回来当 prior，缺任何一半都是在凭空重写。
+ *  被拒时后端 reject 的是 SqlReject 对象而不是纯文本，见 types.ts。 */
 export const aiSqlGenerate = (
   question: string,
   catalog: CatalogTable[],
   config: AIConfig,
   maxRepairs?: number,
-  prior?: PriorDraft | null
+  prior?: PriorDraft | null,
+  feedback?: string | null
 ): Promise<SqlDraft> =>
-  invoke<SqlDraft>("ai_sql_generate", { question, catalog, config, maxRepairs, prior: prior ?? null });
+  invoke<SqlDraft>("ai_sql_generate", {
+    question,
+    catalog,
+    config,
+    maxRepairs,
+    prior: prior ?? null,
+    feedback: feedback ?? null,
+  });
 
 export const reportDatasetValidate = (
   spec: DatasetSpec,

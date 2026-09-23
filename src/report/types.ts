@@ -242,6 +242,14 @@ export interface PriorDraft {
   sql: string;
 }
 
+/** ai_sql_generate 被本机挡下时的回执（后端 SqlReject）：错误原文 + 被挡下的那条 SQL。
+ *  sql 为空 = 还没见到模型写的 SQL 就被拒（请求发不出去、回复里根本没有 SQL），
+ *  这时前端不该挂「照这条错误改」——没有底稿可改。 */
+export interface SqlReject {
+  error: string;
+  sql?: string | null;
+}
+
 /** 上一版报表设计：追问（"再加一条按月的折线"）时把工作台上当前的 spec 带回去。
  *  手改过的 JSON、从报表簿打开的历史报表都能当上一版，所以 question 可能为空。 */
 export interface PriorReport {

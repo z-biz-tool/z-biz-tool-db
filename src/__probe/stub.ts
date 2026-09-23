@@ -256,20 +256,50 @@ function invoke(cmd: string, args: any): Promise<any> {
       // 镜像 ai_sql_generate → HttpModel::new：模型名空则在发请求之前就拒。
       // 不补这条，前端"先配置 AI"那道闸在探针里删掉也是绿的。
       if (!String((a.config || {}).model || "").trim()) {
-        return fail("请先在设置中填写 AI 模型名");
+        return fail({ error: "请先在设置中填写 AI 模型名", sql: null });
       }
       // 与 Rust generate() 同序的前置门槛
-      if (!question.trim()) return fail("先描述你想查什么");
-      if (!catalog.length) return fail("先选至少一张表，模型没有列清单就只能编字段");
+      if (!question.trim()) return fail({ error: "先描述你想查什么", sql: null });
+      if (!catalog.length) return fail({ error: "先选至少一张表，模型没有列清单就只能编字段", sql: null });
+      // ?sqlbroken=1 注入"模型回了一段说明而不是 SQL"：本机连底稿都挖不出来，
+      // sql 是 null，错误卡上就不该挂「让 AI 照这条错误改」
+      if (window.__PROBE_FLAG("sqlbroken")) {
+        return fail({
+          error: "重试 3 次后仍未通过本机校验：模型没给出 SQL，只回了一段说明",
+          sql: null,
+        });
+      }
+      // ?sqlgenfail=1 注入"模型编了一张不存在的表、且怎么改都改不对"：
+      // 拒因和被拒的那条 SQL 两半都要在回执里（与后端 SqlReject 同形），
+      // 探针靠这条腿量错误卡上有没有回喂入口、以及点下去之后 wire 上少了哪一半。
       if (window.__PROBE_FLAG("sqlgenfail")) {
-        return fail(
-          `重试 2 次后仍未通过本机校验：SQL 里的表 invoicez 不在本次目录里（可用：${catalog
+        return fail({
+          error: `重试 3 次后仍未通过本机校验：SQL 里的表 invoicez 不在本次目录里（可用：${catalog
             .map((t) => t.table)
-            .join(", ")}）`
-        );
+            .join(", ")}）`,
+          sql: "SELECT city, total FROM invoicez",
+        });
+      }
+      // ?sqlreject=1 注入"模型编了一个不存在的列、本机把这条 SQL 挡下"：
+      // 判"改对了"收紧到两半都对上——拒因要点名 net_zz，且带回来的底稿里真有这一列。
+      // 只把 feedback 塞成任意非空字符串、或者拿上一轮成功那条当底稿，都还是过不了。
+      if (window.__PROBE_FLAG("sqlreject")) {
+        const t0 = catalog[0];
+        const ticket = String(a.feedback || "");
+        const base = String((a.prior || {}).sql || "");
+        if (!ticket.includes("net_zz") || !base.includes("net_zz")) {
+          return fail({
+            error:
+              `重试 3 次后仍未通过本机校验：SQL 用到了目录里不存在的列：${t0.table}.net_zz。` +
+              `这些表的真实列是：${catalog
+                .map((t) => `${t.table} = [${(t.columns || []).join(", ")}]`)
+                .join("；")}`,
+            sql: `SELECT ${t0.table}.net_zz FROM ${t0.table}`,
+          });
+        }
       }
       const out = mirrorDraft(question, catalog);
-      if (out.reject) return fail(out.reject);
+      if (out.reject) return fail({ error: out.reject, sql: null });
       return Promise.resolve(out.draft);
     }
     case "load_reports":
