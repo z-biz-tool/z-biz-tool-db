@@ -669,21 +669,27 @@ function invoke(cmd: string, args: any): Promise<any> {
           "error returned from database: 1146 (42S02): Table 'shop.orders_x' doesn't exist"
         );
       }
+      // ?rows=N 造 N 行结果；带 max_rows 时按后端同一条口径截断
+      // （先取完再截，所以 total_rows 是整批行数）
+      const n = Number(window.__PROBE_ARG("rows") || 1);
+      const all = Array.from({ length: Math.max(1, n) }, (_, i) => [
+        { __kind: "integer", value: String(i + 1) },
+        { __kind: "text", value: i === 0 ? "杭州" : `城市${i + 1}` },
+        { __kind: "decimal", value: `${99 + i}.50` },
+      ]);
+      const cap = Number(a.maxRows ?? a.max_rows ?? 0);
+      const cut = cap > 0 && all.length > cap;
       return Promise.resolve({
         id: "probe-run-1",
         columns: ["id", "city", "amount"],
+        truncated: cut,
+        total_rows: all.length,
         column_meta: [
           { ordinal: 0, name: "id", native_type: "BIGINT", logical_type: "integer", nullable: false },
           { ordinal: 1, name: "city", native_type: "VARCHAR", logical_type: "text", nullable: true },
           { ordinal: 2, name: "amount", native_type: "DECIMAL", logical_type: "decimal", nullable: true },
         ],
-        rows: [
-          [
-            { __kind: "integer", value: "1" },
-            { __kind: "text", value: "杭州" },
-            { __kind: "decimal", value: "99.50" },
-          ],
-        ],
+        rows: cut ? all.slice(0, cap) : all,
         affected_rows: 0,
         execution_time_ms: 7,
         is_query: true,

@@ -11,6 +11,7 @@ import {
   Card,
   Table,
   Input,
+  InputNumber,
   Select,
   Form,
   Modal,
@@ -160,6 +161,9 @@ interface QueryResultV2 {
   affected_rows: number;
   execution_time_ms: number;
   is_query: boolean;
+  /** T-031：界面只送前 N 行时，后端把总行数和"确实截断了"一起带回来 */
+  truncated?: boolean;
+  total_rows?: number;
   timings?: {
     connect_ms: number;
     queue_ms: number;
@@ -226,6 +230,10 @@ function App() {
   const [selectedConnection, setSelectedConnection] = useState<DBConnection | null>(null);
   const [sqlCode, setSqlCode] = useState("SELECT * FROM users WHERE id = 1");
   const [queryResults, setQueryResults] = useState<TaggedCell[][]>([]);
+  // T-031：界面行数上限。0 = 不限。后端是在把整批行取回之后才截断的，
+  // 这一闸挡的是 IPC 与表格 DOM（几十万行会把界面压死），库侧该加的还是 LIMIT。
+  const [rowCap, setRowCap] = useState<number>(5000);
+  const [resultMeta, setResultMeta] = useState<{ total: number; shown: number } | null>(null);
   // T-001 + T-002：以后端 column_meta 为准，零行结果仍有列定义
   const [queryColumnsMeta, setQueryColumnsMeta] = useState<ColumnMeta[]>([]);
   // T-044: 网格编辑状态
@@ -348,7 +356,13 @@ function App() {
       a.download = `query_results_${new Date().toISOString().slice(0, 10)}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-      msgApi.success(`已导出 ${queryResults.length} 行到 CSV`);
+      // 截断过就必须说清导的是"画出来的那一段"，不是整批结果——
+      // 否则用户拿这份 CSV 去对账，少的行没人认领
+      msgApi.success(
+        resultMeta
+          ? `已导出 ${queryResults.length} 行到 CSV（这次结果共 ${resultMeta.total} 行，界面按上限只取回了 ${resultMeta.shown} 行）`
+          : `已导出 ${queryResults.length} 行到 CSV`
+      );
     } catch (e: any) {
       msgApi.error(`导出失败: ${e}`);
     }
@@ -452,6 +466,7 @@ function App() {
         access_mode: wantWrite ? "writable" : "readOnly",
         approval: grant ?? null,
         expected_generation: null,
+        max_rows: rowCap > 0 ? rowCap : null,
       });
 
       // 异步校验：标签或连接已切走 → 丢弃结果
@@ -463,14 +478,20 @@ function App() {
       // 同步覆写列源：以后端 column_meta 为准；零行也有列（A01）
       setQueryColumnsMeta(result.column_meta ?? []);
       setQueryResults(result.rows || []);
+      const shown = result.rows?.length || 0;
+      setResultMeta(result.truncated ? { total: Number(result.total_rows || 0), shown } : null);
 
       // 执行记录落进 Agent 会话，但标成 system：那是刚发生过的事，不是用户打的一句话
       useAgentStore.getState().addMessage({
         id: `${Date.now().toString(36)}-run`,
         role: "system",
-        content: `已执行一条语句，返回 ${result.rows?.length || 0} 行，耗时 ${
-          result.execution_time_ms || 0
-        }ms`,
+        content: result.truncated
+          ? `已执行一条语句，结果共 ${result.total_rows} 行，界面按上限只取回 ${
+              result.rows?.length || 0
+            } 行，耗时 ${result.execution_time_ms || 0}ms`
+          : `已执行一条语句，返回 ${result.rows?.length || 0} 行，耗时 ${
+              result.execution_time_ms || 0
+            }ms`,
         timestamp: Date.now(),
       });
 
@@ -486,14 +507,20 @@ function App() {
         error: null,
       };
       setHistory((prev) => [newItem, ...prev].slice(0, 100));
-      msgApi.success({
-        content: `查询执行成功，总耗时 ${result.execution_time_ms}ms${
-          result.timings && result.timings.total_ms > 0
-            ? `（连接 ${result.timings.connect_ms}ms / 执行 ${result.timings.execute_ms}ms）`
-            : ""
-        }`,
-        duration: 3,
-      });
+      const timing = `总耗时 ${result.execution_time_ms}ms${
+        result.timings && result.timings.total_ms > 0
+          ? `（连接 ${result.timings.connect_ms}ms / 执行 ${result.timings.execute_ms}ms）`
+          : ""
+      }`;
+      // 截断不能只报绿：这一屏看不到剩下的行，用户以为手里就是全量
+      if (result.truncated) {
+        msgApi.warning({
+          content: `查询执行成功，但结果共 ${result.total_rows} 行，界面按上限只画前 ${shown} 行——${timing}。要全量请调高上限或在语句里自己收口`,
+          duration: 6,
+        });
+      } else {
+        msgApi.success({ content: `查询执行成功，${timing}`, duration: 3 });
+      }
     } catch (e: any) {
       if (requestConnId !== selectedConnection?.id || requestTabId !== activeTabId) {
         return;
@@ -1774,6 +1801,21 @@ function App() {
                               style={{ marginRight: 4 }}
                             />
                           </Tooltip>
+                          <Tooltip title="界面行数上限：只把前 N 行送进表格与 CSV（0 = 不限）。后端仍会取完这一次结果，真要少取请在语句里自己收口。">
+                            <Space size={2}>
+                              <InputNumber
+                                size="small"
+                                min={0}
+                                step={500}
+                                value={rowCap}
+                                onChange={(v) => setRowCap(Number(v ?? 0))}
+                                style={{ width: 86 }}
+                              />
+                              <Text type="secondary" style={{ fontSize: 12 }}>
+                                行
+                              </Text>
+                            </Space>
+                          </Tooltip>
                           <Button
                             type="primary"
                             size="small"
@@ -1803,7 +1845,20 @@ function App() {
                         borderRadius: 12,
                         background: cardBgGradient,
                       }}
-                      title={`查询结果 (${queryResults.length} 行)`}
+                      title={
+                        <Space size={6}>
+                          {resultMeta
+                            ? `查询结果 (前 ${resultMeta.shown} 行 / 共 ${resultMeta.total} 行)`
+                            : `查询结果 (${queryResults.length} 行)`}
+                          {resultMeta && (
+                            <Tooltip
+                              title={`界面上限 ${rowCap} 行：这次结果共 ${resultMeta.total} 行，只有前 ${resultMeta.shown} 行进表格与 CSV`}
+                            >
+                              <Tag color="orange">按上限截断</Tag>
+                            </Tooltip>
+                          )}
+                        </Space>
+                      }
                       extra={
                         <Space>
                           {changeSet.size > 0 && (

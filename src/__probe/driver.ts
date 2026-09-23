@@ -135,6 +135,29 @@ export function installDriver() {
       Array.from(document.querySelectorAll("button"))
         .filter((b) => (b.textContent || "").includes("照这条错误改"))
         .map((b) => (b.textContent || "").trim()),
+    /** 改界面上限行数（antd InputNumber 的 input 走原生 setter，否则 React 收不到） */
+    setRowCap: async (v: number | string) => {
+      const inp = document.querySelector(".ant-input-number input") as HTMLInputElement | null;
+      if (!inp) throw new Error("没有界面上限那个输入框（先连上库并进入 SQL 工作台）");
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+      setter.call(inp, String(v));
+      inp.dispatchEvent(new Event("input", { bubbles: true }));
+      await w.__probe.sleep(120);
+    },
+    /** 从某个下标起，每次执行带过去的 max_rows（null = 不限） */
+    capSent: (from: number) =>
+      (w.__PROBE_CALLS as any[])
+        .slice(from)
+        .filter((c: any) => c.cmd === "execute_query")
+        .map((c: any) => {
+          const v = "max_rows" in c.args ? c.args.max_rows : c.args.maxRows;
+          return v === undefined ? "没带这个键" : String(v);
+        }),
+    /** 结果卡标题与截断标签 */
+    resultTitle: () =>
+      Array.from(document.querySelectorAll(".ant-card-head-title"))
+        .map((t) => (t.textContent || "").trim())
+        .find((t) => t.includes("查询结果")) || null,
     /** 编辑器当前内容：改好的那条 SQL 有没有真落进编辑器，看这个 */
     editorText: () => (document.querySelector(".cm-content")?.textContent || "").trim(),
     /** 写规格 JSON 编辑器（手搓/写坏都走这条）。按 placeholder 认栏，别按内容认：
