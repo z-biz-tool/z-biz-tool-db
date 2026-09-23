@@ -149,6 +149,17 @@ export function installDriver() {
       w.__PROBE_CLICK(o);
       await sleep(60);
     },
+    /** 起草后那张"两版差异"卡的原文（按收尾那句认，别按标题认——标题会变）。
+     *  null = 这一稿没有可对照的前一版（首稿，或编辑器里本来没设计）。 */
+    diffCard: () => {
+      const a = Array.from(document.querySelectorAll(".ant-alert")).find((x) =>
+        (x.textContent || "").includes("对照的是覆盖前后")
+      );
+      if (!a) return null;
+      const cls = a.className;
+      const kind = cls.includes("ant-alert-warning") ? "warning" : cls.includes("ant-alert-info") ? "info" : "other";
+      return `${kind}|${(a.textContent || "").trim()}`;
+    },
     /** 当前规格 JSON 编辑器内容（按含 connection_id 的那一栏找，避开问题输入框） */
     specValue: () =>
       Array.from(document.querySelectorAll("textarea"))

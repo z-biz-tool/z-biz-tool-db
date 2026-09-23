@@ -289,17 +289,37 @@ function invoke(cmd: string, args: any): Promise<any> {
       // 起草一成功就在草稿卡里 map 崩掉整棵树，"起草成功"这条腿其实从没跑通过。
       const specs = (fixture as any).reports[0].datasets;
       const view = (fixture as any).reports[0].view;
+      // ?draftmut=drop_widget|drop_dataset|add_widget|tweak 让"模型改坏了"可注入。
+      // URL 参数只能整页重载才有变，追问是同一会话里的第二轮，所以再认一个运行期钩子。
+      const mut = String(
+        (window as any).__PROBE_DRAFTMUT ?? window.__PROBE_ARG("draftmut") ?? ""
+      );
+      const nextSpecs = JSON.parse(JSON.stringify(specs));
+      const nextView = JSON.parse(JSON.stringify(view));
+      if (mut === "drop_widget" && nextView.widgets.length > 1) nextView.widgets.pop();
+      if (mut === "add_widget")
+        nextView.widgets.push({
+          id: "w_probe",
+          type: "TABLE",
+          title: "注入的新组件",
+          dataset: nextSpecs[0].id,
+        });
+      if (mut === "drop_dataset" && nextSpecs.length > 1) {
+        const gone = nextSpecs.pop();
+        nextView.widgets = nextView.widgets.filter((x: any) => x.dataset !== gone.id);
+      }
+      if (mut === "tweak") nextSpecs[0].limit = 7;
       // 镜像 ai.rs 的两条 warning 规则：连接键跨族 + 没有组件在用的数据集。
       // 以前写死一句"跨 2 种方言"，把 users 丢掉之后它就不成立了。
-      const used = new Set((view.widgets || []).map((x: any) => x.dataset));
+      const used = new Set(nextView.widgets.map((x: any) => x.dataset));
       return Promise.resolve({
-        datasets: specs,
-        view,
+        datasets: nextSpecs,
+        view: nextView,
         steps: ["scan orders (shop)", "filter status = 'paid'", "group by city", "join users (crm)"],
-        columns: Object.fromEntries(specs.map((d: any) => [d.id, ["city", "gmv", "cnt"]])),
+        columns: Object.fromEntries(nextSpecs.map((d: any) => [d.id, ["city", "gmv", "cnt"]])),
         warnings: [
-          ...joinKeyWarnings(specs, cat),
-          ...specs
+          ...joinKeyWarnings(nextSpecs, cat),
+          ...nextSpecs
             .filter((d: any) => !used.has(d.id))
             .map((d: any) => `数据集 ${d.id}（${d.name}）没有任何组件在用，执行时会白取一次数`),
         ],

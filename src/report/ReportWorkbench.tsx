@@ -64,6 +64,7 @@ import type {
   ViewSpec,
 } from "./types";
 import { ReportBoard, SqlList } from "./ReportBoard";
+import { describeDiff, diffSpec, type SpecSide } from "./diffSpec";
 
 const { Text, Title } = Typography;
 const { TextArea } = Input;
@@ -169,6 +170,13 @@ export function ReportWorkbench({
   // state 是渲染快照，await 之后读它会拿到请求落地前的旧值，
   // 所以列清单同时镜像到 ref，起草时用 ref 现读。
   const columnsRef = useRef<Record<string, ColumnInfo[]>>({});
+  // 起草覆盖掉的那一版与新一稿的差异；只在真的覆盖过一次设计之后才有内容
+  const [specDiff, setSpecDiff] = useState<{
+    lines: string[];
+    dropped: boolean;
+    wording: string;
+  } | null>(null);
+
   // 追问式改稿用的"当时需求"。只有 specText 还是这一稿落地时的原文，那句需求才对得上
   // 手上这份设计；用户手改过 JSON 就把它冲掉——设计照样带给模型（模型读的是 JSON），
   // 但别再谎称这份设计是为了那句需求写的。
@@ -311,8 +319,8 @@ export function ReportWorkbench({
     })),
   }));
 
-  /** 从零开始的这条路要一次点到位：坏 JSON 挡在起草前置闸时，
-   *  如果清空按钮只在渲染过之后才出现，用户就没有退路了。 */
+  /** 清空是"从零开始"那条退路：规格 JSON 被起草前置闸拦下时，如果这个入口只在
+   *  渲染过之后才出现，用户就只剩"自己把 JSON 修好"一条路。 */
   const resetWorkbench = () => {
     setPayload(null);
     setDraft(null);
@@ -322,8 +330,9 @@ export function ReportWorkbench({
     setOpenName("");
     setSavedSpecText("");
     setError(null);
-    // 设计都没了，"当时需求"也没有指向的对象了
+    // 都没了，"当时需求"也没有指向的对象了
     priorRef.current = null;
+    setSpecDiff(null);
     runId.current += 1;
   };
 
@@ -373,10 +382,9 @@ export function ReportWorkbench({
       priorRef.current && priorRef.current.specText === specText ? priorRef.current.question : "";
     // 同一句需求再点一次 = 重来一次，不该把上一版喂回去让模型"改"自己
     const sameAsk = remembered.trim() !== "" && remembered.trim() === question.trim();
-    const prior: PriorReport | null =
-      spec.view && spec.datasets && !sameAsk
-        ? { question: remembered, draft: { datasets: spec.datasets, view: spec.view } }
-        : null;
+    const before: SpecSide | null =
+      spec.view && spec.datasets ? { datasets: spec.datasets, view: spec.view } : null;
+    const prior: PriorReport | null = before && !sameAsk ? { question: remembered, draft: before } : null;
     const id = ++runId.current;
     setDrafting(true);
     setError(null);
@@ -403,6 +411,18 @@ export function ReportWorkbench({
       const d = await aiReportDraft(question, ready, aiConfig, undefined, prior);
       if (id !== runId.current) return;
       applyDraft(d, question.trim());
+      // "在上一版基础上改"是对模型的请求，本机校验只查引用合法性，模型少写两个组件照样过。
+      // 所以覆盖前后自己比一遍：丢了东西要当场看得见，而不是回头发现图少了一半。
+      const diff = before ? diffSpec(before, { datasets: d.datasets, view: d.view }) : null;
+      setSpecDiff(
+        diff
+          ? {
+              lines: describeDiff(diff),
+              dropped: Boolean(diff.ds.dropped.length || diff.w.dropped.length),
+              wording: prior ? "这一版在上一版基础上改" : "这一版没带上一版，整份重写",
+            }
+          : null
+      );
       // 说清楚这一稿是在现有设计上改的还是整份重来：起草会覆盖编辑器里的规格，
       // 用户以为"加一个组件"却丢了手搓的 JSON，是最贵的一种不说
       const asked = prior?.question.trim() || "";
@@ -415,8 +435,9 @@ export function ReportWorkbench({
         : sameAsk
           ? "同一句需求，不带上一版整份重写"
           : "现有设计没带上，这一稿是从零起草的";
+      const counts = diff ? ` · 数据集 ${diff.ds.from}→${diff.ds.to}、组件 ${diff.w.from}→${diff.w.to}` : "";
       msgApi.success(
-        `${base}；${d.repairs > 0 ? `本机校验打回 ${d.repairs} 次后通过` : "已通过本机校验"}`
+        `${base}；${d.repairs > 0 ? `本机校验打回 ${d.repairs} 次后通过` : "已通过本机校验"}${counts}`
       );
     } catch (e) {
       if (id !== runId.current) return;
@@ -619,6 +640,8 @@ export function ReportWorkbench({
     // 存进去的那句需求就是这份设计的来处：接着追问（"再把退款单算进去"）
     // 应该在这条报表上改，而不是从零重写一张
     priorRef.current = { question: r.question || "", specText: text };
+    // 上一轮的差异卡说的是"被覆盖那版 vs 起草结果"，跟这条报表没关系了
+    setSpecDiff(null);
     setQuestion(r.question || "");
     setPicked(keys);
     setDraft(null);
@@ -833,6 +856,25 @@ export function ReportWorkbench({
               <div style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", fontSize: 12 }}>
                 {error.detail}
               </div>
+            }
+          />
+        )}
+        {/* 起草覆盖的是整份规格：这一卡说清"上一版有什么、这一版还剩什么"，
+            改坏了也能照着它手工补回去。 */}
+        {specDiff && (
+          <Alert
+            type={specDiff.dropped ? "warning" : "info"}
+            showIcon
+            closable
+            onClose={() => setSpecDiff(null)}
+            style={{ marginBottom: 12 }}
+            title={specDiff.wording}
+            description={
+              <Space orientation="vertical" size={2} style={{ fontSize: 12 }}>
+                {specDiff.lines.map((l) => (
+                  <div key={l}>· {l}</div>
+                ))}
+              </Space>
             }
           />
         )}
