@@ -925,6 +925,36 @@ export function ReportWorkbench({
     }
   };
 
+  /** 撞闸的数据集：一键把那张集的上限翻倍（与后端同源：默认 5 万、硬顶 50 万）。
+   *  原来提示让用户"去调 max_rows"，却只给了一条手改规格 JSON 的路。 */
+  const ROW_DEFAULT = 50000;
+  const ROW_CEILING = 500000;
+  type LimitPlan = { from: number; to: number; atCeiling: boolean };
+  const raisePlan = (d: DatasetSpec): LimitPlan => {
+    const from = d.max_rows ?? ROW_DEFAULT;
+    return { from, to: Math.min(from * 2, ROW_CEILING), atCeiling: from >= ROW_CEILING };
+  };
+  const limitPlans = useMemo(() => {
+    const out: Record<string, LimitPlan> = {};
+    for (const d of spec.datasets || []) out[d.id] = raisePlan(d);
+    return out;
+  }, [spec.datasets]);
+
+  const onRaiseLimit = async (id: string) => {
+    if (!spec.view || !spec.datasets) return;
+    const datasets = spec.datasets.map((d) => {
+      if (d.id !== id) return d;
+      const p = raisePlan(d);
+      return p.atCeiling ? d : { ...d, max_rows: p.to };
+    });
+    const text = JSON.stringify({ datasets, view: spec.view }, null, 2);
+    setSpecText(text);
+    // 上限改了，"当时需求"绑的原文也得跟着走，否则下一次追问会说"现有设计没有对应需求"
+    if (priorRef.current) priorRef.current = { ...priorRef.current, specText: text };
+    // 新的 datasets 直接传下去：state 在这一轮还是旧的
+    await runRender(spec.view, datasets);
+  };
+
   const onRender = async () => {
     if (!spec.view || !spec.datasets) {
       msgApi.warning(spec.parseError || "先有一份合法的草稿 JSON");
@@ -1612,6 +1642,8 @@ export function ReportWorkbench({
                     datasetNameOf={datasetNameOf}
                     onRetry={() => void onRender()}
                     retryBusy={rendering}
+                    limitPlans={limitPlans}
+                    onRaiseLimit={(id) => void onRaiseLimit(id)}
                   />
                   </>
                 ) : draft ? (

@@ -528,11 +528,26 @@ function invoke(cmd: string, args: any): Promise<any> {
       }
       // 取数每次回的都是新的一份（真后端每次重新组包）。复用同一个对象会让
       // "payload 变了没"这种判断在探针里失灵——旧解释该不该作废就量不出来
-      return Promise.resolve(
-        cmd === "report_view_render"
-          ? JSON.parse(JSON.stringify((fixture as any).render))
-          : (fixture as any).validate
-      );
+      if (cmd !== "report_view_render") return Promise.resolve((fixture as any).validate);
+      const out = JSON.parse(JSON.stringify((fixture as any).render));
+      // ?trunc=city-gmv 当成"这张集撞上 max_rows"：payload.partial 与每集的 truncated/rows
+      // 造不出来，就量不到"就地提高上限"那条腿
+      const trunc = String(window.__PROBE_ARG("trunc") || "")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      if (trunc.length) {
+        const want = (a.datasets || []).find((d: any) => trunc.includes(d.id));
+        const cap = Number(want?.max_rows ?? 50000);
+        for (const d of out.datasets) {
+          if (!trunc.includes(d.id)) continue;
+          d.partial = true;
+          d.truncated = [want?.sources?.[0]?.alias || "o"];
+          d.rows = cap;
+        }
+        out.partial = true;
+      }
+      return Promise.resolve(out);
     }
     case "ai_report_draft": {
       const cat: any[] = a.catalog || [];

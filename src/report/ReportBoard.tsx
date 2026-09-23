@@ -106,11 +106,16 @@ export function ReportBoard({
   /** 缺数那张卡上的就地重试：重跑的是整张报表的取数，不是只补那几张，文案别写歪 */
   onRetry,
   retryBusy,
+  limitPlans,
+  onRaiseLimit,
 }: {
   payload: ViewPayload;
   datasetNameOf?: (widgetId: string) => string | undefined;
   onRetry?: () => void;
   retryBusy?: boolean;
+  /** 数据集 id → 撞闸后"翻倍到多少"的计划；到硬顶的就只说，不给假按钮 */
+  limitPlans?: Record<string, { from: number; to: number; atCeiling: boolean }>;
+  onRaiseLimit?: (datasetId: string) => void;
 }) {
   const chartById = new Map(payload.charts.map((c) => [c.widget, c]));
   const placed = new Set(payload.layout.map((l) => l.widget));
@@ -163,7 +168,37 @@ export function ReportBoard({
           type="warning"
           showIcon
           title="结果不完整"
-          description={`以下数据集撞上 max_rows 上限，聚合与排序都只覆盖已取回的部分：${truncated.join("；")}。调大对应数据集的 max_rows 再跑一次。`}
+          description={`以下数据集撞上 max_rows 上限，聚合与排序都只覆盖已取回的部分：${truncated.join(
+            "；"
+          )}。下面这些按钮会把对应数据集的上限翻倍（后端硬顶 50 万行）再重跑一次取数。`}
+          action={
+            onRaiseLimit ? (
+              <Space size={4} wrap>
+                {payload.datasets
+                  .filter((d) => d.partial)
+                  .map((d) => {
+                    const plan = limitPlans?.[d.id];
+                    if (!plan) return null;
+                    if (plan.atCeiling)
+                      return (
+                        <Tag key={d.id} color="default">
+                          {d.name} 已在 50 万上限
+                        </Tag>
+                      );
+                    return (
+                      <Button
+                        key={d.id}
+                        size="small"
+                        loading={retryBusy}
+                        onClick={() => onRaiseLimit(d.id)}
+                      >
+                        {`${d.name} 上限 ${plan.from.toLocaleString()} → ${plan.to.toLocaleString()}`}
+                      </Button>
+                    );
+                  })}
+              </Space>
+            ) : null
+          }
         />
       )}
       <div style={{ position: "relative", height: (bottom + orphans.length * 6) * ROW_UNIT }}>
