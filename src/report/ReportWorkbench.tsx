@@ -511,6 +511,23 @@ export function ReportWorkbench({
       void onPickTables(undefined, { thenDraft: true, question: q, onDone });
       return;
     }
+    // 一条连接都没有、或每条连接的表清单都读完了却一张表也没读到：不用干等 8 秒，现在就实话实说
+    const settled =
+      configs.length > 0 &&
+      Object.keys(connState).length >= configs.length &&
+      !Object.values(connState).some((x) => x.loading);
+    if (!configs.length || settled) {
+      pendingChain.onDone?.("没开始");
+      setPendingChain(null);
+      msgApi.warning(
+        configs.length
+          ? `各连接的表清单都没读到，没开始挑表：${
+              tableCandidates.skipped.join("、") || "未知"
+            }`
+          : "本机还没有任何连接：先建一条连接，再让 AI 出图"
+      );
+      return;
+    }
     const t = setTimeout(() => {
       pendingChain.onDone?.("没开始");
       setPendingChain(null);
@@ -521,7 +538,7 @@ export function ReportWorkbench({
       );
     }, 8000);
     return () => clearTimeout(t);
-  }, [pendingChain, tableCandidates, msgApi]);
+  }, [pendingChain, tableCandidates, msgApi, configs, connState]);
 
 
   const [picking, setPicking] = useState(false);
