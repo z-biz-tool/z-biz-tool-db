@@ -88,7 +88,15 @@ function invoke(cmd: string, args: any): Promise<any> {
         }
         return Promise.resolve((fixture as any).columns[t] || []);
       };
-      return slow > 0 ? new Promise((r) => setTimeout(() => r(body()), slow)) : body();
+      return slow > 0
+        ? new Promise((r) =>
+            setTimeout(() => {
+              // 落地时刻要能被探针读到，否则"正在读取"闪没是注入没生效还是记账错了，分不开
+              push("describe_done", { table: t, at: Math.round(performance.now()) });
+              r(body());
+            }, slow)
+          )
+        : body();
     }
     case "ai_sql_generate": {
       const catalog: any[] = a.catalog || [];
