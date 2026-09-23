@@ -2,7 +2,7 @@
 // 说清楚（截断、耗时、行数、生成的 SQL）。布局只读后端结果，前端不再排一次，
 // 否则同一张看板会有两个版本。
 
-import { Alert, Card, Collapse, Space, Table, Tag, Tooltip, Typography } from "antd";
+import { Alert, Button, Card, Collapse, Space, Table, Tag, Tooltip, Typography } from "antd";
 import { DatabaseOutlined, FieldTimeOutlined } from "@ant-design/icons";
 import { ChartCard } from "./ChartCard";
 import type { SqlPreview, ViewPayload } from "./types";
@@ -103,9 +103,14 @@ export function ReportBoard({
   payload,
   /** 组件 id → 数据集名。ChartData 本身不带数据集，只能由持有 spec 的调用方给 */
   datasetNameOf,
+  /** 缺数那张卡上的就地重试：重跑的是整张报表的取数，不是只补那几张，文案别写歪 */
+  onRetry,
+  retryBusy,
 }: {
   payload: ViewPayload;
   datasetNameOf?: (widgetId: string) => string | undefined;
+  onRetry?: () => void;
+  retryBusy?: boolean;
 }) {
   const chartById = new Map(payload.charts.map((c) => [c.widget, c]));
   const placed = new Set(payload.layout.map((l) => l.widget));
@@ -137,8 +142,19 @@ export function ReportBoard({
                   {f.widgets.length > 0 ? ` —— 受影响组件 ${f.widgets.join("、")}` : ""}
                 </div>
               ))}
-              <div style={{ opacity: 0.75 }}>其余数据集已照常取数；补上连接或改好表名后再点一次「取数并渲染」。</div>
+              <div style={{ opacity: 0.75 }}>
+                {onRetry
+                  ? "其余数据集已照常取数；补上连接或改好表名后，用右边这个「再取一次数」重跑整张报表的取数。"
+                  : "其余数据集已照常取数；补上连接或改好表名后再点一次「取数并渲染」。"}
+              </div>
             </Space>
+          }
+          action={
+            onRetry ? (
+              <Button size="small" loading={retryBusy} onClick={onRetry}>
+                再取一次数
+              </Button>
+            ) : null
           }
         />
       )}

@@ -1607,7 +1607,12 @@ export function ReportWorkbench({
                         <div style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{explainText}</div>
                       </Card>
                     )}
-                    <ReportBoard payload={payload} datasetNameOf={datasetNameOf} />
+                    <ReportBoard
+                    payload={payload}
+                    datasetNameOf={datasetNameOf}
+                    onRetry={() => void onRender()}
+                    retryBusy={rendering}
+                  />
                   </>
                 ) : draft ? (
                   <Empty description="还没有取数，点「取数并渲染」" style={{ marginTop: 60 }} />
