@@ -231,6 +231,13 @@ export interface PriorDraft {
   sql: string;
 }
 
+/** 上一版报表设计：追问（"再加一条按月的折线"）时把工作台上当前的 spec 带回去。
+ *  手改过的 JSON、从报表簿打开的历史报表都能当上一版，所以 question 可能为空。 */
+export interface PriorReport {
+  question: string;
+  draft: ReportDraft;
+}
+
 /** 报表簿条目：存的是 spec 而不是结果，落盘在后端 queries.rs */
 export interface SavedReport {
   id: string;

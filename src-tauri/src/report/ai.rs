@@ -55,6 +55,14 @@ pub struct ReportDraft {
     pub view: ViewSpec,
 }
 
+/// 上一版报表：让"再加一个按月的折线图""把饼图换成表格"这种追问能在已有设计上改。
+/// question 是那版设计对应的需求（手改过规格、或从报表簿打开的历史报表可能为空）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PriorReport {
+    pub question: String,
+    pub draft: ReportDraft,
+}
+
 /// 通过本地校验后的草稿：可以直接拿去 report_view_render
 #[derive(Debug, Clone, Serialize)]
 pub struct DraftResult {
@@ -197,8 +205,14 @@ fn render_catalog(catalog: &[CatalogTable]) -> String {
     lines.join("\n")
 }
 
-/// 生成给模型的完整提示词。feedback 是上一稿被本地校验拒绝的原因。
-pub fn prompt(question: &str, catalog: &[CatalogTable], feedback: Option<&str>) -> String {
+/// 生成给模型的完整提示词。prior 是上一版设计（追问式改稿时才带），
+/// feedback 是上一稿被本地校验拒绝的原因。
+pub fn prompt(
+    question: &str,
+    catalog: &[CatalogTable],
+    prior: Option<&PriorReport>,
+    feedback: Option<&str>,
+) -> String {
     let mut s = String::new();
     s.push_str(
         "你是数据库报表设计器。只输出一段 JSON，不要解释、不要 markdown 代码块。\n\n\
@@ -243,6 +257,20 @@ pub fn prompt(question: &str, catalog: &[CatalogTable], feedback: Option<&str>) 
     );
     s.push_str("\n需求：");
     s.push_str(question.trim());
+    if let Some(p) = prior {
+        let asked = if p.question.trim().is_empty() {
+            String::new()
+        } else {
+            format!("（当时需求：{}）", p.question.trim())
+        };
+        let json = serde_json::to_string_pretty(&p.draft)
+            .unwrap_or_else(|_| "{}".into());
+        s.push_str(&format!(
+            "\n\n上一版报表是这么设计的{asked}：\n{json}\n\
+             请在它基础上按新需求改：新需求没提到的数据集与组件保持原样，\n\
+             只回改好的完整 JSON，不要回增量、不要只回新加的那几个组件。\n"
+        ));
+    }
     if let Some(fb) = feedback {
         s.push_str("\n\n上一稿没有通过本机校验，原因：\n");
         s.push_str(fb.trim());
@@ -636,20 +664,27 @@ impl Model for HttpModel {
 
 /// 起草：问一次 → 本地校验 → 不通过就把错误原文回喂，最多 repairs 次。
 /// 校验全在本地跑，所以模型再怎么胡说也不会变成打到库上的查询。
+/// prior 是上一版设计，追问式改稿时带上；改出来的设计照样过同一套本地校验。
 pub async fn draft(
     model: &dyn Model,
     question: &str,
     catalog: &[CatalogTable],
     repairs: u8,
+    prior: Option<&PriorReport>,
 ) -> Result<DraftResult, String> {
     if question.trim().is_empty() {
         return Err("请先描述你想要什么报表".into());
     }
+    // 空白的上一版只会往提示词里塞噪音，当作没带
+    let prior =
+        prior.filter(|p| !p.draft.datasets.is_empty() || !p.draft.view.widgets.is_empty());
     let rounds = repairs.min(MAX_REPAIRS);
     let mut feedback: Option<String> = None;
     let mut last = String::new();
     for round in 0..=rounds {
-        let raw = model.complete(prompt(question, catalog, feedback.as_deref())).await?;
+        let raw = model
+            .complete(prompt(question, catalog, prior, feedback.as_deref()))
+            .await?;
         let parsed = match parse_draft(&raw) {
             Ok(d) => d,
             Err(e) => {
@@ -692,9 +727,17 @@ pub async fn ai_report_draft(
     catalog: Vec<CatalogTable>,
     config: AIConfig,
     max_repairs: Option<u8>,
+    prior: Option<PriorReport>,
 ) -> Result<DraftResult, String> {
     let model = HttpModel::new(config)?;
-    draft(&model, &question, &catalog, max_repairs.unwrap_or(2)).await
+    draft(
+        &model,
+        &question,
+        &catalog,
+        max_repairs.unwrap_or(2),
+        prior.as_ref(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -816,7 +859,7 @@ mod tests {
 
     #[test]
     fn prompt_lists_every_allowed_function_and_the_catalog() {
-        let p = prompt("各城市成交额", &catalog(), None);
+        let p = prompt("各城市成交额", &catalog(), None, None);
         for f in ALLOWED_FUNCTIONS {
             assert!(p.contains(f), "提示词漏了函数 {}", f);
         }
@@ -831,7 +874,7 @@ mod tests {
     #[test]
     fn prompt_carries_types_when_known_and_bare_names_otherwise() {
         let c = catalog();
-        let p = prompt("各城市成交额", &c, None);
+        let p = prompt("各城市成交额", &c, None, None);
         // orders 带类型
         assert!(p.contains("amount REAL"), "{}", p);
         // users 没有类型 → 只有名字，且名字后面紧跟逗号或右括号
@@ -847,7 +890,7 @@ mod tests {
 
     #[test]
     fn prompt_feeds_the_previous_error_back() {
-        let p = prompt("q", &catalog(), Some("列 total_fee 不存在"));
+        let p = prompt("q", &catalog(), None, Some("列 total_fee 不存在"));
         assert!(p.contains("列 total_fee 不存在"));
         assert!(p.contains("重新输出完整 JSON"));
     }
@@ -856,7 +899,7 @@ mod tests {
     /// 本来能跑的草稿（bigint 配 varchar 是跨库常态），说"随便配"又会换来静默空表。
     #[test]
     fn prompt_states_the_join_key_rule_the_engine_actually_applies() {
-        let p = prompt("q", &catalog(), None);
+        let p = prompt("q", &catalog(), None, None);
         assert!(p.contains("只能写列名"), "表达式仍不接受：{}", p);
         assert!(p.contains("配得上 varchar「1001」"), "要承认整数写法能跨族配：{}", p);
         assert!(p.contains("「007」配不上 7"), "要说清前导零仍不配：{}", p);
@@ -1244,7 +1287,7 @@ mod tests {
             ),
             format!("```json\n{}\n```", draft_of(&[city_gmv()], &[widget("d1", "BAR")])),
         ]);
-        let out = draft(&model, "各城市成交额", &catalog(), 3).await.unwrap();
+        let out = draft(&model, "各城市成交额", &catalog(), 3, None).await.unwrap();
         assert_eq!(out.repairs, 2);
         let prompts = model.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 3);
@@ -1255,7 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn draft_gives_up_with_the_last_local_error() {
         let model = scripted(vec![]);
-        let err = draft(&model, "各城市成交额", &catalog(), 1).await.unwrap_err();
+        let err = draft(&model, "各城市成交额", &catalog(), 1, None).await.unwrap_err();
         assert!(err.contains("重试 2 次"), "{}", err);
         assert!(err.contains("找不到 JSON"), "{}", err);
         assert_eq!(model.prompts.lock().unwrap().len(), 2);
@@ -1264,9 +1307,119 @@ mod tests {
     #[tokio::test]
     async fn draft_refuses_an_empty_question_without_calling_the_model() {
         let model = scripted(vec![draft_of(&[city_gmv()], &[widget("d1", "BAR")])]);
-        let err = draft(&model, "   ", &catalog(), 2).await.unwrap_err();
+        let err = draft(&model, "   ", &catalog(), 2, None).await.unwrap_err();
         assert!(err.contains("描述"), "{}", err);
         assert!(model.prompts.lock().unwrap().is_empty());
+    }
+
+    // ==================== 追问式改稿 ====================
+
+    fn prior(question: &str, raw: &str) -> PriorReport {
+        PriorReport { question: question.into(), draft: parse_draft(raw).unwrap() }
+    }
+
+    #[test]
+    fn prompt_shows_the_previous_design_and_its_question() {
+        let p = prior(
+            "各城市成交额",
+            &draft_of(&[city_gmv()], &[widget("d1", "BAR")]),
+        );
+        let text = prompt("再加一个按月的折线图", &catalog(), Some(&p), None);
+        assert!(text.contains("上一版报表是这么设计的（当时需求：各城市成交额）"), "{text}");
+        // 这两串只可能来自上一版设计：基础提示词的结构示例里既没有 d1 也没有 SUM/amount
+        assert!(text.contains("\"id\": \"d1\""), "{text}");
+        assert!(text.contains("\"output\": \"gmv\""), "{text}");
+        assert!(text.contains("请在它基础上按新需求改"), "{text}");
+        assert!(text.contains("不要回增量"), "{text}");
+        assert!(text.contains("需求：再加一个按月的折线图"), "{text}");
+
+        // 手改过规格、或从报表簿打开的老报表，当时需求可能压根没记下来
+        let mute = prior("", &draft_of(&[city_gmv()], &[widget("d1", "BAR")]));
+        let text2 = prompt("把饼图换成表格", &catalog(), Some(&mute), None);
+        assert!(text2.contains("上一版报表是这么设计的："), "{text2}");
+        assert!(!text2.contains("当时需求"), "{text2}");
+
+        // 没带上一版时不能凭空冒出一段设计
+        let text3 = prompt("各城市成交额", &catalog(), None, None);
+        assert!(!text3.contains("上一版报表"), "{text3}");
+    }
+
+    #[tokio::test]
+    async fn draft_ignores_an_empty_prior_design() {
+        let model = scripted(vec![draft_of(&[city_gmv()], &[widget("d1", "BAR")])]);
+        let empty = prior("上次的需求串", &draft_of(&[], &[]));
+        let out = draft(&model, "各城市成交额", &catalog(), 1, Some(&empty))
+            .await
+            .unwrap();
+        assert_eq!(out.datasets.len(), 1);
+        let ps = model.prompts.lock().unwrap();
+        assert_eq!(ps.len(), 1);
+        assert!(!ps[0].contains("上一版报表"), "{}", ps[0]);
+        assert!(!ps[0].contains("上次的需求串"), "{}", ps[0]);
+    }
+
+    /// 重试轮次也得带着上一版：否则第二轮模型是在凭空重画整张报表
+    #[tokio::test]
+    async fn draft_keeps_the_prior_through_the_repair_round() {
+        let bad = draft_of(
+            &[spec(
+                "d1",
+                "o",
+                r#"[{"alias":"o","connection_id":"shop","table":"invoicez"}]"#,
+                r#""limit":10"#,
+            )],
+            &[widget("d1", "BAR")],
+        );
+        let model = scripted(vec![bad.clone(), draft_of(&[city_gmv()], &[widget("d1", "BAR")])]);
+        let p = prior("各城市成交额", &bad);
+        let out = draft(&model, "把金额换成税前的", &catalog(), 3, Some(&p))
+            .await
+            .unwrap();
+        assert_eq!(out.repairs, 1);
+        let ps = model.prompts.lock().unwrap();
+        assert_eq!(ps.len(), 2);
+        for round in ps.iter() {
+            assert!(round.contains("上一版报表是这么设计的"), "{round}");
+            assert!(round.contains("invoicez"), "{round}");
+            assert!(round.contains("把金额换成税前的"), "{round}");
+        }
+        // 改稿提示和本机拒因同时在场，模型才知道既要在旧设计上改、又要修哪个错
+        assert!(ps[1].contains("上一稿没有通过本机校验"), "{}", ps[1]);
+    }
+
+    /// 上一版可能是用户手改的、也可能是连接改绑前存的：里面的表可能早就不在目录里。
+    /// 模型照抄也不能放行，改出来的设计过的还是同一套本机校验。
+    #[tokio::test]
+    async fn draft_still_rejects_a_stale_prior_the_model_copies() {
+        let stale = draft_of(
+            &[spec(
+                "d1",
+                "o",
+                r#"[{"alias":"o","connection_id":"shop","table":"invoicez"}]"#,
+                r#""limit":10"#,
+            )],
+            &[widget("d1", "BAR")],
+        );
+        let model = scripted(vec![stale.clone(), stale.clone()]);
+        let p = prior("各城市成交额", &stale);
+        let e = draft(&model, "再加一个饼图", &catalog(), 1, Some(&p))
+            .await
+            .unwrap_err();
+        assert!(e.contains("重试 2 次"), "{e}");
+        assert!(e.contains("invoicez"), "{e}");
+        assert_eq!(model.prompts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prior_deserializes_from_the_frontend_shape() {
+        let p: PriorReport = serde_json::from_str(
+            r#"{"question":"按月份","draft":{"datasets":[],"view":{"id":"v","name":"n","widgets":[],"layout":[]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.question, "按月份");
+        assert!(p.draft.datasets.is_empty());
+        // 少带 draft 不能悄悄解成"空白上一版"
+        assert!(serde_json::from_str::<PriorReport>(r#"{"question":"按月份"}"#).is_err());
     }
 
     fn cfg(base_url: &str, key: &str, model: &str) -> AIConfig {

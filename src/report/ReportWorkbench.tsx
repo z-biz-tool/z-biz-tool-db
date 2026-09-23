@@ -30,6 +30,7 @@ import {
 import {
   BulbOutlined,
   CheckCircleOutlined,
+  ClearOutlined,
   DeleteOutlined,
   FolderOpenOutlined,
   ReloadOutlined,
@@ -57,6 +58,7 @@ import type {
   ColumnInfo,
   DatasetSpec,
   DraftResult,
+  PriorReport,
   SavedReport,
   ViewPayload,
   ViewSpec,
@@ -167,6 +169,10 @@ export function ReportWorkbench({
   // state 是渲染快照，await 之后读它会拿到请求落地前的旧值，
   // 所以列清单同时镜像到 ref，起草时用 ref 现读。
   const columnsRef = useRef<Record<string, ColumnInfo[]>>({});
+  // 追问式改稿用的"当时需求"。只有 specText 还是这一稿落地时的原文，那句需求才对得上
+  // 手上这份设计；用户手改过 JSON 就把它冲掉——设计照样带给模型（模型读的是 JSON），
+  // 但别再谎称这份设计是为了那句需求写的。
+  const priorRef = useRef<{ question: string; specText: string } | null>(null);
 
   const aiReady = Boolean(aiConfig.base_url && aiConfig.api_key && aiConfig.model);
 
@@ -305,10 +311,29 @@ export function ReportWorkbench({
     })),
   }));
 
-  const applyDraft = (d: DraftResult) => {
+  /** 从零开始的这条路要一次点到位：坏 JSON 挡在起草前置闸时，
+   *  如果清空按钮只在渲染过之后才出现，用户就没有退路了。 */
+  const resetWorkbench = () => {
+    setPayload(null);
+    setDraft(null);
+    setSpecText("");
+    setQuestion("");
+    setOpenId("");
+    setOpenName("");
+    setSavedSpecText("");
+    setError(null);
+    // 设计都没了，"当时需求"也没有指向的对象了
+    priorRef.current = null;
+    runId.current += 1;
+  };
+
+  const applyDraft = (d: DraftResult, askedFor: string) => {
     setDraft(d);
     setPayload(null);
-    setSpecText(JSON.stringify({ datasets: d.datasets, view: d.view }, null, 2));
+    const text = JSON.stringify({ datasets: d.datasets, view: d.view }, null, 2);
+    setSpecText(text);
+    // 这一稿就是这句需求换来的：下一次追问把它当上一版设计带回去
+    priorRef.current = { question: askedFor, specText: text };
     // 新草稿与之前打开的那条没关系了，保存必须落到新条目上
     setOpenId("");
     setOpenName("");
@@ -330,6 +355,28 @@ export function ReportWorkbench({
       msgApi.warning("先选至少一张表，模型没有目录就只能编字段");
       return;
     }
+    // 起草会整份覆盖编辑器里的规格，所以"要不要把这份设计当上一版带给模型"
+    // 得先问一句它读不读得懂。JSON 坏在这里拦住，比让后端在反序列化上炸、
+    // 顶个"本机拒绝了这一稿"的标题（像在说模型编错了字段）诚实得多。
+    if (spec.parseError) {
+      setError({
+        title: "现有设计的 JSON 读不懂，这一稿根本没发给模型",
+        detail: `${spec.parseError}\n\n要么修好它，要么点「清空」后从零起草。`,
+      });
+      msgApi.warning("规格 JSON 不合法，先修好或清空");
+      return;
+    }
+    // 上一版设计 = 编辑器里这一份：AI 起草的、手搓的、从报表簿打开的都能当底稿。
+    // 只有 datasets 和 view 都在才带——后端要的是整份 ReportDraft，塞半截只会让命令
+    // 在解不开参数时炸，看着像模型的锅。
+    const remembered =
+      priorRef.current && priorRef.current.specText === specText ? priorRef.current.question : "";
+    // 同一句需求再点一次 = 重来一次，不该把上一版喂回去让模型"改"自己
+    const sameAsk = remembered.trim() !== "" && remembered.trim() === question.trim();
+    const prior: PriorReport | null =
+      spec.view && spec.datasets && !sameAsk
+        ? { question: remembered, draft: { datasets: spec.datasets, view: spec.view } }
+        : null;
     const id = ++runId.current;
     setDrafting(true);
     setError(null);
@@ -353,15 +400,33 @@ export function ReportWorkbench({
             .join("、")}`
         );
       }
-      const d = await aiReportDraft(question, ready, aiConfig);
+      const d = await aiReportDraft(question, ready, aiConfig, undefined, prior);
       if (id !== runId.current) return;
-      applyDraft(d);
+      applyDraft(d, question.trim());
+      // 说清楚这一稿是在现有设计上改的还是整份重来：起草会覆盖编辑器里的规格，
+      // 用户以为"加一个组件"却丢了手搓的 JSON，是最贵的一种不说
+      const asked = prior?.question.trim() || "";
+      // 报表簿里存的需求可以很长，截断要让人看出来是被截了，不是需求本来就这么说
+      const brief = asked.length > 18 ? `${asked.slice(0, 18)}…` : asked;
+      const base = prior
+        ? brief
+          ? `在上一版（${brief}）的设计上改`
+          : "在现有设计上改"
+        : sameAsk
+          ? "同一句需求，不带上一版整份重写"
+          : "现有设计没带上，这一稿是从零起草的";
       msgApi.success(
-        d.repairs > 0 ? `已生成，本机校验打回 ${d.repairs} 次后通过` : "已生成并通过本机校验"
+        `${base}；${d.repairs > 0 ? `本机校验打回 ${d.repairs} 次后通过` : "已通过本机校验"}`
       );
     } catch (e) {
       if (id !== runId.current) return;
-      setError({ title: "本机拒绝了这一稿", detail: String(e) });
+      setError({
+        title: "本机拒绝了这一稿",
+        // 带着上一版设计时，后端也可能是在解这份设计时就拒了，不全是模型编错字段
+        detail: prior
+          ? `${e}\n\n（这一稿是拿编辑器里现有设计当底稿改的；反复卡在同一处就清空后从零起草）`
+          : String(e),
+      });
       msgApi.error("生成失败");
     } finally {
       if (id === runId.current) setDrafting(false);
@@ -437,7 +502,11 @@ export function ReportWorkbench({
         map[s.connection_id] ? { ...s, connection_id: map[s.connection_id] } : s
       ),
     }));
-    setSpecText(JSON.stringify({ datasets, view: spec.view }, null, 2));
+    const text = JSON.stringify({ datasets, view: spec.view }, null, 2);
+    setSpecText(text);
+    // 改绑只是把 connection_id 换了个名，这份设计当初要答的问题没变：
+    // 跟着新文本走，否则下一次追问会说"现有设计没有对应需求"
+    if (priorRef.current) priorRef.current = { ...priorRef.current, specText: text };
     const reload: string[] = [];
     const next = [
       ...new Set(
@@ -547,6 +616,9 @@ export function ReportWorkbench({
     ];
     setSpecText(text);
     setSavedSpecText(text);
+    // 存进去的那句需求就是这份设计的来处：接着追问（"再把退款单算进去"）
+    // 应该在这条报表上改，而不是从零重写一张
+    priorRef.current = { question: r.question || "", specText: text };
     setQuestion(r.question || "");
     setPicked(keys);
     setDraft(null);
@@ -858,22 +930,19 @@ export function ReportWorkbench({
               {openId ? (dirty ? "更新报表（改过）" : "已存入报表") : "存入报表簿"}
             </Button>
           </Tooltip>
-          {payload && (
-            <Button
-              icon={<ReloadOutlined />}
-              onClick={() => {
-                setPayload(null);
-                setDraft(null);
-                setSpecText("");
-                setQuestion("");
-                setOpenId("");
-                setOpenName("");
-                setSavedSpecText("");
-                runId.current += 1;
-              }}
+          {(Boolean(payload) || Boolean(specText.trim())) && (
+            // 手搓过一份坏 JSON 的人，需要一条"从零开始"的退路；
+            // 这一步丢掉的是可能没存过的规格，所以给一次确认而不是裸点。
+            <Popconfirm
+              title="清空工作台？"
+              description="当前这份规格会被丢掉。存进过报表簿的能重新打开，没存过的找不回来。"
+              okText="清空"
+              cancelText="取消"
+              okButtonProps={{ danger: true }}
+              onConfirm={resetWorkbench}
             >
-              清空
-            </Button>
+              <Button icon={<ClearOutlined />}>清空</Button>
+            </Popconfirm>
           )}
           {payload && <Tag color="blue">{payload.elapsed_ms} ms</Tag>}
         </Space>

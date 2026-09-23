@@ -12,6 +12,7 @@ import type {
   DatasetSpec,
   DraftResult,
   PriorDraft,
+  PriorReport,
   SavedReport,
   SqlDraft,
   SqlPreview,
@@ -48,13 +49,17 @@ export interface TableSummary {
 /** 数据集 id → (源别名 → 列清单)，回填后可跳过探列直接校验 */
 export type SchemaStore = Record<string, Record<string, string[]>>;
 
+/** 自然语言 → 一整张报表的规格。
+ *  prior 是上一版设计：追问式改稿时把工作台上当前的 spec 带回去，后端会在提示词里
+ *  请模型在它基础上改，改出来的设计过的还是同一套本机校验（旧稿里的编造字段照样会被拦下）。 */
 export const aiReportDraft = (
   question: string,
   catalog: CatalogTable[],
   config: AIConfig,
-  maxRepairs?: number
+  maxRepairs?: number,
+  prior?: PriorReport | null
 ): Promise<DraftResult> =>
-  invoke<DraftResult>("ai_report_draft", { question, catalog, config, maxRepairs });
+  invoke<DraftResult>("ai_report_draft", { question, catalog, config, maxRepairs, prior: prior ?? null });
 
 /** 自然语言 → 一条 SQL。表与列由本机目录限定，编出来的字段会被后端打回。
  *  prior 是上一稿：追问式改稿时带上，后端会在提示词里请模型在旧稿上改，

@@ -1118,7 +1118,7 @@ mod tests {
             },
         ];
         // 提示词里带类型，本机校验比对的仍只是列名
-        assert!(ai::prompt("各城市成交额", &catalog, None).contains("amount REAL"));
+        assert!(ai::prompt("各城市成交额", &catalog, None, None).contains("amount REAL"));
         let raw = r#"好的，这是你要的看板：
         ```json
         {"datasets":[{"id":"city-gmv","name":"城市成交额","base":"o",

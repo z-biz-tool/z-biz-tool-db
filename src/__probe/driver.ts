@@ -67,6 +67,28 @@ export function installDriver() {
      *  列数为 0 就是 T-067 堵掉的那个洞；带类型的列数为 0 说明类型没送到模型眼前。 */
     catalogSent: (from: number) => sentOf("ai_report_draft", from),
     genCatalogSent: (from: number) => sentOf("ai_sql_generate", from),
+    /** 从某个下标起，起草有没有带上上一版设计：'当时需求||数据集数/组件数'；
+     *  'null' = 前端判定不该带，'undefined' = 前端根本没往 wire 上放这个参数。 */
+    draftPriorSent: (from: number) =>
+      (w.__PROBE_CALLS as any[])
+        .slice(from)
+        .filter((c: any) => c.cmd === "ai_report_draft")
+        .map((c: any) => {
+          const p = c.args.prior;
+          if (p == null) return String(p);
+          const d = p.draft || {};
+          return `${p.question}||${(d.datasets || []).length}/${((d.view || {}).widgets || []).length}`;
+        }),
+    /** 写规格 JSON 编辑器（手搓/写坏都走这条）。按 placeholder 认栏，别按内容认：
+     *  写坏之后内容里就没有 connection_id 了。 */
+    setSpec: async (text: string) => {
+      const ta = document.querySelector('textarea[placeholder*="手工编辑"]') as HTMLTextAreaElement | null;
+      if (!ta) throw new Error("没有规格 JSON 编辑器（先切到「规格 JSON」页签）");
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+      setter.call(ta, text);
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+      await sleep(80);
+    },
     /** 从某个下标起，每次生成有没有带上上一稿：'当时需求||旧语句'，没带是 'null'，
      *  连键都没有则是 'undefined'（说明前端根本没往 wire 上放这个参数）。 */
     genPriorSent: (from: number) =>
