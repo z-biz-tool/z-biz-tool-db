@@ -1,102 +1,41 @@
-# Agent 集成指南
+# Agent 对话接缝说明
 
-## 概述
+## 一句话
 
-`z-biz-tool-db` 现在可以使用 `z-biz-tool-shared` 中的共享 Agent 组件。
+Agent 不是一条后端命令，也不是一场"本地微服务"。它是前端的一对组件 + 宿主应用登记的
+处理函数；真正干活的是 `ai_*` 那几条走 HTTP 到大模型的命令。
 
-## 集成步骤
+## 组成
 
-### 1. 安装依赖
+- `src/agent/types.ts`：`AgentIntent`（只有 `query` / `diagnose`）、`AgentMessage`、`AgentResponse`。
+- `src/agent/AgentManager.ts`：zustand store，只存 `messages` / `busy` / `handler`。
+  `ask()` 原样回显用户这一轮，然后调用 handler；没登记 handler 就明确回"没有可用的后端实现"，
+  不编造回答。
+- `src/agent/AgentPanel.tsx`：纯展示 + 输入。它不认识任何 Tauri 命令名。
+- `src/App.tsx`：宿主。`useEffect` 里 `setHandler(askAgent)` 登记一个稳定转发（内部读
+  `agentAskRef.current`，因为 `agentAsk` 每次渲染都是新闭包，要读当前编辑器内容和勾选的表）。
 
-```bash
-cd z-biz-tool-db
-npm install z-biz-tool-shared
-```
+## 两条意图实际走哪里
 
-### 2. 在组件中使用 Agent
+| 意图 | 输入 | 落到 |
+|------|------|------|
+| `query` | 自然语言 + 本机现建的表目录（含真实列清单） | `ai_sql_generate`，产出先过本机列校验，最多带打回次数 |
+| `diagnose` | 报错文本 + 编辑器里那条 SQL | `ai_diagnose_error` |
 
-```tsx
-import { AgentPanel } from 'z-biz-tool-shared';
-import { useAgentStore } from 'z-biz-tool-shared';
+`query` 用的表目录由 `App.tsx` 的 `buildAiCatalog` 现建，和"生成 SQL"页共用同一个实现：
+读不到列清单的表直接丢进 `failed`，不带着空清单去问模型。
 
-// 在组件中使用 AgentPanel
-<AgentPanel />
+## 边界
 
-// 或者使用 AgentStore
-const { query, optimize, analyze, diagnoseError } = useAgentStore();
-```
+- Agent 不碰数据库执行句柄：它只产草稿。填进编辑器要点一下「填进编辑器」，执行由用户走常规授权。
+- 上下文只有一处真源：当前 `selectedConnection` + 勾选的表。store 里不再存 `config/context` 副本。
+- 未配置 AI 参数时直接弹配置窗口并说明原因，不发请求。
 
-### 3. 配置 Agent
+## 历史：删掉了什么
 
-Agent 使用 Zustand 状态管理，可以在应用启动时配置：
-
-```tsx
-import { useAgentStore } from 'z-biz-tool-shared';
-
-// 配置 Agent
-useAgentStore.getState().setContext({
-  connectionId: 'db-1',
-  databaseType: 'mysql',
-  databaseName: 'testdb',
-  tables: [...],
-});
-```
-
-## 共享组件列表
-
-### Agent 模块 (`src/agent/`)
-
-- **AgentPanel** - 完整的 Agent 交互面板（消息列表 + 输入框）
-- **AgentManager** - Zustand 状态管理（query/optimize/analyze/diagnoseError）
-- **QueryHistoryViewer** - 查询历史查看器
-- **SQLEditor** - 带语法高亮的 SQL 编辑器
-
-## 与 Rust Agent 的区别
-
-| 特性 | Rust Agent (已移除) | Shared Agent (新) |
-|------|-------------------|------------------|
-| 语言 | Rust | TypeScript/React |
-| 部署 | 本地微服务 | NPM 包 |
-| UI | 需要 Tauri | React 组件 |
-| 状态 | SQLite | Zustand |
-| 学习成本 | 需要 Rust 知识 | 标准 React |
-
-## 迁移指南
-
-### 旧代码 (Rust Agent)
-
-```tsx
-// 调用 Rust 后端的 Agent 命令
-const result = await invoke("agent_query_suggest", {
-  natural_language: "查询所有用户",
-  config: dbConfig,
-});
-```
-
-### 新代码 (Shared Agent)
-
-```tsx
-// 使用共享的 Agent 组件
-import { AgentPanel } from 'z-biz-tool-shared';
-
-// 直接在 UI 中使用
-<AgentPanel />
-
-// 或者使用状态管理
-const { query } = useAgentStore();
-const result = await query("查询所有用户");
-```
-
-## 优势
-
-1. ✅ **零配置** - 不需要启动额外的 Agent 服务
-2. ✅ **一体化** - UI 和逻辑都在同一个 React 应用中
-3. ✅ **易于调试** - 标准 React 开发流程
-4. ✅ **可复用** - 所有 z-biz-tool 项目共享
-
-## 下一步
-
-1. 安装 z-biz-tool-shared 依赖
-2. 替换现有的 AI 面板为 AgentPanel
-3. 移除 Rust 后端的 Agent 命令
-4. 清理相关依赖
+T-074 删除了这套死接口面——四条 `invoke("agent_*")` 命令（`agent_query_suggest` /
+`agent_sql_optimize` / `agent_results_analyze` / `agent_error_diagnose`）、`call_agent_service`
+（固定 POST 到本机 `http://localhost:8787`，而这个服务在本仓库里从来不存在），以及从未注册进
+`invoke_handler` 的 `src-tauri/src/agent_service.rs`（`agent_assist_v2` 恒返回
+`AGENT_SERVICE_UNAVAILABLE`）。它们在 `src/**` 里零调用者，却要接收带凭据的 `DBConfig`、
+还会为"取表清单"真去连库，是纯增加攻击面的僵尸路径。

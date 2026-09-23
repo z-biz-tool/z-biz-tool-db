@@ -14,8 +14,6 @@ mod db;
 mod security;
 #[path = "secrets.rs"]
 mod secrets;
-#[path = "agent_service.rs"]
-mod agent_service;
 #[path = "ai_sql.rs"]
 mod ai_sql;
 pub mod report;
@@ -964,129 +962,6 @@ async fn call_ai_service(config: &AIConfig, prompt: &str) -> Result<String, Stri
 }
 
 // AI 生成 SQL 在 ai_sql 模块：那里的提示词带真实列清单，产出还在本机校验。
-
-// ================== 本地 Agent 客户端 ==================
-
-// 调用本地 Agent
-async fn call_agent_service(endpoint: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::new();
-    
-    let response = client
-        .post(format!("http://localhost:8787{}", endpoint))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("Agent 请求失败: {}", e))?;
-    
-    if response.status().is_success() {
-        response.json().await.map_err(|e| format!("解析 Agent 响应失败: {}", e))
-    } else {
-        Err(format!("Agent 服务错误: {}", response.status()))
-    }
-}
-
-// Agent: 查询建议（自然语言 → SQL）
-#[command]
-async fn agent_query_suggest(natural_language: String, config: DBConfig) -> Result<String, String> {
-    // 获取表结构
-    let tables = get_tables(config.clone()).await?;
-    
-    let body = serde_json::json!({
-        "natural_language": natural_language,
-        "context": {
-            "connection_id": config.id,
-            "database_type": config.db_type,
-            "database_name": config.database,
-            "tables": tables.iter().map(|t| {
-                serde_json::json!({
-                    "name": t.name,
-                    "row_estimate": t.row_estimate,
-                    "size_bytes": t.size_bytes
-                })
-            }).collect::<Vec<_>>()
-        }
-    });
-    
-    let result = call_agent_service("/query/suggest", body).await?;
-    
-    result.get("sql")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "Agent 响应格式错误".to_string())
-}
-
-// Agent: SQL 优化
-#[command]
-async fn agent_sql_optimize(sql: String, config: DBConfig) -> Result<String, String> {
-    let body = serde_json::json!({
-        "sql": sql,
-        "context": {
-            "connection_id": config.id,
-            "database_type": config.db_type,
-            "database_name": config.database,
-        }
-    });
-    
-    let result = call_agent_service("/sql/optimize", body).await?;
-    
-    result.get("optimized")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "Agent 未返回优化结果".to_string())
-}
-
-// Agent: 结果分析
-// S0 封堵：禁止执行新 SQL；要求前端传入已存在的结果数据，
-// 否则直接返回「功能暂不可用」错误，不发起任何数据库查询（DB-04）。
-#[command]
-async fn agent_results_analyze(
-    sql: String,
-    config: DBConfig,
-    results: Option<Vec<serde_json::Value>>,
-) -> Result<String, String> {
-    // 静默拒绝隐式重执行——必须显式提供 result_data
-    let data = results.ok_or_else(|| {
-        "Agent 结果分析功能暂不可用：未提供结果数据，服务不会自动重新执行 SQL".to_string()
-    })?;
-    let body = serde_json::json!({
-        "sql": sql,
-        "results": data,
-        "context": {
-            "connection_id": config.id,
-            "database_type": config.db_type,
-            "database_name": config.database,
-        }
-    });
-
-    let result = call_agent_service("/results/analyze", body).await?;
-
-    result.get("analysis")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "Agent 未返回分析结果".to_string())
-}
-
-// Agent: 错误诊断
-#[command]
-async fn agent_error_diagnose(error: String, sql: String, config: DBConfig) -> Result<String, String> {
-    let body = serde_json::json!({
-        "error": error,
-        "sql": sql,
-        "context": {
-            "connection_id": config.id,
-            "database_type": config.db_type,
-            "database_name": config.database,
-        }
-    });
-    
-    let result = call_agent_service("/error/diagnose", body).await?;
-    
-    result.get("diagnosis")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "Agent 未返回诊断结果".to_string())
-}
 
 // AI 解释查询结果
 #[command]
@@ -2417,10 +2292,6 @@ pub fn run() {
             ai_optimize_sql,
             ai_explain_sql,
             ai_diagnose_error,
-            agent_query_suggest,
-            agent_sql_optimize,
-            agent_results_analyze,
-            agent_error_diagnose,
             close_pool,
             csv_preview,
             csv_import_execute,
