@@ -61,6 +61,7 @@ import type {
   BriefDataset,
   DatasetSpec,
   DraftReject,
+  ChainOutcome,
   DraftResult,
   PickReject,
   PickResult,
@@ -169,7 +170,7 @@ export function ReportWorkbench({
   /** 从 SQL 助手那条腿撞进跨库死路时，把用户那句需求带过来（seq 变一次算一次交接，
    *  同一句连着点两次也要生效）：没有它就得用户自己把那句话再抄一遍。
    *  run = 带过来之后直接把链条跑完（挑表→起草→取数出图）；用户在 SQL 腿那边点的就是"出图"。 */
-  seed?: { q: string; seq: number; run?: boolean } | null;
+  seed?: { q: string; seq: number; run?: boolean; done?: (o: ChainOutcome) => void } | null;
 }) {
   const [msgApi, msgHolder] = message.useMessage();
   const [connState, setConnState] = useState<Record<string, ConnState>>({});
@@ -189,7 +190,10 @@ export function ReportWorkbench({
   // 需求交接：只认 seq 变化，不看文本是否不同（同句重过来也要落进这一栏）
   const seedSeq = useRef(0);
   // 等表清单落地再跑的链条那一轮
-  const [pendingChain, setPendingChain] = useState<{ q: string } | null>(null);
+  const [pendingChain, setPendingChain] = useState<{
+    q: string;
+    onDone?: (o: ChainOutcome) => void;
+  } | null>(null);
   useEffect(() => {
     if (!seed || seedSeq.current === seed.seq) return;
     seedSeq.current = seed.seq;
@@ -200,7 +204,7 @@ export function ReportWorkbench({
       // 刚切过来时报表工作台才挂载，各连接的表清单还在读：这时直接跑会被
       // "一张表都没读到"挡回原地（探针实测过），所以先记下这一轮，等清单落地再跑
       msgApi.info("需求已从 AI 助手带过来，接着跨库挑表并出图");
-      setPendingChain({ q: asked });
+      setPendingChain({ q: asked, onDone: seed.done });
     } else {
       msgApi.info("需求已从 AI 助手带过来，接着挑表或起草就行");
     }
@@ -501,13 +505,14 @@ export function ReportWorkbench({
   useEffect(() => {
     if (!pendingChain) return;
     if (tableCandidates.candidates.length) {
-      const q = pendingChain.q;
+      const { q, onDone } = pendingChain;
       setPendingChain(null);
       // 需求是刚 setQuestion 的，这一轮闭包里的 question 还可能是空的：话显式交下去
-      void onPickTables(undefined, { thenDraft: true, question: q });
+      void onPickTables(undefined, { thenDraft: true, question: q, onDone });
       return;
     }
     const t = setTimeout(() => {
+      pendingChain.onDone?.("没开始");
       setPendingChain(null);
       msgApi.warning(
         `等了一会儿，各连接的表清单还是没读到，没开始挑表：${
@@ -532,7 +537,7 @@ export function ReportWorkbench({
    *  fix 是「照这条错误再挑一次」：错误原文连同被挡下的那份答案一起回喂——模型是单发的。 */
   const onPickTables = async (
     fix?: { error: string; answer?: string },
-    opts?: { thenDraft?: boolean; question?: string }
+    opts?: { thenDraft?: boolean; question?: string; onDone?: (o: ChainOutcome) => void }
   ): Promise<boolean> => {
     const asked = (opts?.question ?? question).trim();
     if (!asked) {
@@ -600,7 +605,11 @@ export function ReportWorkbench({
         const d = lastDraftRef.current;
         // 按钮写的是"再出图"就得真出图：起草成了就接着取数渲染。
         // 认引用变化而不是读 draft state——那是 await 之前的快照。
-        if (d && d !== beforeDraft) await runRender(d.view, d.datasets);
+        if (!d || d === beforeDraft) opts?.onDone?.("起草被挡下");
+        else if (await runRender(d.view, d.datasets)) opts?.onDone?.("已出图");
+        else opts?.onDone?.("取数没成功");
+      } else {
+        opts?.onDone?.("只挑了表");
       }
       return true;
     } catch (e) {
@@ -608,6 +617,7 @@ export function ReportWorkbench({
       const rej = asPickReject(e);
       setPickError({ error: rej.error, answer: rej.answer || undefined });
       msgApi.error(rej.answer ? "挑表没过本机核对，可以照这条错误再挑一次" : "挑表失败");
+      opts?.onDone?.("挑表被挡下");
       return false;
     } finally {
       if (id === pickRun.current) setPicking(false);
@@ -795,7 +805,7 @@ export function ReportWorkbench({
   );
 
   /** 抽出来是为了"打开报表即取数"：那时 specText 的 state 还没落地，不能走 onRender */
-  const runRender = async (view: ViewSpec, datasets: DatasetSpec[]) => {
+  const runRender = async (view: ViewSpec, datasets: DatasetSpec[]): Promise<boolean> => {
     // 取数前先挡一遍缺连接：后端那句"源 o 引用的连接 … 不在本会话已解锁的连接里"
     // 只点得到别名 o，点不到是哪张表、哪个数据集，而且这一挡省掉一次注定失败的 IPC 往返。
     const missNow = findMissingConns(datasets, aliveConnIds);
@@ -805,28 +815,31 @@ export function ReportWorkbench({
         detail: `${describeMissing(missNow)}\n\n规格已载入，未下推任何 SQL。用下面的入口把它改绑到一条现有连接，或先按原名重建连接。`,
       });
       msgApi.warning("缺少连接，已载入规格但未取数");
-      return;
+      return false;
     }
     const id = ++runId.current;
     setRendering(true);
     setError(null);
     try {
       const p = await reportViewRender(view, datasets, configs);
-      if (id !== runId.current) return;
+      if (id !== runId.current) return false;
       setPayload(p);
       // 有数据集没取到数就不报绿：这块板现在是"缺了几张图"的状态，
       // 一条"2 个组件 · 31 ms"的绿色提示会让人以为图本来就只该有这两张。
       if (p.failed.length > 0) {
         const lost = p.failed.reduce((n, f) => n + f.widgets.length, 0);
         msgApi.warning(`已出 ${p.charts.length} 个组件，${p.failed.length} 个数据集没取到数（${lost} 个组件没画）`);
-      } else {
-        msgApi.success(`${p.charts.length} 个组件 · ${p.elapsed_ms} ms`);
+        // 缺图的板子不算成功：链条要把这件事原样告诉用户
+        return false;
       }
+      msgApi.success(`${p.charts.length} 个组件 · ${p.elapsed_ms} ms`);
+      return true;
     } catch (e) {
-      if (id !== runId.current) return;
+      if (id !== runId.current) return false;
       // 这一段是真的下了 SQL 到库上，拒因多半来自数据库而不是语义层，标题别说反
       setError({ title: "取数失败", detail: String(e) });
       msgApi.error("渲染失败");
+      return false;
     } finally {
       if (id === runId.current) setRendering(false);
     }

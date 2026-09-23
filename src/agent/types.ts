@@ -1,9 +1,10 @@
 // Agent 类型定义
-/** 对话意图。只收"用户这句本身就是输入"的两种：
- *  query = 自然语言 → SQL，diagnose = 报错原文 → 原因与改法。
+/** 对话意图。只收"用户这句本身就是输入"的三种：
+ *  query = 自然语言 → SQL，diagnose = 报错原文 → 原因与改法，
+ *  report = 自然语言 → 一张跨库报表（链子在报表工作台那边跑：挑表→起草→取数→出图）。
  *  解释/优化/分析结果那三条的输入是编辑器里的 SQL 与结果集，
  *  放在 AI 助手弹窗的按钮上更合适，进对话栏只会让用户以为打字有用。 */
-export type AgentIntent = 'query' | 'diagnose';
+export type AgentIntent = 'query' | 'diagnose' | 'report';
 
 /** 本机挡下的表其实躺在别的连接里：面板据此给出「拿去 AI 报表出图」，
  *  question 是当初那句话，交接过去不用用户再抄一遍。 */

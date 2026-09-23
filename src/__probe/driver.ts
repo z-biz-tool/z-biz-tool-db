@@ -299,9 +299,8 @@ export function installDriver() {
      *  自然语言描述、规格 JSON 都是），抓第一个会填到别处去还不报错。 */
     chatBox: () => {
       const tas = Array.from(document.querySelectorAll("textarea")) as HTMLTextAreaElement[];
-      const ta = tas.find(
-        (t) => (t.placeholder || "").includes("想要查什么") || (t.placeholder || "").includes("报错原文")
-      );
+      const want = ["想要查什么", "报错原文", "想要一张什么图"];
+      const ta = tas.find((t) => want.some((w) => (t.placeholder || "").includes(w)));
       if (!ta) throw new Error(`没有 Agent 输入框（placeholder 有：${tas.map((x) => x.placeholder).join(" | ")}）`);
       return ta;
     },

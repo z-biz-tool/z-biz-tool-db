@@ -74,7 +74,7 @@ import { ReportWorkbench } from "./report/ReportWorkbench";
 import { aiSqlGenerate, catalogColumns, listTables, reportDescribeColumns } from "./report/api";
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
 import type { BackendConfig, TableSummary } from "./report/api";
-import type { CatalogTable, SqlDraft, SqlReject } from "./report/types";
+import type { CatalogTable, ChainOutcome, SqlDraft, SqlReject } from "./report/types";
 import type { AgentAskContext, AgentIntent, AgentResponse } from "./agent/types";
 
 // 渐变色主题常量
@@ -384,9 +384,9 @@ function App() {
   // 也不是一开始就挂——没去过就别白刷一遍各连接的表清单。
   const [reportSeen, setReportSeen] = useState(false);
   // 从 SQL 那条腿撞进跨库死路时，那句需求要跟着人一起过去（seq 变一次算一次交接）
-  const [reportSeed, setReportSeed] = useState<{ q: string; seq: number; run?: boolean } | null>(
-    null
-  );
+  const [reportSeed, setReportSeed] = useState<
+    { q: string; seq: number; run?: boolean; done?: (o: ChainOutcome) => void } | null
+  >(null);
   const reportSeedSeq = useRef(0);
 
   // T-045 写入审批状态
@@ -951,6 +951,29 @@ function App() {
         error: "先配置 AI 服务地址、密钥与模型（配置窗口已打开）",
       };
     }
+    if (intent === "report") {
+      // 出图这条链跑在报表工作台那边，结果要由它自己回话：
+      // 气泡不能替它宣布成功——挑表、起草、取数每一步都可能被本机挡下
+      const outcome = await new Promise<string>((resolve) => {
+        let settled = false;
+        const fin = (o: string) => {
+          if (settled) return;
+          settled = true;
+          resolve(o);
+        };
+        // 不换走模式：问数的人要留在对话框里看这一轮的结果，工作台挂在背后跑
+        goReport(text, true, fin, false);
+        // 三个模型往返加一次取数，慢的时候真能过半分钟；等不到就说等不到
+        setTimeout(() => fin("还没跑完"), 40000);
+      });
+      return {
+        success: true,
+        content:
+          outcome === "已出图"
+            ? "已按这句需求出图：跨库挑表 → 起草 → 过本机校验 → 取数渲染。切到顶栏「AI 报表」就是这张板，上面还能点「让 AI 讲清这张图」问口径。"
+            : "这次没出图：" + outcome + "。进度、原因和重试入口都在 AI 报表页。",
+      };
+    }
     if (!selectedConnection) {
       return { success: false, content: "", error: "先在左侧连上数据库：模型只能查已连上的那个库" };
     }
@@ -1050,11 +1073,18 @@ function App() {
 
   /** 把用户送到报表工作台，并把他刚那句需求带过去：
    *  一条 SQL 只能进一个库，跨库要在那边按各库取数、本机内存 join。 */
-  const goReport = (q?: string, run = false) => {
+  /** 把人送到报表工作台（switchMode=false 就只把工作台挂在背后，人留在对话框里），
+   *  run=true 时那一轮跑完由 done 回话——气泡不能替链子宣布成功。 */
+  const goReport = (
+    q?: string,
+    run = false,
+    done?: (o: ChainOutcome) => void,
+    switchMode = true
+  ) => {
     setReportSeen(true);
-    setMode("report");
+    if (switchMode) setMode("report");
     const body = (q || "").trim();
-    if (body) setReportSeed({ q: body, seq: ++reportSeedSeq.current, run });
+    if (body) setReportSeed({ q: body, seq: ++reportSeedSeq.current, run, done });
   };
 
   // 打开 AI 助手：三条 SQL 输入默认用编辑器当前内容，手抄一遍没有意义

@@ -28,6 +28,7 @@ const { Text } = Typography;
 const INTENT_PLACEHOLDER: Record<AgentIntent, string> = {
   query: '想要查什么？例如：按城市统计已支付订单金额（模型只能在已勾选的表的真实字段里挑）',
   diagnose: '把报错原文贴进来，SQL 用编辑器里当前那段',
+  report: '想要一张什么图？例如：按城市和渠道看成交额（各库分别取数，在本机内存里 join）',
 };
 
 /** 失败现场里的 SQL / 报错原文：等宽、能滚、不许把面板撑破 */
@@ -144,6 +145,7 @@ export function AgentPanel({ hint, onUseSql, onClear, onGoReport }: AgentPanelPr
         options={[
           { label: '生成 SQL', value: 'query' },
           { label: '诊断报错', value: 'diagnose' },
+          { label: '出张报表', value: 'report' },
         ]}
       />
       {hint && (
