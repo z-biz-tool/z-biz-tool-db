@@ -158,10 +158,14 @@ export function ReportWorkbench({
   configs,
   aiConfig,
   onOpenAiSettings,
+  seed,
 }: {
   configs: BackendConfig[];
   aiConfig: AIConfig;
   onOpenAiSettings: () => void;
+  /** 从 SQL 助手那条腿撞进跨库死路时，把用户那句需求带过来（seq 变一次算一次交接，
+   *  同一句连着点两次也要生效）：没有它就得用户自己把那句话再抄一遍。 */
+  seed?: { q: string; seq: number } | null;
 }) {
   const [msgApi, msgHolder] = message.useMessage();
   const [connState, setConnState] = useState<Record<string, ConnState>>({});
@@ -177,6 +181,15 @@ export function ReportWorkbench({
   // 错误卡上「加进目录并重问」正在处理的那张表（按钮的 loading 只挂它自己那一个）
   const [addingTable, setAddingTable] = useState("");
   const [question, setQuestion] = useState("");
+  // 需求交接：只认 seq 变化，不看文本是否不同（同句重过来也要落进这一栏）
+  const seedSeq = useRef(0);
+  useEffect(() => {
+    if (!seed || seedSeq.current === seed.seq) return;
+    seedSeq.current = seed.seq;
+    if (!seed.q.trim()) return;
+    setQuestion(seed.q.trim());
+    msgApi.info("需求已从 AI 助手带过来，接着挑表或起草就行");
+  }, [seed, msgApi]);
   const [draft, setDraft] = useState<DraftResult | null>(null);
   const [specText, setSpecText] = useState("");
   const [payload, setPayload] = useState<ViewPayload | null>(null);

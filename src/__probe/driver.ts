@@ -395,6 +395,33 @@ export function installDriver() {
       );
       return `${(box.textContent || "").trim().replace(/\s+/g, " ")}||${btn ? "有入口" : "没有入口"}`;
     },
+    /** 点顶栏那条 mode Segmented（SQL 查询 / AI 报表）。报表腿与 SQL 腿各自都有 Segmented，
+     *  所以只挑带这两项文字的那一条。 */
+    switchMode: async (label: string) => {
+      const segs = Array.from(document.querySelectorAll(".ant-segmented"));
+      const seg = segs.find((x) => (x.textContent || "").includes("AI 报表"));
+      if (!seg) throw new Error("顶栏没有 mode 切换");
+      const it = Array.from(seg.querySelectorAll(".ant-segmented-item")).find(
+        (x) => (x.textContent || "").trim() === label
+      );
+      if (!it) throw new Error(`mode 切换里没有这一项：${label}`);
+      w.__PROBE_CLICK(it.querySelector(".ant-segmented-item-label") || it);
+      await w.__probe.sleep(400);
+    },
+    /** 报表工作台的需求栏（按 placeholder 认，页面上 textarea 不止一个） */
+    reportQuestionBox: () =>
+      (document.querySelector('textarea[placeholder*="例：按城市"]') as HTMLTextAreaElement | null),
+    reportQuestion: () => {
+      const ta = w.__probe.reportQuestionBox();
+      return ta ? ta.value : null;
+    },
+    setReportQuestion: (text: string) => {
+      const ta = w.__probe.reportQuestionBox();
+      if (!ta) throw new Error("报表工作台的需求栏不在 DOM 里（先切到 AI 报表）");
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+      setter.call(ta, text);
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+    },
     /** 页面上各处 Segmented 当前选中的哪一项（顶栏那条是 SQL 查询/AI 报表）。
      *  按 -selected 这个 class 认不靠得住：切换之后两个项上都没有它，
      *  而原生 radio 的 checked 才是"当前是哪一项"的真凭据。 */

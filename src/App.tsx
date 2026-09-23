@@ -365,6 +365,13 @@ function App() {
 
   // 工作模式：SQL 查询 / AI 报表工作台
   const [mode, setMode] = useState<"sql" | "report">("sql");
+  // 报表工作台去过一次就留着：以前 mode 一换回 SQL 查询，整块被条件渲染拆掉，
+  // 刚挑好的表、起草的草稿、规格 JSON 全跟着没了，用户只能从头再来。
+  // 也不是一开始就挂——没去过就别白刷一遍各连接的表清单。
+  const [reportSeen, setReportSeen] = useState(false);
+  // 从 SQL 那条腿撞进跨库死路时，那句需求要跟着人一起过去（seq 变一次算一次交接）
+  const [reportSeed, setReportSeed] = useState<{ q: string; seq: number } | null>(null);
+  const reportSeedSeq = useRef(0);
 
   // T-045 写入审批状态
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
@@ -986,6 +993,15 @@ function App() {
     return () => useAgentStore.getState().setHandler(null);
   }, [askAgent]);
 
+  /** 把用户送到报表工作台，并把他刚那句需求带过去：
+   *  一条 SQL 只能进一个库，跨库要在那边按各库取数、本机内存 join。 */
+  const goReport = (q?: string) => {
+    setReportSeen(true);
+    setMode("report");
+    const body = (q || "").trim();
+    if (body) setReportSeed({ q: body, seq: ++reportSeedSeq.current });
+  };
+
   // 打开 AI 助手：三条 SQL 输入默认用编辑器当前内容，手抄一遍没有意义
   const openAiAssistant = () => {
     const cur = sqlCode.trim();
@@ -1479,7 +1495,11 @@ function App() {
             <Space>
               <Segmented
                 value={mode}
-                onChange={(v) => setMode(v as "sql" | "report")}
+                onChange={(v) => {
+                  const next = v as "sql" | "report";
+                  setMode(next);
+                  if (next === "report") setReportSeen(true);
+                }}
                 options={[
                   { label: "SQL 查询", value: "sql", icon: <CodeOutlined /> },
                   { label: "AI 报表", value: "report", icon: <DashboardOutlined /> },
@@ -1517,15 +1537,23 @@ function App() {
             </Space>
           </Header>
           <Content style={{ display: "flex", flexDirection: "column" }}>
-            {mode === "report" ? (
-              <div style={{ flex: 1, minHeight: 0 }}>
+            {reportSeen && (
+              <div
+                style={{
+                  flex: 1,
+                  minHeight: 0,
+                  display: mode === "report" ? "block" : "none",
+                }}
+              >
                 <ReportWorkbench
                   configs={backendConfigs}
                   aiConfig={aiConfigForReport}
                   onOpenAiSettings={() => setShowAiConfigModal(true)}
+                  seed={reportSeed}
                 />
               </div>
-            ) : isConnected ? (
+            )}
+            {mode === "report" ? null : isConnected ? (
               <>
                 {/* 多标签页 */}
                 <div
@@ -2336,7 +2364,7 @@ function App() {
                                     style={{ marginTop: 6 }}
                                     onClick={() => {
                                       setShowAiResultModal(false);
-                                      setMode("report");
+                                      goReport(aiNaturalLanguage);
                                     }}
                                   >
                                     去 AI 报表跨库出图
