@@ -15,6 +15,7 @@ import {
   Segmented,
   Space,
   Spin,
+  Tooltip,
   Typography,
 } from 'antd';
 import { RobotOutlined, SendOutlined } from '@ant-design/icons';
@@ -208,6 +209,26 @@ export function AgentPanel({ hint, onUseSql, onClear }: AgentPanelProps) {
                   >
                     填进编辑器
                   </Button>
+                )}
+
+                {/* 本机挡下的一稿：拒因点名了哪一列，可模型是单发的——重新问一遍等于
+                    让它从零编。这一键把拒因和被拒的那条 SQL 一起交回去。 */}
+                {msg.fix && (
+                  <Tooltip title="把这条拒因和被挡下的那条 SQL 一起回喂给模型，改完仍过同一套本机校验">
+                    <Button
+                      size="small"
+                      danger
+                      style={{ marginTop: 8 }}
+                      disabled={busy}
+                      onClick={() => {
+                        const fx = msg.fix;
+                        // 固定按 query 意图重问：改稿单只可能来自 SQL 生成那条腿
+                        if (fx) void ask("query", fx.question, { fix: fx });
+                      }}
+                    >
+                      让 AI 照这条错误改
+                    </Button>
+                  </Tooltip>
                 )}
 
                 <Text type="secondary" style={{ fontSize: '12px', marginTop: 4 }}>

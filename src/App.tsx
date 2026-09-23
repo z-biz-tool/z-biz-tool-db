@@ -867,13 +867,15 @@ function App() {
           error: `这一稿根本没发给模型：列清单一张都没读到\n${failed.join("\n")}`,
         };
       }
-      const { draft, builtOn, droppedPrior } = await generateSql(text, catalog);
+      const { draft, builtOn, droppedPrior, fixed } = await generateSql(text, catalog, ctx?.fix);
       const lines = [
-        builtOn
-          ? `在上一稿（当时需求：${builtOn}）基础上改，没从零重写。`
-          : droppedPrior
-            ? "本次表目录和上一稿不同，这一稿是从零写的。"
-            : "",
+        fixed
+          ? "照本机拒因在被挡下的那条 SQL 上改，没从零重写。"
+          : builtOn
+            ? `在上一稿（当时需求：${builtOn}）基础上改，没从零重写。`
+            : droppedPrior
+              ? "本次表目录和上一稿不同，这一稿是从零写的。"
+              : "",
         `只用 ${catalog.length} 张表的真实字段生成，引用了 ${
           draft.tables.join("、") || "（没引用目录里的表）"
         }，方言 ${draft.dialect}。`,
@@ -887,13 +889,14 @@ function App() {
       // 后端把 HTTP 状态码与本机校验的拒因原样带回来，别只留一句"失败"。
       // 被拒时抛的是 SqlReject 对象，直接 String() 会打成 [object Object]。
       const rej = asSqlReject(e);
-      // 面板这条链还没有「照这条错误改」那一键，所以把被挡下的那条一起贴出来，
-      // 用户至少能看出模型刚写的是哪条、要改的是哪一处
+      // 有被挡下的那条才给改稿单：模型没给出 SQL 时（请求没发出去、回复里没 SQL）
+      // 两半缺一半，那一键只会让模型凭空重画
       const gone = rej.sql?.trim();
       return {
         success: false,
         content: "",
         error: gone ? `${rej.error}\n被挡下的那条是：\n${gone}` : rej.error,
+        fix: gone ? { question: text, error: rej.error, sql: gone } : undefined,
       };
     }
   };

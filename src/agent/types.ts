@@ -13,14 +13,26 @@ export interface AgentMessage {
   sql?: string;
   /** 带这个字段的 system 行是一次失败现场：面板据此给出「诊断这条报错」 */
   error?: string;
+  /** 带这个字段的 agent 气泡是一次被本机挡下的稿子：面板据此给出「照这条错误改」 */
+  fix?: SqlFixTicket;
   timestamp: number;
+}
+
+/** 一键改稿要带的两半：拒因 + 被拒的那条 SQL。
+ *  模型是单发的，下一轮看不见自己刚写的那条，缺任何一半都是在凭空重写。 */
+export interface SqlFixTicket {
+  question: string;
+  error: string;
+  sql: string;
 }
 
 /** 一轮提问能附带的最小上下文。
  *  sql = 这句话是从哪条语句的报错里来的。不传就按编辑器当前那段走——
- *  报错发生在用户改稿之前时，只有带着当时那条才能问对（T-075）。 */
+ *  报错发生在用户改稿之前时，只有带着当时那条才能问对（T-075）。
+ *  fix = 这一轮是「照着上一次的拒因改」，而不是重新问一遍。 */
 export interface AgentAskContext {
   sql?: string;
+  fix?: SqlFixTicket;
 }
 
 export interface AgentResponse {
@@ -28,4 +40,6 @@ export interface AgentResponse {
   content: string;
   sql?: string;
   error?: string;
+  /** 这一轮没过本机校验、且手上确有被拒的那条 SQL 时带回来 */
+  fix?: SqlFixTicket;
 }
