@@ -694,8 +694,14 @@ pub async fn chat(cfg: &AIConfig, prompt: &str) -> Result<String, String> {
         "temperature": 0,
         "stream": false,
     });
+    // 有人会把完整端点直接粘进设置里（…/v1/chat/completions），再拼一次就 404 了
+    let endpoint = if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{}/chat/completions", base)
+    };
     let response = client
-        .post(format!("{}/chat/completions", base))
+        .post(endpoint)
         .bearer_auth(&cfg.api_key)
         .json(&body)
         .send()
@@ -2142,6 +2148,155 @@ mod tests {
 
     fn cfg(base_url: &str, key: &str, model: &str) -> AIConfig {
         AIConfig { base_url: base_url.into(), api_key: key.into(), model: model.into() }
+    }
+
+    /// 一个只讲 HTTP/1.1 的假 OpenAI 端点：把 chat() 的真请求跑起来。
+    /// 以前这条链只用脚本化模型测过——URL 怎么拼、鉴权头有没有发出去、
+    /// 状态码是否带进错误文案、响应形状对不对，全都没被任何测试执行过。
+    mod fake_ai {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        pub struct FakeAi {
+            pub base_url: String,
+            /// 服务端收到的完整请求（含请求行、头、体），一条条对齐
+            pub seen: Arc<Mutex<Vec<String>>>,
+        }
+
+        /// 读完整请求（含请求体）才回响应：只读到头部就 write + close，
+        /// 客户端还在发体就会被 RST，reqwest 报"解不开响应体"——假端点自己要先把协议做对。
+        fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut byte = [0u8; 1];
+            let head_end = loop {
+                match stream.read(&mut byte) {
+                    Ok(0) => return if buf.is_empty() { None } else { Some(String::from_utf8_lossy(&buf).to_string()) },
+                    Ok(_) => {
+                        buf.push(byte[0]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break buf.len();
+                        }
+                    }
+                    Err(_) => return None,
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+            let want = head
+                .split("content-length:")
+                .nth(1)
+                .and_then(|rest| rest.split("\r\n").next())
+                .and_then(|n| n.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buf.len() < head_end + want {
+                match stream.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => buf.push(byte[0]),
+                    Err(_) => return None,
+                }
+            }
+            Some(String::from_utf8_lossy(&buf).to_string())
+        }
+
+        /// responses 一条对应一次请求；发完就停止 accept（测试进程退出时端口自然释放）
+        pub fn spawn(responses: Vec<String>) -> FakeAi {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("假 AI 服务要能监听");
+            let port = listener.local_addr().expect("假 AI 服务要有端口").port();
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            std::thread::spawn(move || {
+                for body in responses.into_iter() {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(_) => return,
+                    };
+                    let Some(req) = read_request(&mut stream) else { return };
+                    sink.lock().unwrap().push(req);
+                    let (status_line, payload) = body.split_once('\t').unwrap_or(("200 OK", ""));
+                    let head = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status_line,
+                        payload.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(payload.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+            FakeAi {
+                base_url: format!("http://127.0.0.1:{}/v1", port),
+                seen,
+            }
+        }
+    }
+
+    fn content_of(text: &str) -> String {
+        serde_json::json!({ "choices": [{ "message": { "content": text } }] }).to_string()
+    }
+
+    #[tokio::test]
+    async fn chat_really_posts_the_prompt_and_bearer_token() {
+        let ai = fake_ai::spawn(vec![("200 OK\t".to_string()) + &content_of("这是回答")]);
+        let cfg = cfg(&ai.base_url, "sk-test-key", "probe-model");
+        assert_eq!(chat(&cfg, "各城市成交额").await.unwrap(), "这是回答");
+        let seen = ai.seen.lock().unwrap();
+        let req = seen.first().expect("假服务端要收到一次请求");
+        assert!(req.starts_with("POST /v1/chat/completions HTTP/1.1"), "{}", req);
+        assert!(req.contains("Authorization: Bearer sk-test-key"), "{}", req);
+        assert!(req.contains("\"probe-model\""), "{}", req);
+        assert!(req.contains("各城市成交额"), "{}", req);
+    }
+
+    /// 设置里粘完整端点是最常见的一种写法，不能再拼一次
+    #[tokio::test]
+    async fn chat_accepts_a_full_endpoint_pasted_from_docs() {
+        let ai = fake_ai::spawn(vec![("200 OK\t".to_string()) + &content_of("ok")]);
+        let full = format!("{}/chat/completions", ai.base_url);
+        let cfg = cfg(&full, "k", "m");
+        assert_eq!(chat(&cfg, "hi").await.unwrap(), "ok");
+        let req = ai.seen.lock().unwrap()[0].clone();
+        assert!(req.starts_with("POST /v1/chat/completions HTTP/1.1"), "{}", req);
+        assert!(!req.contains("chat/completions/chat"), "路径被拼了两次：{}", req);
+    }
+
+    #[tokio::test]
+    async fn chat_error_carries_the_status_code_and_the_body() {
+        // 拒因里带状态码与上游原文：只说"请求失败"用户没法分清 401、429 还是模型名写错
+        let ai = fake_ai::spawn(vec![
+            "429 Too Many Slots\t{\"error\":\"rate limited: quota exhausted\"}".to_string(),
+        ]);
+        let e = chat(&cfg(&ai.base_url, "k", "m"), "hi").await.unwrap_err();
+        assert!(e.contains("429"), "{}", e);
+        assert!(e.contains("quota exhausted"), "{}", e);
+    }
+
+    #[tokio::test]
+    async fn chat_says_when_the_response_has_no_content() {
+        let ai = fake_ai::spawn(vec!["200 OK\t{\"choices\":[]}".to_string()]);
+        let e = chat(&cfg(&ai.base_url, "k", "m"), "hi").await.unwrap_err();
+        assert!(e.contains("choices"), "{}", e);
+    }
+
+    /// 真 HTTP 与真校验接起来：模型从网络那头回来，挑表结果照样要对着本机候选清单核对
+    #[tokio::test]
+    async fn pick_over_real_http_still_checks_names_against_the_catalog() {
+        let answer = r#"{"tables":[{"connection_id":"shop","table":"orders"},{"connection_id":"erp","table":"stock"}],"reason":"先看订单"}"#;
+        let ai = fake_ai::spawn(vec![
+            ("200 OK\t".to_string()) + &content_of(&format!("好的：\n```json\n{answer}\n```")),
+            ("200 OK\t".to_string()) + &content_of(r#"{"tables":[{"connection_id":"shop","table":"orders"}],"reason":"去掉编的那张"}"#),
+        ]);
+        let model = HttpModel::new(cfg(&ai.base_url, "k", "m")).unwrap();
+        let out = pick(&model, "各城市成交额", &candidates(), 2, None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.repairs, 1, "第一轮挑了真库里没有的表，改稿后才过");
+        assert_eq!(out.picked.len(), 1);
+        assert_eq!(out.picked[0].table, "orders");
+        let seen = ai.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        // 第二次的提示词里要带上拒因与那份答案（模型是单发的）
+        assert!(seen[1].contains("erp"), "{}", seen[1]);
+        assert!(seen[1].contains("stock"), "{}", seen[1]);
     }
 
     #[tokio::test]
