@@ -3,6 +3,7 @@ name = "z-biz-tool-db"
 version = "0.1.0"
 description = "数据库管理工具 - 对标Beekeeper Studio/DBeaver"
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "z_biz_tool_db_lib"

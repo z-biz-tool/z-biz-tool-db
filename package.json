@@ -1,6 +1,7 @@
 {
   "name": "z-biz-tool-db",
   "version": "0.1.0",
+  "license": "MIT",
   "description": "数据库管理工具 - 对标Beekeeper Studio/DBeaver",
   "type": "module",
   "scripts": {
