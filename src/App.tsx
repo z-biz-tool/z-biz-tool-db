@@ -1,5 +1,6 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from "react";
 import SqlEditor from "./components/SqlEditor";
+import ErrorBoundary from "./components/ErrorBoundary";
 import {
   ConfigProvider,
   theme,
@@ -26,8 +27,15 @@ import {
   Badge,
   Segmented,
 } from "antd";
+import type { SQLNamespace } from "@codemirror/lang-sql";
 import { buildGrant, isLikelyWriteSql, PendingApproval } from "./ipc/approval";
 import type { ApprovalGrant } from "./ipc/approval";
+import {
+  buildRowUpdates,
+  parseChangeKey,
+  parseSingleTableSource,
+  type BuiltStatement,
+} from "./ipc/changeCommit";
 import { classifyError, errorDescription } from "./ipc/errors";
 
 interface ExportedConnection {
@@ -69,8 +77,12 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 // 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
 import { useAgentStore } from "./agent/AgentManager";
-import AgentPanel from "./agent/AgentPanel";
-import { ReportWorkbench } from "./report/ReportWorkbench";
+// 报表看板带着 recharts、Agent 面板带着语法高亮：两者都只在各自视图打开时才用得到，
+// 静态打进来会让首屏多解析大半个体积
+const ReportWorkbench = lazy(() =>
+  import("./report/ReportWorkbench").then((m) => ({ default: m.ReportWorkbench })),
+);
+const AgentPanel = lazy(() => import("./agent/AgentPanel"));
 import { csvDoc, downloadCsv, stampName } from "./report/csv";
 import { aiSqlGenerate, catalogColumns, listTables, reportDescribeColumns } from "./report/api";
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
@@ -243,6 +255,17 @@ function App() {
   );
   const [editValue, setEditValue] = useState<string>("");
   const [changeSet, setChangeSet] = useState<Map<string, TaggedCell>>(new Map());
+  // 网格变更要写回库，得先知道「这一屏是哪张表查出来的」。后端没有游标可读，
+  // 所以在执行成功时把来源记下来，切连接/切标签/换语句就作废（见 commitChangeSet）。
+  const [resultSource, setResultSource] = useState<{
+    table: string;
+    sql: string;
+    connectionId: string;
+    tabId: string;
+  } | null>(null);
+  const [commitPlan, setCommitPlan] = useState<BuiltStatement[] | null>(null);
+  const [commitRejected, setCommitRejected] = useState<{ rowIndex: number; reason: string }[]>([]);
+  const [commitBusy, setCommitBusy] = useState(false);
   // T-044: 记录变更数量用于UI显示
   // T-006：可写访问模式开关；S0 默认 false，写入命令将被后端拒绝
   const [writeAccessEnabled, setWriteAccessEnabled] = useState(false);
@@ -328,6 +351,296 @@ function App() {
   const [editingSavedQuery, setEditingSavedQuery] = useState<SavedQuery | null>(null);
 
   // T-036: 导出结果为 CSV
+  // ── 网格变更写回库 ────────────────────────────────────────────────
+  // 认表 → 取这张表的主键 → 按行拼 UPDATE → 让人逐条过一遍 → 一条一条执行。
+  // 任何一环不成立就停下并把原因讲清楚：这里宁可一格都不写，也不能发一条没有 WHERE 的
+  // UPDATE，更不能把 changeSet 清空来假装提交成功。
+  const dialectOf = (t: DBConnection["type"]) =>
+    t === "postgresql" ? "postgres" : t === "mysql" ? "mysql" : t === "sqlserver" ? "sqlserver" : "sqlite";
+
+  const planCommit = async (): Promise<BuiltStatement[] | null> => {
+    if (!selectedConnection) {
+      msgApi.warning("请先连接数据库");
+      return null;
+    }
+    if (!resultSource) {
+      msgApi.warning({
+        content: "这一屏认不出单一源表（只有不带 JOIN／子查询／聚合的整表 SELECT 才能在网格里改回库）",
+        duration: 6,
+      });
+      return null;
+    }
+    if (
+      resultSource.connectionId !== selectedConnection.id ||
+      (resultSource.tabId && resultSource.tabId !== activeTabId)
+    ) {
+      msgApi.warning({ content: "连接或标签已切换，这一屏的来源作废了，请重新查询", duration: 6 });
+      return null;
+    }
+
+    const [schemaPart, tablePart] = resultSource.table.includes(".")
+      ? resultSource.table.split(/\.(.+)/)
+      : [null, resultSource.table];
+    let tableCols: ColumnInfo[];
+    try {
+      tableCols = await invoke<ColumnInfo[]>("get_table_structure", {
+        tableName: tablePart,
+        config: toBackendConfig(selectedConnection),
+        schema: schemaPart,
+      });
+    } catch (e: any) {
+      msgApi.error(`读 ${resultSource.table} 的结构失败：${e}`);
+      return null;
+    }
+
+    const pkInfos = tableCols.filter((c) => c.is_primary);
+    if (!pkInfos.length) {
+      msgApi.warning({
+        content: `${resultSource.table} 没有主键，网格改不动 —— 没有能唯一定位一行的列，写回去只能靠猜`,
+        duration: 7,
+      });
+      return null;
+    }
+    // 主键必须在结果里，否则 WHERE 无从取值
+    const nameOf = (n: string) => n.split(".").pop()!.toLowerCase();
+    const pkOrdinals = pkInfos.map((pk) => {
+      const meta = queryColumnsMeta.find(
+        (m) => m.name.toLowerCase() === pk.name.toLowerCase() || nameOf(m.name) === nameOf(pk.name)
+      );
+      return meta ? { ordinal: meta.ordinal, name: pk.name, logical_type: meta.logical_type } : null;
+    });
+    const missingPk = pkInfos.filter((_, i) => !pkOrdinals[i]).map((c) => c.name);
+    if (missingPk.length) {
+      msgApi.warning({
+        content: `结果里没有主键列 ${missingPk.join("、")}，SELECT 带上它们才能在网格里改回库`,
+        duration: 7,
+      });
+      return null;
+    }
+
+    const changes: { rowIndex: number; ordinal: number; value: string }[] = [];
+    for (const [key, cell] of changeSet) {
+      const parsed = parseChangeKey(key);
+      if (!parsed) continue;
+      changes.push({ ...parsed, value: cell.value == null ? "" : String(cell.value) });
+    }
+
+    const { statements, rejected } = buildRowUpdates({
+      table: resultSource.table,
+      dialect: dialectOf(selectedConnection.type),
+      columns: queryColumnsMeta,
+      pks: pkOrdinals as { ordinal: number; name: string; logical_type?: string }[],
+      rows: queryResults,
+      changes,
+    });
+    setCommitRejected(
+      rejected.map((r) => ({
+        rowIndex: r.change.rowIndex,
+        reason: r.reason,
+      }))
+    );
+    if (!statements.length) {
+      setCommitPlan([]);
+      msgApi.warning({
+        content: rejected.length
+          ? `这 ${rejected.length} 项都定位不到行：${rejected[0].reason}`
+          : "没有可提交的变更",
+        duration: 7,
+      });
+      return null;
+    }
+    setCommitPlan(statements);
+    return statements;
+  };
+
+  const runCommit = async () => {
+    if (!commitPlan?.length || !selectedConnection || !resultSource) return;
+    setCommitBusy(true);
+    const env = (selectedConnection as any).environment ?? "unknown";
+    const okKeys = new Set<string>();
+    const failures: string[] = [];
+    for (const st of commitPlan) {
+      // 审批摘要按语句文本比对，所以这里给的就是马上要执行的那一条，逐条过闸不留可重放的grant
+      const grant = buildGrant({
+        sql: st.sql,
+        environment: env,
+        issuedAt: Math.floor(Date.now() / 1000),
+        ttlSec: 120,
+      });
+      try {
+        const r = await invoke<QueryResultV2>("execute_query", {
+          sql: st.sql,
+          config: toBackendConfig(selectedConnection),
+          access_mode: "writable",
+          approval: grant,
+          expected_generation: null,
+          max_rows: null,
+        });
+        if (Number(r?.affected_rows ?? 0) === 0) {
+          failures.push(`第 ${st.rowIndexes[0] + 1} 行：0 行受影响，这行可能已被别人改走或删掉`);
+          continue;
+        }
+        st.keys.forEach((k) => okKeys.add(k));
+      } catch (e: any) {
+        const err = classifyError(String(e?.message ?? e));
+        failures.push(`第 ${st.rowIndexes[0] + 1} 行：${errorDescription(err)}`);
+      }
+    }
+
+    if (okKeys.size) {
+      // 落库成功的值钉进结果，绿标才从"待提交"变成"已提交"
+      setQueryResults((prev) => {
+        const next = prev.map((row) => row.slice());
+        for (const key of okKeys) {
+          const cell = changeSet.get(key);
+          const parsed = parseChangeKey(key);
+          if (!cell || !parsed) continue;
+          if (next[parsed.rowIndex]) next[parsed.rowIndex][parsed.ordinal] = cell;
+        }
+        return next;
+      });
+      setChangeSet((prev) => {
+        const next = new Map(prev);
+        okKeys.forEach((k) => next.delete(k));
+        return next;
+      });
+    }
+    setCommitBusy(false);
+    setCommitPlan(null);
+    if (failures.length) {
+      msgApi.error({
+        content: `提交 ${okKeys.size} 项成功，${failures.length} 项失败：${failures.slice(0, 3).join("；")}${
+          failures.length > 3 ? ` 等 ${failures.length} 项` : ""
+        }（失败的那些仍留在待提交区）`,
+        duration: 9,
+      });
+    } else if (okKeys.size) {
+      msgApi.success(`已提交 ${okKeys.size} 项变更`);
+    }
+  };
+
+  // ── 全局快捷键 ────────────────────────────────────────────────────
+  // 用 SQL 客户端的手上频率全在「运行 / 格式化 / 换标签 / 保存」上，而这里原先一个都没绑
+  // （整个应用唯一的按键是单元格编辑框里的 Esc）。动作放进 ref，监听只注册一次，
+  // 免得每改一次状态就摘装一次全局 keydown。
+  const hotkeyRef = useRef<{
+    run: () => void;
+    format: () => void;
+    exportResults: () => void;
+    saveQuery: () => void;
+    newTab: () => void;
+    switchTabIndex: (i: number) => void;
+  }>({
+    run: () => {},
+    format: () => {},
+    exportResults: () => {},
+    saveQuery: () => {},
+    newTab: () => {},
+    switchTabIndex: () => {},
+  });
+
+  useEffect(() => {
+    hotkeyRef.current = {
+      run: () => void executeQuery(),
+      format: () => void formatSQL(),
+      exportResults: () => handleExportResults(),
+      saveQuery: () => setShowSaveQueryModal(true),
+      newTab: () => addTab(),
+      switchTabIndex: (i) => {
+        const t = tabs[i];
+        if (t) switchTab(t.id);
+      },
+    };
+  });
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const k = e.key.toLowerCase();
+      // 运行和保存要在打字的时候也生效 —— 编辑器正是敲完按键的地方
+      if (k === "enter") {
+        e.preventDefault();
+        hotkeyRef.current.run();
+        return;
+      }
+      if (k === "s") {
+        e.preventDefault();
+        hotkeyRef.current.saveQuery();
+        return;
+      }
+      const el = e.target as HTMLElement | null;
+      const typing =
+        !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+      if (typing) return;
+      if (k === "e") {
+        e.preventDefault();
+        hotkeyRef.current.exportResults();
+      } else if (k === "f" && e.shiftKey) {
+        e.preventDefault();
+        hotkeyRef.current.format();
+      } else if (k === "t") {
+        e.preventDefault();
+        hotkeyRef.current.newTab();
+      } else if (/^[1-9]$/.test(k)) {
+        e.preventDefault();
+        hotkeyRef.current.switchTabIndex(Number(k) - 1);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // ── 工作区落盘 ────────────────────────────────────────────────────
+  // 连接本来就有 save_connections 兜着，但 SQL 草稿、标签、行数上限重启全丢 ——
+  // 写入门禁（writeAccessEnabled）刻意不在内：那一闸每次启动都该回到关着。
+  const UI_PREFS_KEY = "z-biz-tool-db-ui-prefs";
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(UI_PREFS_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw) as {
+        tabs?: { id: string; title: string; sql: string }[];
+        activeTabId?: string;
+        rowCap?: number;
+      };
+      if (saved.tabs?.length) {
+        setTabs(saved.tabs);
+        const active = saved.tabs.find((t) => t.id === saved.activeTabId) ?? saved.tabs[0];
+        setActiveTabId(active.id);
+        setSqlCode(active.sql);
+      }
+      if (typeof saved.rowCap === "number") setRowCap(saved.rowCap);
+    } catch {
+      // 读不出来就用默认值，别把启动卡在一屏空白上
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem(
+          UI_PREFS_KEY,
+          JSON.stringify({
+            tabs: tabs.map((t) => (t.id === activeTabId ? { ...t, sql: sqlCode } : t)),
+            activeTabId,
+            rowCap,
+          })
+        );
+      } catch {
+        /* 存不下不影响干活 */
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [tabs, activeTabId, sqlCode, rowCap]);
+
+  // 编辑器补全用的 schema：只在左侧选中了表且字段结构真取回来时才给，
+  // 取不到就留 undefined —— 编一份假的出来，补全会开始建议库里不存在的列。
+  const editorSchema = useMemo<SQLNamespace | undefined>(() => {
+    if (!selectedTable || !columns.length) return undefined;
+    return { [selectedTable.toLowerCase()]: columns.map((c) => c.name.toLowerCase()) };
+  }, [selectedTable, columns]);
+
   const handleExportResults = () => {
     if (queryResults.length === 0) {
       msgApi.warning("没有查询结果可导出");
@@ -469,6 +782,19 @@ function App() {
       }
 
       // 同步覆写列源：以后端 column_meta 为准；零行也有列（A01）
+      // 换了一屏结果，上一屏的待提交变更就失去了行身份，不能悄悄带过来
+      if (changeSet.size > 0) {
+        msgApi.warning({
+          content: `上一屏还有 ${changeSet.size} 项未提交的网格变更，已随这次查询丢弃`,
+          duration: 5,
+        });
+        setChangeSet(new Map());
+      }
+      setEditingCell(null);
+      const src = result.is_query ? parseSingleTableSource(sqlCode) : null;
+      setResultSource(
+        src ? { table: src.table, sql: sqlCode, connectionId: requestConnId, tabId: requestTabId } : null
+      );
       setQueryColumnsMeta(result.column_meta ?? []);
       setQueryResults(result.rows || []);
       const shown = result.rows?.length || 0;
@@ -1629,12 +1955,16 @@ function App() {
                   display: mode === "report" ? "block" : "none",
                 }}
               >
-                <ReportWorkbench
-                  configs={backendConfigs}
-                  aiConfig={aiConfigForReport}
-                  onOpenAiSettings={() => setShowAiConfigModal(true)}
-                  seed={reportSeed}
-                />
+                <ErrorBoundary label="报表看板" resetKey={reportSeed}>
+                  <Suspense fallback={<Spin description="正在装载报表看板…" style={{ padding: 24 }} />}>
+                    <ReportWorkbench
+                      configs={backendConfigs}
+                      aiConfig={aiConfigForReport}
+                      onOpenAiSettings={() => setShowAiConfigModal(true)}
+                      seed={reportSeed}
+                    />
+                  </Suspense>
+                </ErrorBoundary>
               </div>
             )}
             {mode === "report" ? null : isConnected ? (
@@ -1855,24 +2185,45 @@ function App() {
                               </Text>
                             </Space>
                           </Tooltip>
-                          <Button
-                            type="primary"
-                            size="small"
-                            icon={<PlayCircleOutlined />}
-                            onClick={executeQuery}
-                            style={{
-                              borderRadius: 6,
-                              background: brandGradient,
-                              boxShadow: "0 4px 12px rgba(102,126,234,0.3)",
-                            }}
+                          <Tooltip
+                            title={
+                              <div style={{ fontSize: 12 }}>
+                                <div>⌘/Ctrl + Enter 执行</div>
+                                <div>⇧⌘/Ctrl + F 格式化</div>
+                                <div>⌘/Ctrl + S 存为常用查询</div>
+                                <div>⌘/Ctrl + E 导出结果 · ⌘/Ctrl + T 新标签 · ⌘/Ctrl + 1…9 切标签</div>
+                              </div>
+                            }
                           >
-                            执行
-                          </Button>
+                            <Button
+                              type="primary"
+                              size="small"
+                              icon={<PlayCircleOutlined />}
+                              onClick={executeQuery}
+                              style={{
+                                borderRadius: 6,
+                                background: brandGradient,
+                                boxShadow: "0 4px 12px rgba(102,126,234,0.3)",
+                              }}
+                            >
+                              执行
+                            </Button>
+                          </Tooltip>
+                          <Text type="secondary" style={{ fontSize: 11 }}>
+                            ⌘↵ 执行 · ⇧⌘F 格式化 · ⌘S 保存
+                          </Text>
                         </Space>
                       }
                     >
                       {/* T-029: CodeMirror 6 SQL 编辑器 */}
-                      <SqlEditor value={sqlCode} onChange={setSqlCode} height="150px" />
+                      <SqlEditor
+                        value={sqlCode}
+                        onChange={setSqlCode}
+                        onRun={() => void executeQuery()}
+                        dialect={selectedConnection?.type === "sqlserver" ? undefined : selectedConnection?.type}
+                        schema={editorSchema}
+                        height="150px"
+                      />
                     </Card>
 
                     {/* 查询结果 */}
@@ -1922,8 +2273,7 @@ function App() {
                               size="small"
                               type="primary"
                               onClick={() => {
-                                msgApi.info(`已记录 ${changeSet.size} 项变更（待后端提交）`);
-                                setChangeSet(new Map());
+                                void planCommit();
                               }}
                               style={{ borderRadius: 6, background: brandGradient }}
                             >
@@ -2251,6 +2601,65 @@ function App() {
         </Form>
       </Modal>
 
+      {/* 网格变更提交前的逐条过目：要写什么、写去哪、按哪个键定位，一眼能看见才按确认 */}
+      <Modal
+        title={`提交 ${commitPlan?.length ?? 0} 条变更到 ${resultSource?.table ?? ""}`}
+        open={!!commitPlan}
+        onCancel={() => !commitBusy && setCommitPlan(null)}
+        okText={commitBusy ? "提交中…" : "确认写入库"}
+        okButtonProps={{ loading: commitBusy, disabled: !commitPlan?.length }}
+        onOk={() => void runCommit()}
+        width={760}
+        mask={{ closable: false }}
+      >
+        {commitRejected.length > 0 && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={`有 ${commitRejected.length} 项定位不到行，这次不会提交`}
+            description={
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {commitRejected.slice(0, 5).map((r, i) => (
+                  <li key={i}>
+                    第 {r.rowIndex + 1} 行：{r.reason}
+                  </li>
+                ))}
+              </ul>
+            }
+          />
+        )}
+        <div
+          style={{
+            maxHeight: 320,
+            overflow: "auto",
+            border: "1px solid rgba(255,255,255,0.12)",
+            borderRadius: 6,
+            padding: 8,
+          }}
+        >
+          {commitPlan?.map((st, i) => (
+            <pre
+              key={i}
+              style={{
+                margin: 0,
+                padding: "4px 0",
+                fontSize: 12,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-all",
+                borderBottom:
+                  i === (commitPlan?.length ?? 0) - 1 ? "none" : "1px dashed rgba(255,255,255,0.08)",
+              }}
+            >
+              {st.sql}
+            </pre>
+          ))}
+        </div>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          每条语句各过一次写入门禁；某条失败只影响它自己，其余照旧提交，失败的仍留在待提交区。
+        </Typography.Text>
+      </Modal>
+
       {/* 保存查询弹窗 */}
       <Modal
         title={editingSavedQuery ? "编辑常用查询" : "保存为常用查询"}
@@ -2357,6 +2766,8 @@ function App() {
               ),
               children: (
                 <div style={{ height: 480 }}>
+                <ErrorBoundary label="Agent 问数">
+                  <Suspense fallback={<Spin description="正在装载 Agent 面板…" style={{ padding: 24 }} />}>
                   <AgentPanel
                     hint={agentHint}
                     onClear={() => {
@@ -2373,6 +2784,8 @@ function App() {
                     }}
                     onGoPickTables={() => setAiActiveTab("generate")}
                   />
+                  </Suspense>
+                </ErrorBoundary>
                 </div>
               ),
             },
