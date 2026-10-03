@@ -40,7 +40,7 @@ jobs:
       - name: Install npm deps
         run: |
           # z-biz-tool-shared 已发布为 npm 包，直接装即可
-          npm install --registry=https://registry.npmmirror.com
+          npm install
 
       - name: Frontend typecheck
         # 原来写的是 `npx tsc --noEmit || echo "tsc reported errors; see above"`：tsc 失败时 echo
@@ -107,7 +107,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev
 
       - name: Install npm dependencies
-        run: npm install --registry=https://registry.npmmirror.com
+        run: npm install
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
