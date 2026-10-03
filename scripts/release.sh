@@ -10,6 +10,12 @@
 #   - src-tauri/Cargo.toml        (缺失会跳过, 不会报错)
 #   - src-tauri/tauri.conf.json   (缺失会跳过, 不会报错)
 #
+# version 字段的定位是**语义定位**，不是"第一个 version"：
+#   JSON 只改顶层键，TOML 只改 [package] / [workspace.package] 段。
+# 早先用正则取第一个匹配，改到嵌套的 plugins.updater.version 或
+# [workspace.dependencies.x] 的**依赖版本约束**时 rc 仍是 0，脚本一路走到打 tag，
+# 产出一个 cargo 装不上的 tag。定位不到就报错退出，一个字节都不写。
+#
 # 发布前置门禁（缺哪步跳哪步，2026-09-24 从 db 的 T-059 上收）:
 #   1) package.json 有 "typecheck" script -> npm run typecheck
 #   2) 存在 src-tauri/                    -> cargo test --lib
@@ -236,24 +242,130 @@ bump_file() {
     return 0
   fi
   python3 - "$file" "$new_ver" <<'PY'
-import re, sys
+# 只改**语义上的那个** version 字段，改完回读校验，校验不过就一个字都不写。
+# 旧实现拿正则取"第一个 version"，改到错的那一个时 rc 仍是 0，脚本一路走到打 tag。
+import json, re, sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:          # python < 3.11
+    tomllib = None
+
 path, new_ver = sys.argv[1], sys.argv[2]
+ext = path.rsplit('.', 1)[-1].lower()
+
+
+def fail(msg):
+    sys.exit(f"bump {path}: {msg}")
+
+
+def json_value_span(text, key):
+    """顶层 "key": "..." 的值区间（不含两端引号）；找不到返回 None。
+
+    逐字符扫而不是正则：嵌套对象里的 "version"（tauri.conf.json 的 plugins.updater、
+    package.json 的 config 段）在正则眼里和顶层的一模一样，改到它等于静默损坏。
+    """
+    depth, i, n = 0, 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == '\\' else 1
+            if j >= n:                    # 引号不配对，交给下面的 json.loads 报错
+                return None
+            if depth == 1 and text[i + 1:j] == key:
+                m = j + 1
+                while m < n and text[m] in ' \t\r\n':
+                    m += 1
+                if m < n and text[m] == ':':
+                    m += 1
+                    while m < n and text[m] in ' \t\r\n':
+                        m += 1
+                    if m < n and text[m] == '"':
+                        vs = m + 1
+                        while vs < n:
+                            if text[vs] == '\\':
+                                vs += 2
+                                continue
+                            if text[vs] == '"':
+                                return (m + 1, vs)
+                            vs += 1
+                    fail(f'顶层 "{key}" 不是字符串字面量，不猜')
+            i = j + 1
+            continue
+        if c in '{[':
+            depth += 1
+        elif c in '}]':
+            depth -= 1
+        i += 1
+    return None
+
+
+# 认这两段：成员包是 [package]，虚拟 workspace 把版本集中放在 [workspace.package]
+PKG_SECTIONS = ('package', 'workspace.package')
+
+
+def toml_version_span(text):
+    """(值区间, 所在段名)；找不到返回 None。只在 PKG_SECTIONS 里找 version。"""
+    section, offset = None, 0
+    for line in text.splitlines(keepends=True):
+        s = line.strip()
+        if s.startswith('[') and s.endswith(']'):
+            section = s[1:-1].strip()
+        elif section in PKG_SECTIONS:
+            m = re.match(r'''^[ \t]*version[ \t]*=[ \t]*(["'])([^"']*)\1''', line)
+            if m:
+                base = offset + m.start(2)
+                return (base, base + len(m.group(2))), section
+        offset += len(line)
+    return None
+
+
 with open(path, 'r', encoding='utf-8') as f:
     content = f.read()
-# (regex, replacement, flags)
-patterns = [
-    (r'("version"\s*:\s*)"[^"]+"',  rf'\g<1>"{new_ver}"', 0),             # JSON
-    (r'^(version\s*=\s*)"[^"]+"',    rf'\g<1>"{new_ver}"', re.MULTILINE),  # TOML
-]
-for pat, repl, flags in patterns:
-    new, n = re.subn(pat, repl, content, count=1, flags=flags)
-    if n:
-        content = new
-        break
+
+if ext == 'json':
+    try:
+        json.loads(content)
+    except Exception as e:
+        fail(f'原文件就不是合法 JSON: {e}')
+    span = json_value_span(content, 'version')
+    if span is None:
+        fail('找不到顶层 "version" 字段')
+    new = content[:span[0]] + new_ver + content[span[1]:]
+    try:
+        got = json.loads(new)
+    except Exception as e:
+        fail(f'改完不是合法 JSON，已放弃写入: {e}')
+    if got.get('version') != new_ver:
+        fail(f'回读校验不通过，顶层 version 仍是 {got.get("version")!r}')
+elif ext == 'toml':
+    if tomllib is None:
+        fail('python < 3.11 无 tomllib，拒绝盲改 TOML')
+    try:
+        tomllib.loads(content)
+    except Exception as e:
+        fail(f'原文件就不是合法 TOML: {e}')
+    got_span = toml_version_span(content)
+    if got_span is None:
+        fail('找不到 [package] / [workspace.package] 段里的 version'
+             '（若是 version.workspace = true 继承，请手动改本仓）')
+    (start, end), section = got_span
+    new = content[:start] + new_ver + content[end:]
+    try:
+        parsed = tomllib.loads(new)
+    except Exception as e:
+        fail(f'改完不是合法 TOML，已放弃写入: {e}')
+    node = parsed.get('package') if section == 'package' \
+        else parsed.get('workspace', {}).get('package')
+    if not isinstance(node, dict) or node.get('version') != new_ver:
+        fail(f'回读校验不通过，{section}.version 仍是 {(node or {}).get("version")!r}')
 else:
-    sys.exit(f"未在 {path} 中找到 version 字段")
+    fail(f'不认识的扩展名 .{ext}，只支持 .json / .toml')
+
 with open(path, 'w', encoding='utf-8') as f:
-    f.write(content)
+    f.write(new)
 PY
   ok "更新 $file -> $new_ver"
 }
