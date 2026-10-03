@@ -41,6 +41,9 @@
 #   - 当前在 git 仓库内, 默认分支是 main
 #   - 工作区干净 (没有未提交的改动)
 #   - 已配置 origin 指向 GitHub
+#   - python3 需 3.11+（改 Cargo.toml 要 tomllib 来"改完重新解析"）。stock macOS
+#     的 python3 是 3.9，这一步在没装 Homebrew python 的机器上真的会拦到；
+#     届时脚本会拒绝改 TOML 并说明原因，而不是盲改。
 # ------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -342,7 +345,8 @@ if ext == 'json':
         fail(f'回读校验不通过，顶层 version 仍是 {got.get("version")!r}')
 elif ext == 'toml':
     if tomllib is None:
-        fail('python < 3.11 无 tomllib，拒绝盲改 TOML')
+        fail('需要 python 3.11+（tomllib），当前解释器没有 —— 拒绝盲改 TOML。'
+             '请用 3.11+ 的 python3 跑本脚本；JSON 那两个文件不受影响。')
     try:
         tomllib.loads(content)
     except Exception as e:
