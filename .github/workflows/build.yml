@@ -48,6 +48,11 @@ jobs:
         # 所以直接去掉 `|| echo`，让它按本来该有的方式失败。
         run: npx tsc --noEmit -p tsconfig.json
 
+      # 本仓的 tests/*.test.ts 此前从来没进过 CI：上面跑的是 cargo test 和 tsc，
+      # 前端这套断言一次都没执行过。改了逻辑红了，流水线不会知道。
+      - name: Frontend unit tests
+        run: npm test
+
       - name: Cargo check (lib + tests)
         working-directory: src-tauri
         run: cargo check --tests --locked
