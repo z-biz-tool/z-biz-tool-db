@@ -32,6 +32,13 @@ pub struct DBConfig {
     #[serde(default)]
     pub password: String,
     pub database: String,
+    /// T-025：这一条连接的 TLS 档位。缺省 = 最安全的一档（verify_full）。
+    #[serde(default)]
+    pub tls_mode: Option<TlsMode>,
+    /// T-025：企业私有 CA 的证书文件路径（Pem）。内置根证书集是 Mozilla 公共 CA，
+    /// 私有 CA 必须显式给文件，否则 verify_full 连不上。
+    #[serde(default)]
+    pub tls_ca_path: Option<String>,
 }
 
 /// 列元数据：用于结果契约，避免 UI 误用首行 Object.keys 推导列名
@@ -256,6 +263,12 @@ pub struct ConnectionRecord {
     /// 环境标记：unknown | dev | test | staging | prod | custom
     #[serde(default = "default_environment")]
     pub environment: String,
+    /// T-025：这一条连接的 TLS 档位。缺省 = 最安全的一档（verify_full）。
+    #[serde(default)]
+    pub tls_mode: Option<TlsMode>,
+    /// T-025：企业私有 CA 的证书文件路径（Pem）。
+    #[serde(default)]
+    pub tls_ca_path: Option<String>,
 }
 
 fn default_environment() -> String {
@@ -357,7 +370,7 @@ const POOL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// - verify_full（默认）：强制校验 CA + 主机名
 /// - prefer：未配置证书时不阻断本地开发，但记录警告
 /// - disable：仅本地隔离可显式选择，连接元数据保留可识别标记
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsMode {
     VerifyFull,
@@ -380,30 +393,72 @@ impl TlsMode {
             _ => TlsMode::VerifyFull,
         }
     }
+
+    /// 映射到 sqlx 的 MySQL SSL 模式。
+    ///
+    /// ⚠️ 语义差异必须说清楚（这是 T-025 的核心，之前的实现是三个 no-op 分支）：
+    /// - `VerifyFull` → `VerifyIdentity`：**验 CA + 验主机名**（唯一名副其实的一档）。
+    ///   旧实现"留 opts 默认"，而 sqlx 的默认是 `Preferred` ⇒ **根本不校验证书**，
+    ///   与本枚举"默认强制校验"的承诺相反。
+    /// - `Prefer` → `Required`：**加密但不校验证书**（sqlx 侧 `accept_invalid_certs=true`）。
+    ///   这是安全降级，调用方必须打警告 —— 本枚举的语义就是"不阻断本地开发，但记录警告"。
+    /// - `Disable` → `Disabled`：**明文**。仅本地隔离可用。
+    pub fn to_mysql(self) -> sqlx::mysql::MySqlSslMode {
+        use sqlx::mysql::MySqlSslMode;
+        match self {
+            TlsMode::VerifyFull => MySqlSslMode::VerifyIdentity,
+            TlsMode::Prefer => MySqlSslMode::Required,
+            TlsMode::Disable => MySqlSslMode::Disabled,
+        }
+    }
+
+    /// 映射到 sqlx 的 PostgreSQL SSL 模式。与 `to_mysql` 同义，只是枚举名不同。
+    pub fn to_pg(self) -> sqlx::postgres::PgSslMode {
+        use sqlx::postgres::PgSslMode;
+        match self {
+            TlsMode::VerifyFull => PgSslMode::VerifyFull,
+            TlsMode::Prefer => PgSslMode::Require,
+            TlsMode::Disable => PgSslMode::Disable,
+        }
+    }
+
+    /// 这一档是否**不校验证书**。用于在界面上明确标出"降级"状态。
+    pub fn skips_certificate_verification(self) -> bool {
+        matches!(self, TlsMode::Prefer | TlsMode::Disable)
+    }
+}
+
+/// 解析这个连接该用哪一档 TLS。
+///
+/// 优先级：**连接配置里的 `tls_mode` > 环境变量 > 默认（verify_full）**。
+/// 缺省一律落到最安全的那一档 —— 认不出来的值也不回退到宽松档。
+fn resolve_tls_mode(configured: Option<TlsMode>, env_var: &str) -> TlsMode {
+    configured.unwrap_or_else(|| {
+        TlsMode::from_str_opt(std::env::var(env_var).ok().as_ref().map(|s| s.as_str()))
+    })
 }
 
 async fn mysql_pool(cfg: &DBConfig) -> Result<MySqlPool, String> {
     let (host, port) = split_host_port(&cfg.host, cfg.port);
-    // T-025：通过环境变量控制 TLS 模式。S1 默认 verify-full，
-    // 接受 MYSQL_TLS_MODE / PG_TLS_MODE 设置，缺省时安全优先。
-    let mode = TlsMode::from_str_opt(
-        std::env::var("MYSQL_TLS_MODE").ok().as_ref().map(|s| s.as_str()),
-    );
+    // T-025：TLS 模式。连接配置优先，其次环境变量，缺省落到最安全的一档。
+    let mode = resolve_tls_mode(cfg.tls_mode, "MYSQL_TLS_MODE");
     let mut opts = MySqlConnectOptions::new()
         .host(&host)
         .port(port)
         .username(&cfg.username)
         .password(&cfg.password)
-        .database(&cfg.database);
-    opts = match mode {
-        TlsMode::VerifyFull => {
-            // sqlx-mysql 0.8：通过 ssl_mode 配置通道；这里不强制以免越界锁版本
-            // 留 opts 默认；后续可在连接级强制。
-            opts
-        }
-        TlsMode::Prefer => opts,
-        TlsMode::Disable => opts,
-    };
+        .database(&cfg.database)
+        .ssl_mode(mode.to_mysql());
+    // 企业私有 CA：内置根证书集是 Mozilla 公共 CA，私有 CA 必须显式给文件。
+    if let Some(ca) = cfg.tls_ca_path.as_ref().filter(|p| !p.trim().is_empty()) {
+        opts = opts.ssl_ca(ca);
+    }
+    if mode.skips_certificate_verification() {
+        eprintln!(
+            "[TLS] 连接 {:?} 使用 {:?} 档：不校验证书（降级）。生产环境请改回 verify_full。",
+            cfg.name, mode
+        );
+    }
     tokio::time::timeout(
         CONNECT_TIMEOUT,
         sqlx::pool::PoolOptions::<sqlx::MySql>::new()
@@ -419,20 +474,23 @@ async fn mysql_pool(cfg: &DBConfig) -> Result<MySqlPool, String> {
 
 async fn pg_pool(cfg: &DBConfig) -> Result<PgPool, String> {
     let (host, port) = split_host_port(&cfg.host, cfg.port);
-    let mode = TlsMode::from_str_opt(
-        std::env::var("PG_TLS_MODE").ok().as_ref().map(|s| s.as_str()),
-    );
+    let mode = resolve_tls_mode(cfg.tls_mode, "PG_TLS_MODE");
     let mut opts = PgConnectOptions::new()
         .host(&host)
         .port(port)
         .username(&cfg.username)
         .password(&cfg.password)
-        .database(&cfg.database);
-    opts = match mode {
-        TlsMode::VerifyFull => opts,
-        TlsMode::Prefer => opts,
-        TlsMode::Disable => opts,
-    };
+        .database(&cfg.database)
+        .ssl_mode(mode.to_pg());
+    if let Some(ca) = cfg.tls_ca_path.as_ref().filter(|p| !p.trim().is_empty()) {
+        opts = opts.ssl_root_cert(ca);
+    }
+    if mode.skips_certificate_verification() {
+        eprintln!(
+            "[TLS] 连接 {:?} 使用 {:?} 档：不校验证书（降级）。生产环境请改回 verify_full。",
+            cfg.name, mode
+        );
+    }
     tokio::time::timeout(
         CONNECT_TIMEOUT,
         sqlx::pool::PoolOptions::<sqlx::Postgres>::new()
@@ -2386,6 +2444,8 @@ mod tests {
             username: "root".into(),
             password: String::new(),
             database: db.into(),
+            tls_mode: None,
+            tls_ca_path: None,
         }
     }
 
@@ -2497,6 +2557,8 @@ mod tests {
             database: "mysql".into(),
             revision: 0,
             environment: "dev".into(),
+            tls_mode: None,
+            tls_ca_path: None,
         }];
         queries::save_connections(&records).await.unwrap();
         let loaded = queries::load_connections().await.unwrap();
@@ -2863,6 +2925,8 @@ mod tests {
             database: "d".into(),
             revision: 0,
             environment: "dev".into(),
+            tls_mode: None,
+            tls_ca_path: None,
         };
         let new = ConnectionRecord {
             id: "new".into(),
@@ -2897,6 +2961,8 @@ mod tests {
             database: ":memory:".into(),
             revision: 7,
             environment: "dev".into(),
+            tls_mode: None,
+            tls_ca_path: None,
         };
         queries::save_connections(&vec![c]).await.unwrap();
         assert!(check_connection_revision("x1".into(), 7).await.unwrap());
@@ -2922,6 +2988,8 @@ mod tests {
             database: ":memory:".into(),
             revision: 1,
             environment: "dev".into(),
+            tls_mode: None,
+            tls_ca_path: None,
         }];
         queries::save_connections(&records).await.unwrap();
 
@@ -3536,5 +3604,105 @@ mod tests {
         assert_eq!(total, ROWS as i64, "丢掉流之后这条连接查出来的行数不对");
         drop(pool);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// T-025 的 TLS 映射测试。
+///
+/// **为什么单独一个模块**：原先的 TLS 断言写在 `mysql_select_only` 里面，
+/// 而那个测试在本机没有 MySQL 时会**提前 return**（`[skip] 本机 MySQL 不可用`）——
+/// 于是那些断言在绝大多数机器上**一次都没跑过**。安全相关的断言必须无条件执行。
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use sqlx::mysql::MySqlSslMode;
+    use sqlx::postgres::PgSslMode;
+
+    #[test]
+    fn verify_full_actually_verifies_certificates() {
+        // 守卫测试：旧实现"留 opts 默认"，而 sqlx 的默认是 Preferred ⇒ **根本不校验证书**。
+        // 这条断言就是为了让"默认档位不再等于 sqlx 默认"这件事被钉住，
+        // 防止哪天又被改回 no-op 分支。
+        // sqlx 的这两个枚举**没有实现 PartialEq**，所以只能用 matches! 判形状。
+        assert!(
+            !matches!(TlsMode::VerifyFull.to_mysql(), MySqlSslMode::Preferred),
+            "verify_full 档位不能等于 sqlx 的 Preferred（那是不校验证书）"
+        );
+        assert!(
+            !matches!(TlsMode::VerifyFull.to_pg(), PgSslMode::Prefer),
+            "verify_full 档位不能等于 sqlx 的 Prefer（那是不校验证书）"
+        );
+    }
+
+    #[test]
+    fn verify_full_maps_to_the_strictest_verifying_mode() {
+        // MySQL：只有 VerifyIdentity 验主机名（VerifyCa 不验）
+        assert!(matches!(
+            TlsMode::VerifyFull.to_mysql(),
+            MySqlSslMode::VerifyIdentity
+        ));
+        // PG：只有 VerifyFull 验主机名
+        assert!(matches!(
+            TlsMode::VerifyFull.to_pg(),
+            PgSslMode::VerifyFull
+        ));
+    }
+
+    #[test]
+    fn prefer_encrypts_but_skips_verification_and_is_flagged_as_degraded() {
+        // sqlx 的 Required/Require = 加密但不校验证书 —— 这是**安全降级**，必须被标出来。
+        assert!(matches!(TlsMode::Prefer.to_mysql(), MySqlSslMode::Required));
+        assert!(matches!(TlsMode::Prefer.to_pg(), PgSslMode::Require));
+        assert!(TlsMode::Prefer.skips_certificate_verification());
+    }
+
+    #[test]
+    fn disable_turns_tls_off_entirely() {
+        assert!(matches!(TlsMode::Disable.to_mysql(), MySqlSslMode::Disabled));
+        assert!(matches!(TlsMode::Disable.to_pg(), PgSslMode::Disable));
+        assert!(TlsMode::Disable.skips_certificate_verification());
+    }
+
+    #[test]
+    fn only_verify_full_is_treated_as_verifying() {
+        assert!(!TlsMode::VerifyFull.skips_certificate_verification());
+    }
+
+    #[test]
+    fn unrecognised_values_fall_back_to_the_safe_mode() {
+        // 认不出来的值**不许**回退到宽松档 —— 那是"配错了就悄悄不安全"。
+        assert_eq!(TlsMode::from_str_opt(Some("whatever")), TlsMode::VerifyFull);
+        assert_eq!(TlsMode::from_str_opt(Some("")), TlsMode::VerifyFull);
+        assert_eq!(TlsMode::from_str_opt(None), TlsMode::VerifyFull);
+    }
+
+    #[test]
+    fn configured_mode_wins_over_environment_variable() {
+        // 连接配置里的档位优先于环境变量
+        let env_name = "ZBT_TLS_TEST_MODE";
+        std::env::remove_var(env_name);
+        // 都没有 → 默认（最安全的一档）
+        assert_eq!(resolve_tls_mode(None, env_name), TlsMode::VerifyFull);
+        // 环境变量有值 → 用它
+        std::env::set_var(env_name, "prefer");
+        assert_eq!(resolve_tls_mode(None, env_name), TlsMode::Prefer);
+        // 连接配置有值 → 配置优先
+        assert_eq!(
+            resolve_tls_mode(Some(TlsMode::Disable), env_name),
+            TlsMode::Disable
+        );
+        // 环境变量认不出来 → 仍然回到最安全的一档
+        std::env::set_var(env_name, "nonsense");
+        assert_eq!(resolve_tls_mode(None, env_name), TlsMode::VerifyFull);
+        std::env::remove_var(env_name);
+    }
+
+    #[test]
+    fn config_round_trips_through_serde() {
+        // 连接配置要落盘，所以枚举必须能序列化/反序列化
+        let json = serde_json::to_string(&TlsMode::VerifyFull).unwrap();
+        assert_eq!(json, "\"verify_full\"");
+        let back: TlsMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, TlsMode::VerifyFull);
     }
 }

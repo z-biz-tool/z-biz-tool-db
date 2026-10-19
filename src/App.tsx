@@ -135,7 +135,38 @@ interface DBConnection {
   username: string;
   password: string;
   database: string;
+  /**
+   * T-025：TLS 档位。
+   * - verify_full（默认）：验 CA + 验主机名
+   * - prefer：加密但**不校验证书**（降级，只适合本地开发）
+   * - disable：明文（仅本地隔离）
+   */
+  tlsMode?: TlsMode;
+  /** T-025：企业私有 CA 的证书文件路径（Pem）。内置根证书集是 Mozilla 公共 CA。 */
+  tlsCaPath?: string;
 }
+
+/** T-025：TLS 档位。取值与后端 `TlsMode` 的 serde 形式逐字一致。 */
+type TlsMode = "verify_full" | "prefer" | "disable";
+
+/** TLS 档位的说明文案。界面上必须说清"prefer 不校验证书"，否则用户以为它更安全。 */
+const TLS_MODE_OPTIONS: { value: TlsMode; label: string; hint: string }[] = [
+  {
+    value: "verify_full",
+    label: "校验证书（推荐）",
+    hint: "验证 CA 与主机名。私有 CA 需在下方填写证书文件路径。",
+  },
+  {
+    value: "prefer",
+    label: "加密但不校验证书",
+    hint: "⚠ 安全降级：连接仍加密，但不验证服务器身份。仅限本地开发。",
+  },
+  {
+    value: "disable",
+    label: "不使用 TLS（明文）",
+    hint: "⚠ 密码与数据明文传输。仅限本机隔离环境。",
+  },
+];
 
 // 后端 v2 列元数据（DB-01 / T-001）：前端不再用 Object.keys 推导列名
 interface ColumnMeta {
@@ -904,6 +935,9 @@ function App() {
     username: c.username,
     password: c.password,
     database: c.database,
+    // T-025：TLS 档位与私有 CA 路径一起透传。缺省交给后端落最安全的一档。
+    tls_mode: c.tlsMode ?? null,
+    tls_ca_path: c.tlsCaPath ?? null,
   });
 
   // 报表工作台要一次拿到所有连接的凭据（跨库 join 的每个源各自定位连接）。
@@ -935,6 +969,9 @@ function App() {
             username: c.username ?? "",
             password: c.password ?? "",
             database: c.database ?? "",
+            // T-025：TLS 档位与私有 CA 路径从后端读回
+            tlsMode: c.tls_mode ?? undefined,
+            tlsCaPath: c.tls_ca_path ?? undefined,
           }))
         )
       )
@@ -2531,7 +2568,15 @@ function App() {
           form.resetFields();
         }}
       >
-        <Form form={form} layout="vertical" onFinish={saveConnection}>
+        <Form
+          form={form}
+          layout="vertical"
+          onFinish={saveConnection}
+          // T-025：默认就是最安全的一档（校验证书）。不设默认值的话，
+          // 新建连接时这个下拉是空的，用户不选就等于"没配" —— 后端虽然会兜到安全档，
+          // 但界面上看不出当前是什么档位。
+          initialValues={{ tlsMode: "verify_full" }}
+        >
           <Form.Item name="name" label="连接名称" rules={[{ required: true }]}>
             <Input placeholder="例如：本地 MySQL" />
           </Form.Item>
@@ -2553,7 +2598,10 @@ function App() {
           <Form.Item
             noStyle
             shouldUpdate={(prev, cur) =>
-              prev?.type !== cur?.type || prev?.database !== cur?.database
+              prev?.type !== cur?.type ||
+              prev?.database !== cur?.database ||
+              // T-025：TLS 档位变了，"私有 CA 路径"那栏要跟着出现/消失
+              prev?.tlsMode !== cur?.tlsMode
             }
           >
             {() => {
@@ -2579,6 +2627,35 @@ function App() {
                   {!isSqlite && (
                     <Form.Item name="password" label="密码">
                       <Input.Password placeholder="输入密码" />
+                    </Form.Item>
+                  )}
+                  {/* T-025：TLS 档位。SQLite 是本地文件，没有 TLS 这回事。 */}
+                  {!isSqlite && (
+                    <Form.Item
+                      name="tlsMode"
+                      label="TLS 校验方式"
+                      extra={
+                        TLS_MODE_OPTIONS.find(
+                          (o) => o.value === form.getFieldValue("tlsMode")
+                        )?.hint ?? TLS_MODE_OPTIONS[0].hint
+                      }
+                    >
+                      <Select
+                        placeholder="选择 TLS 校验方式"
+                        options={TLS_MODE_OPTIONS.map((o) => ({
+                          value: o.value,
+                          label: o.label,
+                        }))}
+                      />
+                    </Form.Item>
+                  )}
+                  {!isSqlite && form.getFieldValue("tlsMode") === "verify_full" && (
+                    <Form.Item
+                      name="tlsCaPath"
+                      label="私有 CA 证书路径（可选）"
+                      extra="内置根证书集是 Mozilla 公共 CA；企业自签 CA 请填写 .pem 文件的绝对路径。"
+                    >
+                      <Input placeholder="例如：/etc/ssl/certs/corp-root-ca.pem" />
                     </Form.Item>
                   )}
                   <Form.Item

@@ -733,6 +733,8 @@ mod tests {
             username: String::new(),
             password: String::new(),
             database: path.into(),
+            tls_mode: None,
+            tls_ca_path: None,
         }
     }
 
