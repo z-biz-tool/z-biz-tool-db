@@ -60,8 +60,11 @@ jobs:
       - name: Cargo test (lib + SQLite integration)
         working-directory: src-tauri
         run: |
-          cargo test --lib
-          cargo test --test test_sqlite
+          # `-- --nocapture`：Rust 测试框架默认**吞掉通过用例的 stdout/stderr**
+          # ⇒ 本仓「[LIVE] 跳过 minimax 真实 API 实测…」这类跳过标记在 CI 日志里
+          # 看不见 ⇒ 「没跑」看着跟「跑过了」一样。打开捕获后可核对。
+          cargo test --lib -- --nocapture
+          cargo test --test test_sqlite -- --nocapture
           # MySQL/PG 集成测试需要 docker，标了 #[ignore]，只在手动跑
           # （--no-run 是 cargo 级参数，放在 `--` 后 libtest 会报 Unrecognized option）
           cargo test --lib --no-run
