@@ -75,16 +75,24 @@ jobs:
       # 本地实测 `cargo fmt --all --check` 有 **405 处差异**散在 30 多个文件里，
       # CI 完全不跑 fmt ⇒ 谁把格式改乱了没人知道，评审只能靠肉眼。
       # 格式债已在同一次提交里整仓清零（纯排版重排，Rust + TS 测试全过）。
-      #
-      # **clippy 暂不收严**（如实记账）：本仓 `cargo clippy --all-targets -- -D warnings`
-      # 实测约 **100 条**，其中约 40 条是「从未构造/从未接线」的 API
-      # （Pool / SecretStore / V2Envelope / 连接池 / 密钥持有者等），
-      # 另有多条 `await_holding_lock` 落在测试代码的共享目录锁上。
-      # 这些不是改几行能清的，是「接线还是删掉」的工程判断 ⇒ 不在这一轮里草率收严，
-      # 更不能挂一条永远红的门禁。债记在 lead 的 `06_验收与风险清单.md` R12。
       - name: Format
         working-directory: src-tauri
         run: cargo fmt --all --check
+
+      # 2026-10-22 新增：clippy 收严为 `-D warnings` 并变成门禁。
+      #
+      # 此前**不收严**是有据的：当时 `cargo clippy --all-targets -- -D warnings`
+      # 实测约 100 条告警，其中约 40 条是「从未构造/从未接线」的 API
+      # （Pool / SecretStore / V2Envelope / 连接池 / 密钥持有者等）——
+      # 那不是改几行能清的，是「接线还是删掉」的工程判断。
+      #
+      # 现在这些 API 已**逐个接线或删除**（连接池按参数指纹复用、密钥库接进
+      # save/load_connections、v2 包络接进三个 v2 命令、流式批次接进
+      # query_start/query_next、多语句门禁补上……），本仓 clippy 告警实测归零，
+      # 所以门禁可以挂上。**收严之后 CI 红了就修真 lint，不许回退门禁。**
+      - name: Clippy (deny warnings)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
 
   build:
     needs: test

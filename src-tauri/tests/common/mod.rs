@@ -7,6 +7,11 @@
 // MySQL/PG 集成测试放在 #[ignore] 标记下，CI 在 docker compose up 之后移除 ignore。
 // SQLite 一律打开（不需标记），先在 SQLite 跑过的逻辑必先在 SQLite 内复现。
 
+// 共享辅助模块：每个集成测试二进制只用其中一部分
+// （test_sqlite 用 fresh_data_dir/mysql_available，test_postgres 用 pg_available…），
+// 没被当前二进制用到的那些会报 dead_code —— 那是**模块设计使然**，不是死代码。
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 

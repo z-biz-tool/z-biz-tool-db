@@ -5,7 +5,6 @@
 // 验收：A21 导入中断后已提交批次可查，未提交批次无痕迹。
 
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 
 /// 导入结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +23,12 @@ pub struct PreviewResult {
     pub rows: Vec<Vec<String>>,
     pub total_rows: u64,
     pub encoding: String,
+    /// 编码判定的置信度（0.0-1.0）。
+    ///
+    /// 为什么要给用户看：置信度低（0.5）意味着"其实是 UTF-8，但不敢保证"。
+    /// 只给一个 encoding 名字，用户看到"utf-8"就以为一定是 UTF-8，
+    /// 结果导入后中文全是乱码还不知道原因。
+    pub encoding_confidence: f64,
 }
 
 /// 编码检测结果
@@ -73,11 +78,11 @@ fn is_likely_gbk(bytes: &[u8]) -> bool {
         let b = bytes[i];
         if b < 0x80 {
             i += 1;
-        } else if b >= 0xB0 && b <= 0xF7 {
+        } else if (0xB0..=0xF7).contains(&b) {
             // GBK 首字节范围
             if i + 1 < bytes.len() {
                 let next = bytes[i + 1];
-                if next >= 0x40 && next <= 0xFE {
+                if (0x40..=0xFE).contains(&next) {
                     gbk_chars += 1;
                     i += 2;
                     continue;
@@ -112,7 +117,7 @@ pub fn parse_csv(
                 if b < 0x80 {
                     result.push(b as char);
                     i += 1;
-                } else if b >= 0xB0 && b <= 0xF7 && i + 1 < bytes.len() {
+                } else if (0xB0..=0xF7).contains(&b) && i + 1 < bytes.len() {
                     result.push('\u{FFFD}'); // 替换字符
                     i += 2;
                 } else {
@@ -207,6 +212,7 @@ pub fn preview_csv(bytes: &[u8], delimiter: char, limit: usize) -> Result<Previe
         rows,
         total_rows: data_rows as u64,
         encoding: detection.encoding.to_string(),
+        encoding_confidence: detection.confidence,
     })
 }
 

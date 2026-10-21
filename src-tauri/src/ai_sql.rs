@@ -1447,15 +1447,14 @@ mod tests {
         // 只准备一条好答案：错误单和旧 SQL 在第一轮就同时到场，模型一次改对才算这次
         // 请求没白头发（脚本给多条的话，第二轮起是后端自己在修，量不到这一键）
         let model = scripted(vec!["SELECT o.city, o.amount FROM orders o".into()]);
-        let ticket =
-            format!("重试 1 次后仍未通过本机校验：SQL 用到了目录里不存在的列：orders.net_amount");
+        let ticket = "重试 1 次后仍未通过本机校验：SQL 用到了目录里不存在的列：orders.net_amount";
         let out = generate(
             &model,
             "各城市成交额",
             &catalog(),
             2,
             Some(&prior_draft("各城市成交额", bad)),
-            Some(&ticket),
+            Some(ticket),
         )
         .await
         .unwrap();

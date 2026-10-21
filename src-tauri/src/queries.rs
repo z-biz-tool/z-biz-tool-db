@@ -242,7 +242,7 @@ fn next_revision_for(path: &Path) -> Result<u64, String> {
 }
 
 /// S0：写入前剥离敏感字段（DB-08 / A10）
-fn strip_secrets_from_connections(records: &mut Vec<ConnectionRecord>) {
+fn strip_secrets_from_connections(records: &mut [ConnectionRecord]) {
     for r in records.iter_mut() {
         if !r.password.is_empty() {
             r.password.clear();
@@ -382,7 +382,7 @@ pub async fn delete_report(id: &str) -> Result<(), String> {
 
 pub async fn save_connections(connections: &[ConnectionRecord]) -> Result<(), String> {
     let mut sanitized: Vec<ConnectionRecord> = connections.to_vec();
-    strip_secrets_from_connections(&mut sanitized);
+    strip_secrets_from_connections(sanitized.as_mut_slice());
     save_envelope(&connections_path()?, &sanitized, CURRENT_SCHEMA_VERSION)
 }
 

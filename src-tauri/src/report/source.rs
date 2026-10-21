@@ -817,17 +817,23 @@ mod tests {
     }
 
     /// 回归两件事：① 给 sqlite 加"文件不存在"提示时不能把 :memory: 一起挡掉；
-    /// ② 记下真实限制——每条语句新建一个池，`:memory:` 因此每次都是全新的空库，
-    /// 报表/探查只能走文件库。连接亲和性属于 T-012 会话 actor 的活。
+    /// ② `:memory:` 现在**能用了** —— 连接池按 (连接 id, 参数指纹, 模式) 缓存，
+    /// 且 `:memory:` 的池连接数限 1（多连接时每条连接就是一个独立的库），
+    /// 所以建表与查表落在同一个内存库上。
+    ///
+    /// 改之前这里断言的是"每次都是全新的空库"（那时每条语句都新建池）。
+    /// 那个限制已经没有了，断言要跟着事实走 —— 否则它会挡住真正的修复。
+    /// 残留限制：连接池被 LRU 回收（上限 16 条）后重建，`:memory:` 的数据会丢。
     #[tokio::test]
-    async fn in_memory_sqlite_skips_path_check_but_shares_nothing() {
+    async fn in_memory_sqlite_skips_path_check_and_shares_the_pool() {
         let cfg = sqlite_cfg("mem", ":memory:");
         run_dispatch(&cfg, "CREATE TABLE t (id INTEGER)")
             .await
             .unwrap();
-        let err = describe_columns(&cfg, "", "t").await.unwrap_err();
-        assert!(err.contains("没有可读取的列"), "{}", err);
-        assert!(!err.contains("文件不存在"), "{}", err);
+        let cols = describe_columns(&cfg, "", "t")
+            .await
+            .expect(":memory: 里刚建的表应当能读到列");
+        assert_eq!(cols.len(), 1, "应当读到 1 列");
     }
 
     #[tokio::test]

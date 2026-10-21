@@ -155,9 +155,8 @@ pub fn strip_strings_and_comments(sql: &str) -> String {
 }
 
 fn utf8_char_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b < 0xC0 {
+    // 0x00-0xBF 都是单字节（0x80-0xBF 是 UTF-8 的后续字节）
+    if b < 0xC0 {
         1
     } else if b < 0xE0 {
         2
@@ -169,22 +168,22 @@ fn utf8_char_len(b: u8) -> usize {
 }
 
 /// 计算多语句中首条之外的语句数量（按分号切分，忽略字符串/注释内的分号——已剥除）
+/// 多语句计数：**首条之外**还有几条语句。
+///
+/// 旧实现数的是"第一个分号之后还有几个分号"，于是
+/// `SELECT 1; DROP TABLE x`（结尾没有分号）被判成 **0 条额外语句**
+/// —— 也就是"只有一条安全语句"，只读通道会放行。
+/// （ai_sql.rs 早就绕开了这个坑：它自己按顶层分号数。）
+/// 现在按"顶层分号切出来的非空段数 - 1"算，结尾有没有分号都对。
 fn count_extra_statements(stripped: &str) -> u32 {
-    let mut count = 0u32;
-    let mut found_first = false;
-    for ch in stripped.chars() {
-        if ch == ';' {
-            if found_first {
-                count += 1;
-            } else {
-                found_first = true;
-            }
-        }
-    }
-    if !found_first {
+    let statements = stripped
+        .split(';')
+        .filter(|seg| !seg.trim().is_empty())
+        .count();
+    if statements == 0 {
         0
     } else {
-        count
+        (statements - 1) as u32
     }
 }
 
@@ -353,6 +352,25 @@ mod tests {
         let c = classify("SELECT 1; DROP TABLE t;");
         assert_eq!(c.kind, StatementKind::Query);
         assert_eq!(c.other_statements, 1);
+    }
+
+    /// 结尾**没有**分号时也必须数出来。
+    ///
+    /// 旧实现数的是"第一个分号之后还有几个分号"，`SELECT 1; DROP TABLE t`
+    /// 会被算成 0 条额外语句 ⇒ 静态分类器说它只有一条安全语句 ⇒
+    /// 只读通道放行。这是真的漏判，必须钉住。
+    #[test]
+    fn multi_statement_detects_second_without_trailing_semicolon() {
+        let c = classify("SELECT 1; DROP TABLE t");
+        assert_eq!(c.kind, StatementKind::Query);
+        assert_eq!(c.other_statements, 1, "结尾没分号时也要数出第二条语句");
+    }
+
+    /// 单语句（末尾带不带分号）都不能被误判成多语句。
+    #[test]
+    fn single_statement_is_not_multi() {
+        assert_eq!(classify("SELECT 1").other_statements, 0);
+        assert_eq!(classify("SELECT 1;").other_statements, 0);
     }
 
     #[test]

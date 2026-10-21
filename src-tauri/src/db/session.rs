@@ -11,13 +11,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// T-031 常量配置
 pub const MAX_BATCH_ROWS: usize = 500;
-pub const MAX_BATCH_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
+pub const MAX_BATCH_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const MAX_QUEUE_BATCHES: usize = 2;
 
 /// 查询状态机
@@ -96,7 +96,9 @@ impl TransactionState {
 }
 
 /// 单个结果批次
-#[derive(Debug, Clone)]
+///
+/// 走 IPC 边界 ⇒ 必须可序列化。
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryBatch {
     pub seq: u32,
     pub columns: Vec<crate::ColumnMeta>,
@@ -136,11 +138,33 @@ impl QueryRegistry {
         }
     }
 
+    /// 注册表最多留多少条作业。超了先清掉**已终结**的（成功/失败/取消/未知），
+    /// 还在跑的一条都不动 —— 否则每次查询都往里塞一条，进程跑久了会一直涨。
+    pub const MAX_JOBS: usize = 256;
+
     pub fn insert(&self, job: QueryJobInternal) {
-        self.inner
-            .lock()
-            .expect("registry lock")
-            .insert(job.query_id.clone(), job);
+        let mut guard = self.inner.lock().expect("registry lock");
+        guard.insert(job.query_id.clone(), job);
+        if guard.len() > Self::MAX_JOBS {
+            // 先挑出已终结的，再逐条 remove —— 清理走公开 API，不在锁里做二次加锁。
+            let stale: Vec<String> = guard
+                .iter()
+                .filter(|(_, j)| {
+                    matches!(
+                        j.state,
+                        QueryState::Succeeded
+                            | QueryState::Failed
+                            | QueryState::Cancelled
+                            | QueryState::Unknown
+                    )
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            drop(guard);
+            for k in stale {
+                self.remove(&k);
+            }
+        }
     }
 
     pub fn get_state(&self, query_id: &str) -> Option<(QueryState, String)> {
@@ -172,6 +196,26 @@ impl QueryRegistry {
         }
     }
 
+    /// 查询被取消（取消请求已生效）⇒ 状态 `Cancelled`。
+    pub fn mark_cancelled(&self, query_id: &str) {
+        if let Some(job) = self.inner.lock().expect("registry lock").get_mut(query_id) {
+            job.cancel_requested = true;
+            job.state = QueryState::Cancelled;
+            job.state_msg = "查询已取消".into();
+        }
+    }
+
+    /// 状态不可判定（连接没了 / 池被回收）⇒ 状态 `Unknown`。
+    ///
+    /// 与"取消失败"是两回事：`Unknown` 说的是**我们不知道这条查询怎么了**，
+    /// 界面上必须提示用户"这条连接可能还在跑，先隔离再重连"。
+    pub fn mark_unknown(&self, query_id: &str) {
+        if let Some(job) = self.inner.lock().expect("registry lock").get_mut(query_id) {
+            job.state = QueryState::Unknown;
+            job.state_msg = "状态不可判定（连接已不可用）".into();
+        }
+    }
+
     pub fn pending_count(&self) -> usize {
         self.inner
             .lock()
@@ -191,6 +235,27 @@ impl QueryRegistry {
 
     pub fn remove(&self, query_id: &str) {
         self.inner.lock().expect("registry lock").remove(query_id);
+    }
+
+    /// 取出这条作业的批次通道发送端。
+    ///
+    /// 生产者（后台任务）**从作业这里借**通道，而不是自己另造一个：
+    /// 作业是通道的所有者，作业没了通道也就跟着没了（生命周期单一）。
+    pub fn batch_sender(&self, query_id: &str) -> Option<mpsc::Sender<QueryBatch>> {
+        self.inner
+            .lock()
+            .expect("registry lock")
+            .get(query_id)
+            .map(|j| j.batch_tx.clone())
+    }
+
+    /// 这一单跑了多久（毫秒）。查无此作业 ⇒ None。
+    pub fn elapsed_ms(&self, query_id: &str) -> Option<u128> {
+        self.inner
+            .lock()
+            .expect("registry lock")
+            .get(query_id)
+            .map(|j| j.start_time.elapsed().as_millis())
     }
 
     // T-043：获取事务状态
@@ -318,12 +383,15 @@ impl QueryRegistry {
     }
 
     // T-046：记录写操作影响行数并检测冲突（0 行影响 = 乐观并发冲突）
+    //
+    // 冲突标记按**最近一次**写操作判定（不是粘住的）：事务里第一条更新没命中
+    // 并不代表整笔事务有冲突 —— 后续语句命中了，这次更新就是"条件不满足"，
+    // 不是并发冲突。粘住会让界面一直报冲突，误导用户。
     pub fn record_write_impact(&self, query_id: &str, affected_rows: u64) {
         if let Some(job) = self.inner.lock().expect("registry lock").get_mut(query_id) {
             job.last_affected_rows = affected_rows;
-            if affected_rows == 0 && job.transaction_state == TransactionState::Active {
-                job.conflict_detected = true;
-            }
+            job.conflict_detected =
+                affected_rows == 0 && job.transaction_state == TransactionState::Active;
         }
     }
 
@@ -337,13 +405,37 @@ impl QueryRegistry {
             .unwrap_or(false)
     }
 
-    // T-046：标记 COMMIT 响应丢失（committing → unknown）
+    // T-043：标记 COMMIT 响应丢失（committing → unknown）
     pub fn mark_commit_response_lost(&self, query_id: &str) {
         if let Some(job) = self.inner.lock().expect("registry lock").get_mut(query_id) {
             if job.transaction_state == TransactionState::Committing {
                 job.transaction_state = TransactionState::Unknown;
                 job.state_msg = "COMMIT 响应丢失".into();
             }
+        }
+    }
+
+    /// 事务里的一条语句失败 ⇒ 事务进入 `failed`（不是"还在跑"）。
+    ///
+    /// 为什么要单独记：事务里失败的那条语句之后，这个事务**能不能继续**是未知的
+    /// （有的驱动会直接把它 abort 掉）。界面必须能区分"事务失败"与"查询失败"。
+    pub fn mark_transaction_failed(&self, query_id: &str) {
+        if let Some(job) = self.inner.lock().expect("registry lock").get_mut(query_id) {
+            if job.transaction_state == TransactionState::Active {
+                job.transaction_state = TransactionState::Failed;
+                job.state_msg = "事务内语句失败".into();
+            }
+        }
+    }
+
+    /// 事务结束（提交或回滚完成）⇒ 作业状态置为 `Succeeded`（不再算"在途"）。
+    ///
+    /// 与 `mark_succeeded` 分开：那个说的是"一条查询跑完了"，
+    /// 这个说的是"一条**事务**结束了"，两者的 state_msg 不同。
+    pub fn mark_transaction_finished(&self, query_id: &str, msg: &str) {
+        if let Some(job) = self.inner.lock().expect("registry lock").get_mut(query_id) {
+            job.state = QueryState::Succeeded;
+            job.state_msg = msg.to_string();
         }
     }
 
@@ -356,6 +448,94 @@ impl QueryRegistry {
             .map(|j| j.transaction_state == TransactionState::Unknown)
             .unwrap_or(false)
     }
+}
+
+// ================== T-031：流式查询（query_start / query_next） ==================
+
+/// 一条流式查询的共享状态：生产者写、消费者读。
+///
+/// 为什么要共享而不是各存各的：生产者是后台任务，消费者是命令，
+/// 两边必须对"流结束了吗 / 出错了吗"有**同一个**答案，
+/// 否则前端会拿到一批数据后永远等不到结束标记。
+#[derive(Debug)]
+pub struct StreamShared {
+    /// 生产者出错时的原因（消费者在读到结束标记时读它）
+    pub error: Option<String>,
+    /// 生产者已推完（且已把最后一批推进队列）
+    pub done: bool,
+    /// 已推送的行数
+    pub pushed_rows: u64,
+    /// 是否因为达到 max_rows 上限而提前收尾
+    pub truncated: bool,
+    /// 下一批的序号
+    pub next_seq: u32,
+    /// 流的状态
+    pub state: QueryState,
+    /// 列元信息（第一批到达后才有）
+    pub columns: Vec<crate::ColumnMeta>,
+}
+
+impl Default for StreamShared {
+    fn default() -> Self {
+        Self {
+            error: None,
+            done: false,
+            pushed_rows: 0,
+            truncated: false,
+            next_seq: 0,
+            state: QueryState::Queued,
+            columns: Vec::new(),
+        }
+    }
+}
+
+/// 消费者端：持有接收端与共享状态。
+#[derive(Clone)]
+pub struct StreamEntry {
+    pub stream_id: String,
+    /// 批次队列。`tokio::sync::Mutex` 而不是裸 Receiver：
+    /// 消费者要 `await recv()`，期间不能让别的 `query_next` 插进来。
+    pub rx: Arc<tokio::sync::Mutex<mpsc::Receiver<QueryBatch>>>,
+    pub shared: Arc<Mutex<StreamShared>>,
+    pub start_time: Instant,
+}
+
+/// 流式查询注册表（进程内单例）
+#[derive(Default)]
+pub struct StreamRegistry {
+    inner: tokio::sync::Mutex<HashMap<String, Arc<StreamEntry>>>,
+}
+
+impl StreamRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn insert(&self, entry: Arc<StreamEntry>) {
+        self.inner
+            .lock()
+            .await
+            .insert(entry.stream_id.clone(), entry);
+    }
+
+    pub async fn get(&self, stream_id: &str) -> Option<Arc<StreamEntry>> {
+        self.inner.lock().await.get(stream_id).cloned()
+    }
+
+    pub async fn remove(&self, stream_id: &str) -> Option<Arc<StreamEntry>> {
+        self.inner.lock().await.remove(stream_id)
+    }
+
+    pub async fn count(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+}
+
+static STREAMS: OnceLock<StreamRegistry> = OnceLock::new();
+
+/// 全局流注册表。
+pub fn streams() -> &'static StreamRegistry {
+    STREAMS.get_or_init(StreamRegistry::new)
 }
 
 static REGISTRY: OnceLock<QueryRegistry> = OnceLock::new();

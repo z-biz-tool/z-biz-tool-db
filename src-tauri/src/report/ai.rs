@@ -785,9 +785,9 @@ pub async fn draft(
     repairs: u8,
     prior: Option<&PriorReport>,
     feedback: Option<&str>,
-) -> Result<DraftResult, DraftReject> {
+) -> Result<DraftResult, Box<DraftReject>> {
     if question.trim().is_empty() {
-        return Err(DraftReject::of("请先描述你想要什么报表"));
+        return Err(Box::new(DraftReject::of("请先描述你想要什么报表")));
     }
     // 空白的上一版只会往提示词里塞噪音，当作没带
     let prior = prior.filter(|p| !p.draft.datasets.is_empty() || !p.draft.view.widgets.is_empty());
@@ -802,7 +802,7 @@ pub async fn draft(
         let raw = model
             .complete(prompt(question, catalog, prior, feedback.as_deref()))
             .await
-            .map_err(DraftReject::of)?;
+            .map_err(|e| Box::new(DraftReject::of(e)))?;
         let parsed = match parse_draft(&raw) {
             Ok(d) => d,
             Err(e) => {
@@ -825,10 +825,10 @@ pub async fn draft(
             }
         }
     }
-    Err(DraftReject {
+    Err(Box::new(DraftReject {
         error: format!("重试 {} 次后仍未通过本地校验：{}", rounds + 1, last),
         draft: rejected,
-    })
+    }))
 }
 
 /// 从模型回复里挖出 JSON 并反序列化成草稿
@@ -1311,8 +1311,8 @@ pub async fn ai_report_draft(
     max_repairs: Option<u8>,
     prior: Option<PriorReport>,
     feedback: Option<String>,
-) -> Result<DraftResult, DraftReject> {
-    let model = HttpModel::new(config).map_err(DraftReject::of)?;
+) -> Result<DraftResult, Box<DraftReject>> {
+    let model = HttpModel::new(config).map_err(|e| Box::new(DraftReject::of(e)))?;
     draft(
         &model,
         &question,

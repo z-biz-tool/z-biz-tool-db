@@ -73,6 +73,7 @@ import {
   DashboardOutlined,
   CheckCircleOutlined,
   ThunderboltOutlined,
+  WarningOutlined,
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 // 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
@@ -144,6 +145,13 @@ interface DBConnection {
   tlsMode?: TlsMode;
   /** T-025：企业私有 CA 的证书文件路径（Pem）。内置根证书集是 Mozilla 公共 CA。 */
   tlsCaPath?: string;
+  /**
+   * T-014：凭据状态。后端取值："" = 从未存过密码；"ok" = 明文已还原；
+   * "missing" = 取不回来了（进程重启 / 密钥丢失），**必须重新输入密码**。
+   */
+  credentialState?: string;
+  /** T-014：取不回密码的原因，后端给的中文说明，直接展示给用户。 */
+  credentialNote?: string;
 }
 
 /** T-025：TLS 档位。取值与后端 `TlsMode` 的 serde 形式逐字一致。 */
@@ -972,6 +980,9 @@ function App() {
             // T-025：TLS 档位与私有 CA 路径从后端读回
             tlsMode: c.tls_mode ?? undefined,
             tlsCaPath: c.tls_ca_path ?? undefined,
+            // T-014：凭据状态（missing = 密码取不回来了，要提示用户重输）
+            credentialState: c.credential_state ?? undefined,
+            credentialNote: c.credential_note ?? undefined,
           }))
         )
       )
@@ -1534,10 +1545,26 @@ function App() {
   };
 
   // 断开连接
-  const disconnectDB = () => {
+  // T-011：**真的告诉后端关掉这条连接的连接池**。
+  // 改之前这里只清了前端状态，后端的池还活着 —— 数据库端的会话不释放，
+  // 用户以为断开了其实没有；改了密码之后旧凭据的池也还在被复用。
+  const disconnectDB = async () => {
+    const conn = selectedConnection;
     setIsConnected(false);
     setSelectedConnection(null);
     setQueryResults([]);
+    if (conn) {
+      try {
+        const report = await invoke<any>("close_pool", {
+          connectionId: conn.id,
+          revision: 0,
+        });
+        msgApi.info(`已断开连接（关闭 ${report?.closed_pools ?? 0} 个连接池）`);
+        return;
+      } catch (e: any) {
+        msgApi.warning(`断开连接时释放后端连接池失败: ${e}`);
+      }
+    }
     msgApi.info("已断开连接");
   };
 
@@ -1903,6 +1930,11 @@ function App() {
                 >
                   <span>{conn.name}</span>
                   <Space size="small">
+                    {conn.credentialState === "missing" ? (
+                      <Tooltip title={conn.credentialNote ?? "密码取不回来了，请重新输入"}>
+                        <WarningOutlined style={{ color: "#faad14" }} />
+                      </Tooltip>
+                    ) : null}
                     <Tooltip title="编辑">
                       <EditOutlined
                         onClick={(e) => {

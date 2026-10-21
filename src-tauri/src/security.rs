@@ -26,6 +26,29 @@ pub enum ApprovalError {
     Consumed(String),
 }
 
+impl ApprovalError {
+    /// 给用户看的原因（**不是** Debug 打印：`Missing("...")` 那层壳对用户没意义）。
+    ///
+    /// 改之前 lib.rs 用 `format!("审批校验失败: {:?}", e)`，把枚举变体名和引号
+    /// 一起糊给用户看；这里把真正的 payload 拿出来。
+    pub fn message(&self) -> &str {
+        match self {
+            ApprovalError::Missing(m)
+            | ApprovalError::Expired(m)
+            | ApprovalError::SqlMismatch(m)
+            | ApprovalError::Consumed(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for ApprovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for ApprovalError {}
+
 pub fn digest_sql(sql: &str) -> String {
     // S0 简化：用 sql 首 64 字节 + 长度作为摘要；S3 将换成带密钥的 HMAC
     let head: String = sql.chars().take(64).collect();

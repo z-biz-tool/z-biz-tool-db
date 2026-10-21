@@ -27,6 +27,25 @@ export interface StructuredError {
   raw: string;
 }
 
+/**
+ * 后端给的**机器可读错误码**（src-tauri/src/db/ipc.rs 的同一份清单）。
+ *
+ * 后端错误串形如 `READONLY_BLOCKED: 只读模式拒绝 ...`：
+ * 有码就采信码，没有才退回中文正则匹配（老后端 / 第三方库错误）。
+ */
+const CODE_TABLE: Record<string, { category: ErrorCategory; retryable: boolean }> = {
+  AUTHZ_DENIED:      { category: "authz",            retryable: false },
+  READONLY_BLOCKED:  { category: "readonly_blocked", retryable: false },
+  APPROVAL_DENIED:   { category: "approval",         retryable: false },
+  STALE_GENERATION:  { category: "stale_generation", retryable: true  },
+  INVALID_PORT:      { category: "invalid_port",     retryable: false },
+  SECRET_STRIPPED:   { category: "secret_stripped",  retryable: false },
+  SQL_CLASSIFY:      { category: "sql_classify",     retryable: false },
+  CONNECTION_FAILED: { category: "connection",       retryable: true  },
+  IPC_ERROR:         { category: "ipc",              retryable: true  },
+  UNKNOWN:           { category: "unknown",          retryable: true  },
+};
+
 const KNOWN_PATTERNS: Array<{ category: ErrorCategory; pattern: RegExp; code: string; retryable: boolean }> = [
   { category: "authz",            pattern: /AUTHZ|认证|授权|无权/,                            code: "AUTHZ_DENIED",         retryable: false },
   { category: "readonly_blocked", pattern: /只读模式拒绝/,                                    code: "READONLY_BLOCKED",     retryable: false },
@@ -40,6 +59,22 @@ const KNOWN_PATTERNS: Array<{ category: ErrorCategory; pattern: RegExp; code: st
 ];
 
 export function classifyError(raw: string): StructuredError {
+  // 1) 后端带了机器可读码 ⇒ 直接采信，不再用正则猜
+  const m = /^([A-Z][A-Z0-9_]*):\s*([\s\S]*)$/.exec(raw);
+  if (m) {
+    const known = CODE_TABLE[m[1]];
+    if (known) {
+      const body = m[2].length > 240 ? m[2].slice(0, 240) + "…" : m[2];
+      return {
+        category: known.category,
+        code: m[1],
+        retryable: known.retryable,
+        safe_message: body,
+        raw,
+      };
+    }
+  }
+  // 2) 老后端 / 第三方错误：中文正则匹配
   for (const k of KNOWN_PATTERNS) {
     if (k.pattern.test(raw)) {
       return {

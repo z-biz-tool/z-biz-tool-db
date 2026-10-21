@@ -14,7 +14,7 @@ mod db;
 mod queries;
 pub mod report;
 #[path = "secrets.rs"]
-mod secrets;
+pub mod secrets;
 #[path = "security.rs"]
 mod security;
 
@@ -128,7 +128,6 @@ fn build_timings(
     connect_start: std::time::Instant,
     exec_start: std::time::Instant,
 ) -> Timings {
-    let now = std::time::Instant::now();
     let connect_ms = connect_start.elapsed().as_millis() as u64;
     let execute_ms = exec_start.elapsed().as_millis() as u64;
     Timings {
@@ -269,6 +268,15 @@ pub struct ConnectionRecord {
     /// T-025：企业私有 CA 的证书文件路径（Pem）。
     #[serde(default)]
     pub tls_ca_path: Option<String>,
+    /// T-014：密码的密钥库引用。**落盘只存这个索引，绝不存明文**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<crate::secrets::SecretRef>,
+    /// T-014：凭据状态。""=从未存过密码；ok=明文已还原；missing=取不回来了，需重输。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credential_state: String,
+    /// T-014：取不回密码时给用户看的原因。**必须展示**，不能只把密码清空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_note: Option<String>,
 }
 
 fn default_environment() -> String {
@@ -287,34 +295,42 @@ fn de_port<'de, D>(d: D) -> Result<u16, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
+    // 端口非法一律带 INVALID_PORT 前缀：前端 errors.ts 认这个码，
+    // 中文正文（"端口…超过/端口字段/端口字符串"）保持不变 ⇒ 正则那条路也还在。
+    fn invalid_port(msg: &str) -> String {
+        db::ipc::ApiError::invalid_port(msg).to_wire()
+    }
     let v = serde_json::Value::deserialize(d)?;
     match v {
         serde_json::Value::Number(n) => {
             let raw = n
                 .as_u64()
                 .or_else(|| n.as_i64().map(|i| i.max(0) as u64))
-                .ok_or_else(|| serde::de::Error::custom("端口必须为非负整数"))?;
+                .ok_or_else(|| serde::de::Error::custom(invalid_port("端口必须为非负整数")))?;
             if raw > u16::MAX as u64 {
-                return Err(serde::de::Error::custom(format!(
+                return Err(serde::de::Error::custom(invalid_port(&format!(
                     "端口 {} 超过 u16 上限 {}",
                     raw,
                     u16::MAX
-                )));
+                ))));
             }
-            if raw == 0 {
-                return Err(serde::de::Error::custom("端口不能为 0"));
-            }
+            // 0 = "未指定"：SQLite 连接根本没有端口，前端也会送 0。
+            // 端口是否合法**取决于驱动** ⇒ 在建池时按驱动校验
+            // （MySQL/PG 端口为 0 会被拒），这里放行。
             Ok(raw as u16)
         }
         serde_json::Value::String(s) => {
             let t = s.trim();
             if t.is_empty() {
-                return Err(serde::de::Error::custom("端口字符串为空"));
+                return Err(serde::de::Error::custom(invalid_port("端口字符串为空")));
             }
-            t.parse::<u16>()
-                .map_err(|_| serde::de::Error::custom(format!("无法解析端口字符串: {}", s)))
+            t.parse::<u16>().map_err(|_| {
+                serde::de::Error::custom(invalid_port(&format!("无法解析端口字符串: {}", s)))
+            })
         }
-        _ => Err(serde::de::Error::custom("端口必须是数字或字符串")),
+        _ => Err(serde::de::Error::custom(invalid_port(
+            "端口必须是数字或字符串",
+        ))),
     }
 }
 
@@ -370,18 +386,14 @@ const POOL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// - verify_full（默认）：强制校验 CA + 主机名
 /// - prefer：未配置证书时不阻断本地开发，但记录警告
 /// - disable：仅本地隔离可显式选择，连接元数据保留可识别标记
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsMode {
+    /// 缺省 = 最安全的一档（验 CA + 验主机名）
+    #[default]
     VerifyFull,
     Prefer,
     Disable,
-}
-
-impl Default for TlsMode {
-    fn default() -> Self {
-        TlsMode::VerifyFull
-    }
 }
 
 impl TlsMode {
@@ -426,6 +438,16 @@ impl TlsMode {
     pub fn skips_certificate_verification(self) -> bool {
         matches!(self, TlsMode::Prefer | TlsMode::Disable)
     }
+
+    /// 档位名。与 serde 的 `rename_all = "snake_case"` 逐字一致
+    /// （`verify_full` / `prefer` / `disable`）—— 显示与指纹都用它，避免两处各写一份。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TlsMode::VerifyFull => "verify_full",
+            TlsMode::Prefer => "prefer",
+            TlsMode::Disable => "disable",
+        }
+    }
 }
 
 /// 解析这个连接该用哪一档 TLS。
@@ -434,12 +456,17 @@ impl TlsMode {
 /// 缺省一律落到最安全的那一档 —— 认不出来的值也不回退到宽松档。
 fn resolve_tls_mode(configured: Option<TlsMode>, env_var: &str) -> TlsMode {
     configured.unwrap_or_else(|| {
-        TlsMode::from_str_opt(std::env::var(env_var).ok().as_ref().map(|s| s.as_str()))
+        let env_value = std::env::var(env_var).ok();
+        TlsMode::from_str_opt(env_value.as_deref())
     })
 }
 
-async fn mysql_pool(cfg: &DBConfig) -> Result<MySqlPool, String> {
+async fn mysql_pool_new(cfg: &DBConfig, max_connections: u32) -> Result<MySqlPool, String> {
     let (host, port) = split_host_port(&cfg.host, cfg.port);
+    // 端口是否合法取决于驱动：SQLite 不用端口，MySQL/PG 必须有。
+    if port == 0 {
+        return Err(db::ipc::ApiError::invalid_port("MySQL 连接必须指定端口（1-65535）").to_wire());
+    }
     // T-025：TLS 模式。连接配置优先，其次环境变量，缺省落到最安全的一档。
     let mode = resolve_tls_mode(cfg.tls_mode, "MYSQL_TLS_MODE");
     let mut opts = MySqlConnectOptions::new()
@@ -463,6 +490,7 @@ async fn mysql_pool(cfg: &DBConfig) -> Result<MySqlPool, String> {
         CONNECT_TIMEOUT,
         sqlx::pool::PoolOptions::<sqlx::MySql>::new()
             .acquire_timeout(POOL_CONNECT_TIMEOUT)
+            .max_connections(max_connections)
             .connect_with(opts),
     )
     .await
@@ -472,8 +500,13 @@ async fn mysql_pool(cfg: &DBConfig) -> Result<MySqlPool, String> {
     .map_err(|e| e.to_string())
 }
 
-async fn pg_pool(cfg: &DBConfig) -> Result<PgPool, String> {
+async fn pg_pool_new(cfg: &DBConfig, max_connections: u32) -> Result<PgPool, String> {
     let (host, port) = split_host_port(&cfg.host, cfg.port);
+    if port == 0 {
+        return Err(
+            db::ipc::ApiError::invalid_port("PostgreSQL 连接必须指定端口（1-65535）").to_wire(),
+        );
+    }
     let mode = resolve_tls_mode(cfg.tls_mode, "PG_TLS_MODE");
     let mut opts = PgConnectOptions::new()
         .host(&host)
@@ -494,6 +527,7 @@ async fn pg_pool(cfg: &DBConfig) -> Result<PgPool, String> {
     tokio::time::timeout(
         CONNECT_TIMEOUT,
         sqlx::pool::PoolOptions::<sqlx::Postgres>::new()
+            .max_connections(max_connections)
             .acquire_timeout(POOL_CONNECT_TIMEOUT)
             .connect_with(opts),
     )
@@ -504,7 +538,7 @@ async fn pg_pool(cfg: &DBConfig) -> Result<PgPool, String> {
     .map_err(|e| e.to_string())
 }
 
-async fn sqlite_pool(cfg: &DBConfig) -> Result<SqlitePool, String> {
+async fn sqlite_pool_new(cfg: &DBConfig, max_connections: u32) -> Result<SqlitePool, String> {
     let path = cfg.database.trim();
     if path.is_empty() {
         return Err("SQLite 需要在「数据库名」中填写数据库文件路径".to_string());
@@ -526,10 +560,126 @@ async fn sqlite_pool(cfg: &DBConfig) -> Result<SqlitePool, String> {
         }
     }
     let opts = SqliteConnectOptions::new().filename(path);
-    tokio::time::timeout(CONNECT_TIMEOUT, SqlitePool::connect_with(opts))
+    // SQLite 的连接数**必须**是 1：
+    // - `:memory:` 模式下**每条连接就是一个独立的数据库** ⇒ 多连接时
+    //   "建表"和"查询"可能落在不同库上 ⇒ 报 "no such table"；
+    // - 事务必须落在同一条连接上 ⇒ 多连接时 BEGIN 与 COMMIT 不同连接
+    //   ⇒ 报 "no transaction is active"。
+    // 代价是 SQLite 访问串行化 —— 对桌面工具的本地库可以接受，
+    // 换来的是"建了表就一定能查到"。
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        sqlx::pool::PoolOptions::<sqlx::Sqlite>::new()
+            .max_connections(max_connections)
+            .connect_with(opts),
+    )
+    .await
+    .map_err(|_| "SQLite 打开超时：文件可能被其它进程独占或位于慢速网络盘".to_string())?
+    .map_err(|e| e.to_string())
+}
+
+// ================== 连接池缓存 ==================
+
+/// 取（或建）连接池：走全局 `ConnectionManager` 缓存。
+///
+/// **2026-10-22 实测修正**：改之前 `mysql_pool(&config)` 每次调用都
+/// `connect_with(...)` **新建一个池** —— 等于每条查询都重新握手 + 重新鉴权，
+/// 而 `ConnectionManager`（缓存层，A04 验收要求"同一连接多次查询复用池"）
+/// 当时**没有任何生产调用点**。
+///
+/// 缓存键 = (连接 id, 参数指纹, access_mode)：
+/// - 参数指纹保证「改了 host / 密码 / 库名」之后拿到的是**新池**，
+///   不会拿旧池去连旧库（旧池还带着旧凭据）；
+/// - access_mode 分开「只读池」与「可写池」，两者身份不共享。
+async fn pooled(
+    config: &DBConfig,
+    access_mode: &str,
+) -> Result<crate::db::connection::AnyPool, String> {
+    use crate::db::connection::{fingerprint, pool_registry, AnyPool, PoolKey};
+    let key = PoolKey {
+        connection_id: config.id.clone(),
+        fingerprint: fingerprint(config),
+        access_mode: access_mode.to_string(),
+    };
+    pool_registry()
+        .get_or_insert(key, || async {
+            match dispatch_db_type(config)? {
+                "mysql" => Ok(AnyPool::MySql(mysql_pool_new(config, 10).await?)),
+                "postgresql" => Ok(AnyPool::Pg(pg_pool_new(config, 10).await?)),
+                // `:memory:` 每条连接就是一个独立的库 ⇒ 只能 1 条连接，
+                // 否则"建表"和"查询"可能落在不同的库上。文件库可以多连。
+                "sqlite" => Ok(AnyPool::Sqlite(
+                    sqlite_pool_new(config, sqlite_conn_limit(config)).await?,
+                )),
+                _ => Err("不支持的数据库类型".to_string()),
+            }
+        })
         .await
-        .map_err(|_| "SQLite 打开超时：文件可能被其它进程独占或位于慢速网络盘".to_string())?
-        .map_err(|e| e.to_string())
+}
+
+/// SQLite 池的连接数上限。
+///
+/// `:memory:` 模式下**每条连接都是一个独立的数据库** ⇒ 连接数必须为 1，
+/// 否则建表与查询可能落在不同的库上（"no such table"）。
+/// 文件库没有这个限制，保持并发。
+fn sqlite_conn_limit(cfg: &DBConfig) -> u32 {
+    let db = cfg.database.trim();
+    if db == ":memory:" || db.starts_with("file:") {
+        1
+    } else {
+        10
+    }
+}
+
+/// T-043：取**事务专属**的单连接池。
+///
+/// `create` 为真 ⇒ 新开一个（BEGIN 时用）；为假 ⇒ 取已存在的
+/// （事务中的普通语句、COMMIT、ROLLBACK 都用它 ⇒ 落在同一条连接上）。
+async fn tx_pool(
+    config: &DBConfig,
+    create: bool,
+) -> Result<crate::db::connection::AnyPool, String> {
+    use crate::db::connection::{pool_registry, AnyPool};
+    let registry = pool_registry();
+    if !create {
+        return registry
+            .tx_pool(&config.id)
+            .ok_or_else(|| "事务已结束或尚未开始（没有进行中的事务）".to_string());
+    }
+    if let Some(p) = registry.tx_pool(&config.id) {
+        return Ok(p);
+    }
+    // 单连接池：事务期间的每一条语句都落在同一条连接上
+    let pool = match dispatch_db_type(config)? {
+        "mysql" => AnyPool::MySql(mysql_pool_new(config, 1).await?),
+        "postgresql" => AnyPool::Pg(pg_pool_new(config, 1).await?),
+        "sqlite" => AnyPool::Sqlite(sqlite_pool_new(config, 1).await?),
+        _ => return Err("不支持的数据库类型".to_string()),
+    };
+    registry.insert_tx_pool(&config.id, pool.clone());
+    Ok(pool)
+}
+
+/// 只读池：表结构 / 元数据 / 报表取数等一律走这条。
+async fn mysql_pool(cfg: &DBConfig) -> Result<MySqlPool, String> {
+    match pooled(cfg, "readOnly").await? {
+        crate::db::connection::AnyPool::MySql(p) => Ok(p),
+        _ => Err("连接池类型与请求不符".to_string()),
+    }
+}
+
+async fn pg_pool(cfg: &DBConfig) -> Result<PgPool, String> {
+    match pooled(cfg, "readOnly").await? {
+        crate::db::connection::AnyPool::Pg(p) => Ok(p),
+        _ => Err("连接池类型与请求不符".to_string()),
+    }
+}
+
+async fn sqlite_pool(cfg: &DBConfig) -> Result<SqlitePool, String> {
+    match pooled(cfg, "readOnly").await? {
+        crate::db::connection::AnyPool::Sqlite(p) => Ok(p),
+        _ => Err("连接池类型与请求不符".to_string()),
+    }
 }
 
 fn dispatch_db_type(cfg: &DBConfig) -> Result<&'static str, String> {
@@ -640,7 +790,7 @@ fn bytes_to_value(v: Option<Vec<u8>>) -> serde_json::Value {
 fn base64_encode(bytes: &[u8]) -> String {
     // 不引入额外依赖，使用简易 base64 编码
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
         let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
@@ -1219,28 +1369,35 @@ pub struct MigrationReport {
     pub total_connections: u32,
     pub needs_reentry: u32,
     pub up_to_date: u32,
-    pub repaired: u32,
+    /// T-014：需要重新输入密码的连接，**逐条列出**。
+    /// 只给一个计数的话用户没法知道该去改哪一条。
+    pub missing_credentials: Vec<db::credentials::MissingCredential>,
+}
+
+async fn migration_report_with(
+    store: &dyn secrets::SecretStore,
+) -> Result<MigrationReport, String> {
+    // T-014：迁移报告的判据从"猜 revision 水位"改成**真的去密钥库取一次**。
+    // 旧口径（revision < 水位 ⇒ needs_reentry）与实际能不能取回密码无关，
+    // 报出来的数是假的。
+    let raw = queries::load_connections().await?;
+    let (unsealed, missing) = db::credentials::unseal(store, raw);
+    let up_to_date = unsealed
+        .iter()
+        .filter(|c| c.credential_state == db::credentials::CREDENTIAL_OK)
+        .count() as u32;
+    Ok(MigrationReport {
+        total_connections: unsealed.len() as u32,
+        needs_reentry: missing.len() as u32,
+        up_to_date,
+        missing_credentials: missing,
+    })
 }
 
 #[command]
 async fn run_secret_migration() -> Result<MigrationReport, String> {
-    let conns = queries::load_connections().await?;
-    let mut needs_reentry = 0u32;
-    let mut up_to_date = 0u32;
-    let repaired = 0u32;
-    for c in &conns {
-        if c.revision < CURRENT_MIGRATION_WATERMARK {
-            needs_reentry += 1;
-        } else {
-            up_to_date += 1;
-        }
-    }
-    Ok(MigrationReport {
-        total_connections: conns.len() as u32,
-        needs_reentry,
-        up_to_date,
-        repaired,
-    })
+    let store = secrets::secret_store();
+    migration_report_with(store.as_ref()).await
 }
 
 // T-046：检查连接 revision 是否与持久化一致；
@@ -1283,6 +1440,36 @@ async fn execute_query(
     max_rows: Option<u32>,
 ) -> Result<QueryResult, String> {
     let start = std::time::Instant::now();
+    // T-013：先把这一单登记为"在途"，取消协议才有得匹配。
+    // 改之前 in-flight 表**从来没被 register 过** ⇒ 任何取消请求都只能拿到 NotFound。
+    //
+    // 请求标识仍是 **UUID v4**（T-018 验收：`query_id_is_uuid_v4` 钉着这条），
+    // 外面套一层 `gen{generation}|` 前缀（T-022 的代次透传）。
+    // 前端拿到的整个字符串就是取消/查状态用的 key ⇒ 三处必须是同一个字符串。
+    let generation = expected_generation.unwrap_or(0);
+    let query_id = format!("gen{}|{}", generation, uuid::Uuid::new_v4());
+    crate::db::cancel::in_flight().register(
+        &config.id,
+        query_id.clone(),
+        security::digest_sql(&sql),
+    );
+
+    // T-031：把这一单登记进作业注册表 —— 成功/失败/取消才有地方可标，
+    // 状态查询也才有东西可查（改之前普通查询**从不进**注册表，
+    // 于是 `mark_succeeded` / `mark_failed` / `get_state` 全是只有测试在调的死代码）。
+    db::session::registry().insert(db::session::QueryJobInternal {
+        query_id: query_id.clone(),
+        state: db::session::QueryState::Running,
+        state_msg: "执行中".into(),
+        cancel_requested: false,
+        start_time: std::time::Instant::now(),
+        batch_tx: tokio::sync::mpsc::channel(1).0,
+        transaction_state: db::session::TransactionState::Idle,
+        generation,
+        conflict_detected: false,
+        last_affected_rows: 0,
+    });
+
     let result = execute_query_inner(
         sql.clone(),
         config.clone(),
@@ -1290,8 +1477,24 @@ async fn execute_query(
         approval,
         expected_generation,
         max_rows,
+        query_id.clone(),
     )
     .await;
+
+    // 终态写进作业注册表：成功 ⇒ succeeded，失败 ⇒ failed（带原因）。
+    match &result {
+        Ok(_) => db::session::registry().mark_succeeded(&query_id),
+        Err(e) => db::session::registry().mark_failed(&query_id, e),
+    }
+
+    // 查询结束（成功或失败）⇒ 从在途表摘掉。
+    // 若这一单曾请求过取消，`finish` 会回 `Confirmed`（取消已生效）。
+    let cancel_outcome = crate::db::cancel::in_flight().finish(&query_id);
+    if let Some(state) = cancel_outcome {
+        // 取消生效：把作业状态也标成"已取消"，让状态查询与取消协议说同一件事。
+        db::session::registry().mark_cancelled(&query_id);
+        let _ = state;
+    }
 
     // T-035：所有终态（成功或失败）都记录历史
     match &result {
@@ -1325,6 +1528,102 @@ async fn execute_query(
     result
 }
 
+/// 事务状态机拒绝时的错误。
+///
+/// 代次不匹配 ⇒ `STALE_GENERATION`（结果过期，重试有意义）；
+/// 其它状态非法 ⇒ `UNKNOWN`，但都要带上**当时的事务状态**，
+/// 否则界面只知道"被拒了"，不知道"事务现在处于什么状态"。
+fn tx_state_error(
+    action: &str,
+    detail: &str,
+    state: Option<db::session::TransactionState>,
+    query_id: &str,
+) -> String {
+    let msg = format!("事务状态机拒绝 {}：{}", action, detail);
+    let state_str = state
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let err = if detail.contains("generation 不匹配") {
+        db::ipc::ApiError::stale_generation(&msg)
+    } else {
+        db::ipc::ApiError::unknown("execute_query", &msg)
+    };
+    err.with_transaction_state(&state_str)
+        .with_query_id(query_id)
+        .to_wire()
+}
+
+/// 执行前的门禁：只读通道 / 写审批。
+///
+/// 抽成独立函数的理由：`execute_query` 与 `query_start`（T-031 流式）
+/// 必须用**同一套**门禁。两份判据迟早漂移，漂移的后果就是
+/// "流式接口能绕过审批" —— 那比没有审批更坏。
+fn gate_execution(
+    sql: &str,
+    mode: &str,
+    approval: Option<&security::ApprovalGrant>,
+    classification: db::sql_classify::Classification,
+    query_id: &str,
+) -> Result<db::sql_classify::Classification, String> {
+    // 多语句一律拒（**两个通道都拒**）。
+    //
+    // 为什么：审批/只读判据都只看**第一条**语句。`SELECT 1; DROP TABLE x`
+    // 的第一条是安全 SELECT ⇒ 会被放行，后面那条却能删表。
+    // 之前 `classify` 的多语句计数还少算一条（结尾没分号时算成 0），
+    // 等于这道门根本没关。现在计数修对了，门也真的关上了。
+    if classification.other_statements > 0 {
+        return Err(db::ipc::ApiError::sql_classify(&format!(
+            "多语句被拒：这条 SQL 含 {} 条语句，只允许单语句执行",
+            classification.other_statements + 1
+        ))
+        .with_query_id(query_id)
+        .to_wire());
+    }
+    match mode {
+        "readOnly" => {
+            if !matches!(
+                classification.safety,
+                db::sql_classify::SafetyClass::ReadOnlySafe
+            ) {
+                // 包含 ReadOnlyUnsafe/Write/Unknown 一律拒绝只读通道。
+                // 错误带机器可读码 READONLY_BLOCKED：前端 errors.ts 优先认码，
+                // 中文正文保持原样 ⇒ 认码的老前端也不受影响。
+                return Err(db::ipc::ApiError::readonly_blocked(
+                    &format!("{:?}", classification.kind),
+                    &format!("{:?}", classification.safety),
+                )
+                .with_query_id(query_id)
+                .to_wire());
+            }
+        }
+        "writable" => {
+            // T-055：生产/staging 环境强制额外审批门槛（除普通 approval 外）
+            let env = approval
+                .map(|g| g.environment.as_str())
+                .unwrap_or("unknown");
+            // 写操作需要审批
+            security::evaluate(
+                approval,
+                classification.kind,
+                classification.safety,
+                sql,
+                chrono::Utc::now().timestamp(),
+                env,
+            )
+            .map_err(|e| {
+                // 用真实消息（ApprovalError::message），不是 `{:?}` 的枚举壳
+                db::ipc::ApiError::approval_denied(&format!("审批校验失败: {}", e.message()))
+                    .with_query_id(query_id)
+                    .to_wire()
+            })?;
+        }
+        other => {
+            return Err(format!("未知 access_mode: {}", other));
+        }
+    }
+    Ok(classification)
+}
+
 async fn execute_query_inner(
     sql: String,
     config: DBConfig,
@@ -1332,6 +1631,7 @@ async fn execute_query_inner(
     approval: Option<security::ApprovalGrant>,
     expected_generation: Option<u32>,
     max_rows: Option<u32>,
+    query_id: String,
 ) -> Result<QueryResult, String> {
     if sql.trim().is_empty() {
         return Err("SQL 语句为空".to_string());
@@ -1340,112 +1640,193 @@ async fn execute_query_inner(
 
     // T-023：用词法分类器判定语句族与安全级别
     let classification = db::sql_classify::classify(&sql);
-    match mode.as_str() {
-        "readOnly" => {
-            if !matches!(
-                classification.safety,
-                db::sql_classify::SafetyClass::ReadOnlySafe
-            ) {
-                // 包含 ReadOnlyUnsafe/Write/Unknown 一律拒绝只读通道
-                return Err(format!(
-                    "只读模式拒绝 {:?}：kind={:?}, safety={:?}",
-                    classification.kind, classification.kind, classification.safety
-                ));
-            }
-        }
-        "writable" => {
-            // T-055：生产/staging 环境强制额外审批门槛（除普通 approval 外）
-            let env = approval
-                .as_ref()
-                .map(|g| g.environment.as_str())
-                .unwrap_or("unknown");
-            // 写操作需要审批
-            security::evaluate(
-                approval.as_ref(),
-                classification.kind,
-                classification.safety,
-                &sql,
-                chrono::Utc::now().timestamp(),
-                approval
-                    .as_ref()
-                    .map(|g| g.environment.as_str())
-                    .unwrap_or("unknown"),
-            )
-            .map_err(|e| format!("审批校验失败: {:?}", e))?;
-        }
-        other => {
-            return Err(format!("未知 access_mode: {}", other));
-        }
-    }
+    gate_execution(&sql, &mode, approval.as_ref(), classification, &query_id)?;
 
     // T-041：分段耗时 — 队列/连接/执行分别计时
     let start = std::time::Instant::now();
-    let db_type = dispatch_db_type(&config)?;
+    // 类型先校验：不支持的类型要在这里就说清楚，而不是等到建池才炸。
+    dispatch_db_type(&config)?;
     let connect_start = std::time::Instant::now();
     // 只有 sqlite + 有上限时走流式；Some(true) = 还有更多行没取，总数未数过
     let cap = max_rows.map(|m| m as usize);
     let mut streamed_more: Option<bool> = None;
-    let dispatch_result = match db_type {
-        "mysql" => {
-            let pool = mysql_pool(&config).await?;
+    // T-043：事务状态跟踪。
+    //
+    // **2026-10-22 修正**：改之前这里 BEGIN 时直接塞一个
+    // `transaction_state: Active` 的条目 —— **绕过状态机**：generation 没校验、
+    // `can_transition` 没参与。于是 `TransactionState` 状态机
+    // （Idle / Failed / Unknown + can_transition）在生产构建里是**死代码**，
+    // 只有测试在调它（而测试永远绿 ⇒ 看起来是好的）。
+    //
+    // 现在：状态转换在**跑 SQL 之前**做 —— 否则 COMMIT 失败之后状态还停在 Active，
+    // 界面根本看不出"这个事务到底提交了没有"。转换是否合法由状态机自己判。
+    let reg = db::session::registry();
+    let tx_gen = expected_generation.unwrap_or(0);
+    let conn_key = format!("{}:{}", config.id, tx_gen);
+    let tx_kind = db::sql_classify::classify(&sql).kind;
+    let upper = sql.trim().to_ascii_uppercase();
+    let tx_action: Option<&'static str> =
+        if matches!(tx_kind, db::sql_classify::StatementKind::TxControl) {
+            if upper.starts_with("BEGIN") {
+                // 先登记成 Idle，再由状态机走 Idle → Active（顺带校验 generation）。
+                // 已有事务时不覆盖：那样第二次 BEGIN 会把 Active 重置掉，
+                // 状态机也就没机会拒它了。
+                match reg.get_transaction_state(&conn_key) {
+                    None => {
+                        reg.insert(db::session::QueryJobInternal {
+                            query_id: conn_key.clone(),
+                            state: db::session::QueryState::Running,
+                            state_msg: "事务已开始".into(),
+                            cancel_requested: false,
+                            start_time: std::time::Instant::now(),
+                            batch_tx: tokio::sync::mpsc::channel(1).0,
+                            transaction_state: db::session::TransactionState::Idle,
+                            generation: tx_gen,
+                            conflict_detected: false,
+                            last_affected_rows: 0,
+                        });
+                    }
+                    Some(db::session::TransactionState::Idle) => {}
+                    Some(_) => {
+                        // 上一个事务已经终结（提交/回滚/失败/未知）⇒ 先重置成 Idle。
+                        // 不重置的话，**同一条连接上的第二个 BEGIN 会被状态机拒死**
+                        // （Committed/RolledBack 都不允许 → Active），用户再也开不了新事务。
+                        // 仍在进行中（Active）的除外 —— 那种情况本来就该被拒。
+                        reg.reset_transaction_to_idle(&conn_key);
+                    }
+                }
+                reg.begin_transaction(&conn_key, tx_gen).map_err(|e| {
+                    tx_state_error("BEGIN", &e, reg.get_transaction_state(&conn_key), &conn_key)
+                })?;
+                Some("begin")
+            } else if upper.starts_with("COMMIT") {
+                reg.commit_transaction(&conn_key, tx_gen).map_err(|e| {
+                    tx_state_error(
+                        "COMMIT",
+                        &e,
+                        reg.get_transaction_state(&conn_key),
+                        &conn_key,
+                    )
+                })?;
+                Some("commit")
+            } else if upper.starts_with("ROLLBACK") {
+                reg.rollback_transaction(&conn_key, tx_gen).map_err(|e| {
+                    tx_state_error(
+                        "ROLLBACK",
+                        &e,
+                        reg.get_transaction_state(&conn_key),
+                        &conn_key,
+                    )
+                })?;
+                Some("rollback")
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // 池走全局缓存（2026-10-22）：同一 (连接, 参数指纹, access_mode) 复用同一个池。
+    // 改之前这里每次都新建一个池 ⇒ 每条查询都重新握手 + 重新鉴权。
+    //
+    // T-043：但**事务期间必须换池** —— 事务的每一条语句都要落在**同一条连接**上。
+    // 普通池有多条连接 ⇒ BEGIN 与 COMMIT 会落到不同连接 ⇒ 数据库端根本没有
+    // 这个事务（COMMIT 报 "no transaction is active"，MySQL 上更糟：
+    // 悄悄提交了一个空事务，而界面显示"事务已提交"）。
+    let pool = match tx_action {
+        Some("begin") => tx_pool(&config, true).await,
+        Some("commit") | Some("rollback") => match tx_pool(&config, false).await {
+            Ok(p) => Ok(p),
+            // 没有事务池（没 BEGIN 过，或已被回收）⇒ 交给数据库报真实错误
+            Err(_) => pooled(&config, &mode).await,
+        },
+        _ => {
+            if crate::db::connection::pool_registry().has_tx_pool(&config.id) {
+                tx_pool(&config, false).await
+            } else {
+                pooled(&config, &mode).await
+            }
+        }
+    }
+    .map_err(|e| {
+        db::ipc::ApiError::connection_failed(&e)
+            .with_query_id(&query_id)
+            .to_wire()
+    })?;
+    let dispatch_result = match pool {
+        crate::db::connection::AnyPool::MySql(pool) => {
             let es = std::time::Instant::now();
             mysql_run(&pool, &sql)
                 .await
                 .map(|r| (r.0, r.1, r.2, r.3, es))
         }
-        "postgresql" => {
-            let pool = pg_pool(&config).await?;
+        crate::db::connection::AnyPool::Pg(pool) => {
             let es = std::time::Instant::now();
             pg_run(&pool, &sql).await.map(|r| (r.0, r.1, r.2, r.3, es))
         }
-        "sqlite" => {
-            let pool = sqlite_pool(&config).await?;
+        crate::db::connection::AnyPool::Sqlite(pool) => {
             let es = std::time::Instant::now();
             sqlite_run_capped(&pool, &sql, cap).await.map(|(r, more)| {
                 streamed_more = if cap.is_some() { Some(more) } else { None };
                 (r.0, r.1, r.2, r.3, es)
             })
         }
-        _ => return Err("不支持的数据库类型".to_string()),
     };
 
     let (column_meta, mut rows, affected, is_query, exec_start) = match dispatch_result {
         Ok(v) => v,
-        Err(e) => return Err(e),
-    };
-    // T-018：使用 UUID v4 作为请求标识
-    let id = uuid::Uuid::new_v4().to_string();
-
-    // T-043：事务状态跟踪 — 检测 TxControl 语句并更新 registry
-    let reg = db::session::registry();
-    let tx_kind = db::sql_classify::classify(&sql).kind;
-    if matches!(tx_kind, db::sql_classify::StatementKind::TxControl) {
-        let upper = sql.trim().to_ascii_uppercase();
-        let conn_key = format!("{}:{}", config.id, expected_generation.unwrap_or(0));
-        if upper.starts_with("BEGIN") {
-            let _ = reg.insert(db::session::QueryJobInternal {
-                query_id: conn_key.clone(),
-                state: db::session::QueryState::Running,
-                state_msg: "事务已开始".into(),
-                cancel_requested: false,
-                start_time: std::time::Instant::now(),
-                batch_tx: tokio::sync::mpsc::channel(1).0,
-                transaction_state: db::session::TransactionState::Active,
-                generation: expected_generation.unwrap_or(0),
-                conflict_detected: false,
-                last_affected_rows: 0,
-            });
-        } else if upper.starts_with("COMMIT") {
-            reg.mark_committed(&conn_key);
-        } else if upper.starts_with("ROLLBACK") {
-            reg.mark_rolled_back(&conn_key);
+        Err(e) => {
+            // 语句失败：事务状态按"结果未知"推进，绝不假装它还停在老状态。
+            match tx_action {
+                Some("commit") => reg.mark_commit_response_lost(&conn_key),
+                Some("rollback") => reg.mark_transaction_unknown(&conn_key),
+                _ => {
+                    // 事务进行中的一条普通语句失败 ⇒ 事务进入 failed
+                    if reg.get_transaction_state(&conn_key)
+                        == Some(db::session::TransactionState::Active)
+                    {
+                        reg.mark_transaction_failed(&conn_key);
+                    }
+                }
+            }
+            // 语句本身失败：既不是连接问题也不是审批问题 ⇒ UNKNOWN
+            return Err(db::ipc::ApiError::unknown("execute_query", &e)
+                .with_query_id(&query_id)
+                .to_wire());
         }
+    };
+
+    // T-046：写操作记录影响行数。0 行且在事务里 ⇒ 乐观并发冲突
+    // （更新没命中任何行，用户以为改成功了，其实什么都没改）。
+    if !is_query {
+        reg.record_write_impact(&query_id, affected);
     }
+
+    // 事务结束（COMMIT/ROLLBACK 成功）⇒ 丢弃事务池，后续语句回到普通池。
+    if matches!(tx_action, Some("commit") | Some("rollback")) {
+        crate::db::connection::pool_registry().remove_tx_pool(&config.id);
+    }
+
+    // 事务语句成功 ⇒ 推进状态机
+    match tx_action {
+        // BEGIN 之后事务仍然是 Active（这条"作业"要一直挂到 COMMIT/ROLLBACK）
+        Some("begin") => {}
+        Some("commit") => {
+            reg.mark_committed(&conn_key);
+            reg.mark_transaction_finished(&conn_key, "事务已提交");
+        }
+        Some("rollback") => {
+            reg.mark_rolled_back(&conn_key);
+            reg.mark_transaction_finished(&conn_key, "事务已回滚");
+        }
+        _ => {}
+    }
+    // T-018/T-013：请求标识就是外层登记在途时用的那个 query_id ——
+    // 界面拿它去查状态、去请求取消，后端拿它去认这一单，三处必须是同一个。
 
     let columns: Vec<String> = column_meta.iter().map(|m| m.name.clone()).collect();
 
-    // T-022 generation 透传：UI 可携带并比对
-    let generation = expected_generation.unwrap_or(0);
+    // T-022 generation 透传：UI 可携带并比对（query_id 里已带 `gen{generation}|` 前缀）
 
     // T-031：max_rows 截断。sqlite 那条已经在取数时停了，"还有更多"是确定的，
     // 但总行数没数过——total_rows 给 0，由前端说"后面的行没取"而不是编一个总数。
@@ -1463,7 +1844,7 @@ async fn execute_query_inner(
     };
 
     let mut result = QueryResult {
-        id,
+        id: query_id.clone(),
         columns,
         column_meta,
         rows,
@@ -1474,7 +1855,7 @@ async fn execute_query_inner(
         truncated,
         total_rows,
     };
-    result.id = format!("gen{}|{}", generation, result.id);
+    result.id = query_id;
     Ok(result)
 }
 
@@ -1495,12 +1876,24 @@ pub struct MetadataListV2 {
 }
 
 #[command]
-async fn metadata_list_v2(config: DBConfig) -> Result<MetadataListV2, String> {
-    let kind = dispatch_db_type(&config)?;
+async fn metadata_list_v2(config: DBConfig) -> Result<db::ipc::V2Envelope<MetadataListV2>, String> {
+    // v2 契约：成功与失败走同一个返回类型（`Err` 分支装业务错误）。
+    // 外层的 `Err(String)` 只留给"包络都构造不出来"这种没法装进包络的情况。
+    match metadata_list_v2_inner(&config).await {
+        Ok(data) => Ok(db::ipc::V2Envelope::ok(data, &config.id)),
+        Err(e) => Ok(db::ipc::V2Envelope::err(db::ipc::ApiError::unknown(
+            "metadata_list",
+            &e,
+        ))),
+    }
+}
+
+async fn metadata_list_v2_inner(config: &DBConfig) -> Result<MetadataListV2, String> {
+    let kind = dispatch_db_type(config)?;
     let mut objects = Vec::new();
     match kind {
         "postgresql" => {
-            let pool = pg_pool(&config).await?;
+            let pool = pg_pool(config).await?;
             let rows = sqlx::query(
                 "SELECT n.nspname AS schema, c.relname AS name, c.relkind AS kind \
                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -1528,7 +1921,7 @@ async fn metadata_list_v2(config: DBConfig) -> Result<MetadataListV2, String> {
             }
         }
         "mysql" => {
-            let pool = mysql_pool(&config).await?;
+            let pool = mysql_pool(config).await?;
             let rows = sqlx::query(
                 "SELECT table_name AS name, table_type FROM information_schema.tables \
                  WHERE table_schema = ? ORDER BY table_name",
@@ -1553,7 +1946,7 @@ async fn metadata_list_v2(config: DBConfig) -> Result<MetadataListV2, String> {
             }
         }
         "sqlite" => {
-            let pool = sqlite_pool(&config).await?;
+            let pool = sqlite_pool(config).await?;
             let rows = sqlx::query(
                 "SELECT type, name FROM sqlite_master \
                  WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -1582,27 +1975,361 @@ async fn metadata_list_v2(config: DBConfig) -> Result<MetadataListV2, String> {
 }
 
 // T-019 v2 IPC：query_status_v2
-// 接受 queryId 返回 InFlight 状态快照（暂只骨架，未与执行器绑活）
+//
+// **2026-10-22 修正**：改之前这个命令**写死**返回 `Pending`，
+// 消息是"v2 命令已注册；具体状态接入待 session actor 完成" ——
+// 也就是说它从来没查过任何东西。现在它真的去查两张表：
+// 作业注册表（这一单跑成什么样了）+ 在途注册表（还剩几单在跑、取消有没有被受理）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryStatusV2 {
+    pub query_id: String,
+    /// 作业状态：queued/running/succeeded/failed/cancelled/unknown/…
+    pub state: String,
+    /// 状态说明（失败时是原因）
+    pub message: String,
+    /// 在途快照（这一单还在跑时才有）
+    pub in_flight: Option<crate::db::cancel::QueryStatus>,
+    /// 当前在途作业数
+    pub pending_jobs: usize,
+    /// 已请求取消、还没确认的条数
+    pub pending_cancels: usize,
+    /// 这一单已经跑了多久（毫秒）；查无此作业时为 None
+    pub elapsed_ms: Option<u128>,
+    /// 是否检测到乐观并发冲突（写操作影响 0 行）
+    pub has_conflict: bool,
+    /// 事务状态是否不可判定（不可自动重试，得先隔离连接）
+    pub transaction_unknown: bool,
+    /// 全局在途查询总数
+    pub in_flight_total: usize,
+    /// 当前打开的流式查询条数
+    pub open_streams: usize,
+    /// 这条流式查询已经跑了多久（毫秒）；不是流式查询时为 None
+    pub stream_elapsed_ms: Option<u128>,
+}
+
 #[command]
-async fn query_status_v2(query_id: String) -> Result<crate::db::cancel::CancelResponse, String> {
-    // 当前 InFlightRegistry 是每进程单例；S1 接入后将通过这里查询；
-    // 现在直接返回 cancelled accepted 状态机正在 pending。
-    Ok(crate::db::cancel::CancelResponse {
-        query_id,
-        state: crate::db::cancel::CancelState::Pending,
-        message: "v2 命令已注册；具体状态接入待 session actor 完成".to_string(),
-    })
+async fn query_status_v2(query_id: String) -> Result<db::ipc::V2Envelope<QueryStatusV2>, String> {
+    let reg = db::session::registry();
+    // 查无此作业 ⇒ 状态 unknown（**不是**"没这单"：这一单可能只是已经跑完了）
+    let (state, message) = reg.get_state(&query_id).unwrap_or((
+        db::session::QueryState::Unknown,
+        "查无此作业（可能已结束或从未在本进程登记）".to_string(),
+    ));
+    Ok(db::ipc::V2Envelope::ok(
+        QueryStatusV2 {
+            query_id: query_id.clone(),
+            state: state.as_str().to_string(),
+            message,
+            in_flight: db::cancel::in_flight().status(&query_id),
+            pending_jobs: reg.pending_count(),
+            pending_cancels: db::cancel::in_flight().pending_count(),
+            elapsed_ms: reg.elapsed_ms(&query_id),
+            has_conflict: reg.has_conflict(&query_id),
+            transaction_unknown: reg.is_transaction_unknown(&query_id),
+            in_flight_total: db::cancel::in_flight().in_flight_count(),
+            open_streams: db::session::streams().count().await,
+            stream_elapsed_ms: db::session::streams()
+                .get(&query_id)
+                .await
+                .map(|entry| entry.start_time.elapsed().as_millis()),
+        },
+        &query_id,
+    ))
 }
 
 // T-019 v2 IPC：query_cancel_v2
 #[command]
-async fn query_cancel_v2(query_id: String) -> Result<crate::db::cancel::CancelResponse, String> {
-    use crate::db::cancel::InFlightRegistry;
-    // 内部取全局注册：S1 拆出 static OnceLock 后可寻址
-    // 这里使用本地注册实例；生产应替换为全局唯一实例
-    static REG: std::sync::OnceLock<InFlightRegistry> = std::sync::OnceLock::new();
-    let reg = REG.get_or_init(InFlightRegistry::new);
-    Ok(reg.cancel(&query_id))
+async fn query_cancel_v2(
+    query_id: String,
+) -> Result<db::ipc::V2Envelope<crate::db::cancel::CancelResponse>, String> {
+    // 全局唯一注册表：取消命令与状态命令必须查**同一张表**，
+    // 否则会出现"取消说受理了、状态说查无此单"这种自相矛盾。
+    let resp = db::cancel::in_flight().cancel(&query_id);
+    // 取消请求已受理 ⇒ 作业状态标成"取消中"（界面据此显示"正在请求取消"）。
+    if matches!(resp.state, crate::db::cancel::CancelState::Accepted) {
+        db::session::registry().mark_cancel_requested(&query_id);
+    }
+    Ok(db::ipc::V2Envelope::ok(resp, &query_id))
+}
+
+/// T-031：流式取数的**生产端**（三个驱动同构 ⇒ 宏展开同一份逻辑）。
+///
+/// 为什么用宏而不是泛型：sqlx 的行类型（MySqlRow / PgRow / SqliteRow）
+/// 与 `fetch()` 返回的流类型都随驱动变化，泛型化要引入一层 trait 体操；
+/// 而这段逻辑只有三十来行，宏展开三次比抽象层更清楚。
+///
+/// 背压：批次队列容量是 `MAX_QUEUE_BATCHES`，`send().await` 在队列满时**等待**
+/// ⇒ 前端不取，生产者就停在这儿（内存不会一路涨）。
+macro_rules! stream_rows {
+    ($pool:expr, $sql:expr, $max_rows:expr, $tx:expr, $shared:expr, $cell_fn:path) => {{
+        use futures_util::TryStreamExt;
+        let mut conn = match $pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                let mut sh = $shared.lock().unwrap_or_else(|p| p.into_inner());
+                sh.error = Some(format!("取连接失败: {}", e));
+                sh.state = db::session::QueryState::Failed;
+                sh.done = true;
+                return;
+            }
+        };
+        let mut stream = sqlx::query($sql).fetch(&mut *conn);
+        let mut meta: Vec<ColumnMeta> = Vec::new();
+        let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut seq = 0u32;
+        let mut total = 0u64;
+        let mut truncated = false;
+        loop {
+            let row = match stream.try_next().await {
+                Ok(Some(r)) => r,
+                Ok(None) => break,
+                Err(e) => {
+                    let mut sh = $shared.lock().unwrap_or_else(|p| p.into_inner());
+                    sh.error = Some(format!("取数失败: {}", e));
+                    sh.state = db::session::QueryState::Failed;
+                    sh.done = true;
+                    return;
+                }
+            };
+            if let Some(m) = $max_rows {
+                if total >= m as u64 {
+                    truncated = true;
+                    // 截断要**当场**记进共享状态：消费者可能在生产者收尾之前
+                    // 就拿到最后一批，那时 shared.truncated 还没更新就报成"没截断"。
+                    $shared.lock().unwrap_or_else(|p| p.into_inner()).truncated = true;
+                    break;
+                }
+            }
+            if meta.is_empty() {
+                meta = column_meta_from_row(row.columns());
+            }
+            let mut cells = Vec::with_capacity(row.columns().len());
+            for i in 0..row.columns().len() {
+                cells.push($cell_fn(&row, i));
+            }
+            let row_bytes: usize = cells.iter().map(|c| c.to_string().len()).sum();
+            // 批边界：行数上限 或 字节上限，谁先到算谁
+            if !rows.is_empty()
+                && (rows.len() >= db::session::MAX_BATCH_ROWS
+                    || bytes + row_bytes > db::session::MAX_BATCH_BYTES)
+            {
+                let batch = db::session::QueryBatch {
+                    seq,
+                    columns: meta.clone(),
+                    rows: std::mem::take(&mut rows),
+                    truncated: false,
+                    affected_rows: 0,
+                };
+                // 队列满了就等（背压）；消费者没了就收工
+                let sent = batch.rows.len() as u64;
+                if $tx.send(batch).await.is_err() {
+                    return;
+                }
+                {
+                    let mut sh = $shared.lock().unwrap_or_else(|p| p.into_inner());
+                    sh.pushed_rows += sent;
+                    sh.next_seq = seq + 1;
+                }
+                seq += 1;
+                bytes = 0;
+            }
+            bytes += row_bytes;
+            rows.push(cells);
+            total += 1;
+        }
+        // 收尾：把不满一批的也推出去（空结果也推一个空批，消费者据此知道"到头了"）
+        let batch = db::session::QueryBatch {
+            seq,
+            columns: meta.clone(),
+            rows: std::mem::take(&mut rows),
+            truncated,
+            affected_rows: 0,
+        };
+        let sent = batch.rows.len() as u64;
+        let _ = $tx.send(batch).await;
+        let mut sh = $shared.lock().unwrap_or_else(|p| p.into_inner());
+        sh.done = true;
+        sh.truncated = truncated || sh.truncated;
+        sh.pushed_rows += sent;
+        sh.columns = meta;
+        sh.state = db::session::QueryState::Succeeded;
+    }};
+}
+
+/// T-031：流式查询的启动结果。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryStreamStart {
+    /// 流句柄（后续用 query_next 传它）。**不是**请求 id —— 请求 id 仍是 UUID v4。
+    pub stream_id: String,
+    /// 列元信息
+    pub columns: Vec<ColumnMeta>,
+    /// 第一批
+    pub first_batch: db::session::QueryBatch,
+    /// 流状态：queued / streaming / succeeded / failed
+    pub state: String,
+    /// 已推送到队列里的行数（不含还在队列里没被取走的部分）
+    pub pushed_rows: u64,
+    /// 是否因为达到 max_rows 上限而截断（后面还有更多）
+    pub truncated: bool,
+}
+
+/// T-031：起一条流式查询。
+///
+/// 与 `execute_query` 的区别：结果**分批**返回，不会一次性把十万行塞进内存。
+/// 门禁与 `execute_query` 完全一致（同一个 `gate_execution`）——
+/// 两套判据漂移的后果就是"流式接口能绕过审批"。
+#[tauri::command]
+async fn query_start(
+    config: DBConfig,
+    sql: String,
+    access_mode: Option<String>,
+    approval: Option<security::ApprovalGrant>,
+    expected_generation: Option<u32>,
+    max_rows: Option<u32>,
+) -> Result<QueryStreamStart, String> {
+    if sql.trim().is_empty() {
+        return Err("SQL 语句为空".to_string());
+    }
+    let mode = access_mode.unwrap_or_else(|| "readOnly".to_string());
+    let classification = db::sql_classify::classify(&sql);
+    // 流式的句柄就是这次的请求标识（用于错误定位）
+    let stream_id = db::session::next_query_id();
+    gate_execution(&sql, &mode, approval.as_ref(), classification, &stream_id)?;
+
+    let max_rows = max_rows.map(|m| m as usize);
+    let (tx, rx) = tokio::sync::mpsc::channel(db::session::MAX_QUEUE_BATCHES);
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(db::session::StreamShared::default()));
+    let entry = std::sync::Arc::new(db::session::StreamEntry {
+        stream_id: stream_id.clone(),
+        rx: std::sync::Arc::new(tokio::sync::Mutex::new(rx)),
+        shared: shared.clone(),
+        start_time: std::time::Instant::now(),
+    });
+    db::session::streams().insert(entry.clone()).await;
+
+    // 作业登记：状态从 Queued 开始（前端据此显示"排队中"）
+    // 作业是批次通道的**所有者**；生产者随后从作业这里借通道。
+    let reg = db::session::registry();
+    reg.insert(db::session::QueryJobInternal {
+        query_id: stream_id.clone(),
+        state: db::session::QueryState::Queued,
+        state_msg: "排队中".into(),
+        cancel_requested: false,
+        start_time: std::time::Instant::now(),
+        batch_tx: tx,
+        transaction_state: db::session::TransactionState::Idle,
+        generation: expected_generation.unwrap_or(0),
+        conflict_detected: false,
+        last_affected_rows: 0,
+    });
+    let tx_task = reg
+        .batch_sender(&stream_id)
+        .expect("刚登记的作业一定有批次通道");
+
+    // 生产者：后台任务，边取边推
+    let pool = pooled(&config, &mode).await.map_err(|e| {
+        db::ipc::ApiError::connection_failed(&e)
+            .with_query_id(&stream_id)
+            .to_wire()
+    })?;
+    let shared_task = shared.clone();
+    let sql_task = sql.clone();
+    tokio::spawn(async move {
+        match pool {
+            crate::db::connection::AnyPool::MySql(p) => {
+                stream_rows!(p, &sql_task, max_rows, tx_task, shared_task, mysql_cell)
+            }
+            crate::db::connection::AnyPool::Pg(p) => {
+                stream_rows!(p, &sql_task, max_rows, tx_task, shared_task, pg_cell)
+            }
+            crate::db::connection::AnyPool::Sqlite(p) => {
+                stream_rows!(p, &sql_task, max_rows, tx_task, shared_task, sqlite_cell)
+            }
+        }
+    });
+
+    // 等第一批：拿到它才知道列长什么样
+    let first = {
+        let mut rx = entry.rx.lock().await;
+        rx.recv().await
+    };
+    let first = match first {
+        Some(b) => b,
+        None => {
+            let msg = {
+                let sh = shared.lock().unwrap_or_else(|p| p.into_inner());
+                sh.error
+                    .clone()
+                    .unwrap_or_else(|| "流式查询未能启动".to_string())
+            };
+            db::session::streams().remove(&stream_id).await;
+            reg.mark_failed(&stream_id, &msg);
+            return Err(msg);
+        }
+    };
+    {
+        let mut sh = shared.lock().unwrap_or_else(|p| p.into_inner());
+        sh.state = db::session::QueryState::Streaming;
+        sh.next_seq = first.seq + 1;
+        sh.columns = first.columns.clone();
+    }
+    reg.mark_succeeded(&stream_id);
+    let (pushed_rows, truncated) = {
+        let sh = shared.lock().unwrap_or_else(|p| p.into_inner());
+        (sh.pushed_rows, sh.truncated)
+    };
+    Ok(QueryStreamStart {
+        stream_id,
+        columns: first.columns.clone(),
+        first_batch: first,
+        state: "streaming".to_string(),
+        pushed_rows,
+        truncated,
+    })
+}
+
+/// T-031：取下一批。返回 None = 流已结束。
+#[tauri::command]
+async fn query_next(stream_id: String) -> Result<Option<db::session::QueryBatch>, String> {
+    let entry = db::session::streams()
+        .get(&stream_id)
+        .await
+        .ok_or_else(|| format!("流 {} 不存在或已结束", stream_id))?;
+    let reg = db::session::registry();
+    let mut rx = entry.rx.lock().await;
+    // 结束判定：生产者说做完了，且队列里确实没东西了
+    let done = {
+        let sh = entry.shared.lock().unwrap_or_else(|p| p.into_inner());
+        sh.done
+    };
+    if done && rx.is_empty() {
+        drop(rx);
+        db::session::streams().remove(&stream_id).await;
+        reg.mark_succeeded(&stream_id);
+        return Ok(None);
+    }
+    let batch = rx.recv().await;
+    drop(rx);
+    match batch {
+        Some(b) => Ok(Some(b)),
+        None => {
+            // 通道关了 ⇒ 生产者退出（正常收尾或出错）
+            db::session::streams().remove(&stream_id).await;
+            let sh = {
+                let sh = entry.shared.lock().unwrap_or_else(|p| p.into_inner());
+                (sh.error.clone(), sh.done)
+            };
+            if let Some(e) = sh.0 {
+                reg.mark_failed(&stream_id, &e);
+                return Err(e);
+            }
+            if sh.1 {
+                reg.mark_succeeded(&stream_id);
+            }
+            Ok(None)
+        }
+    }
 }
 
 // 获取数据库表列表
@@ -1790,6 +2517,7 @@ async fn execute_batch(
     queries: Vec<String>,
     config: DBConfig,
     access_mode: Option<String>,
+    approval: Option<security::ApprovalGrant>,
 ) -> Result<Vec<QueryResult>, String> {
     let mode = access_mode.unwrap_or_else(|| "readOnly".to_string());
     if mode == "readOnly" {
@@ -1802,10 +2530,16 @@ async fn execute_batch(
         if q.trim().is_empty() {
             continue;
         }
+        // 批量接口**也必须过同一道门**。
+        // 改之前它只判了 access_mode 就直接执行 —— 可写模式下**完全不查审批**，
+        // 等于给"绕过审批"开了一个后门。门禁与 execute_query 共用同一个函数。
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let classification = db::sql_classify::classify(&q);
+        gate_execution(&q, &mode, approval.as_ref(), classification, &batch_id)?;
         let start = std::time::Instant::now();
         let (column_meta, rows, affected, is_query) = run_dispatch(&config, &q).await?;
         // T-018 同样为批量执行使用 UUID v4 标识
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = batch_id;
         let columns: Vec<String> = column_meta.iter().map(|m| m.name.clone()).collect();
         out.push(QueryResult {
             id,
@@ -1882,7 +2616,7 @@ async fn format_sql(sql: String) -> Result<String, String> {
             i += 1;
         }
     }
-    inserts.sort_by(|a, b| b.0.cmp(&a.0)); // 倒序：从后往前插入
+    inserts.sort_by_key(|x| std::cmp::Reverse(x.0)); // 倒序：从后往前插入
 
     let mut output = sql;
     for (pos, ins) in &inserts {
@@ -2143,7 +2877,8 @@ async fn import_connections(
                     c.db_type, c.name
                 ));
             }
-            if c.port == 0 {
+            // 端口 0 只对 MySQL/PostgreSQL 非法 —— SQLite 压根不用端口
+            if c.port == 0 && matches!(c.db_type.as_str(), "mysql" | "postgresql") {
                 return Err(format!("连接 {} 端口字段为 0", c.name));
             }
         }
@@ -2249,17 +2984,24 @@ async fn csv_import_execute(
 // 连接配置落盘
 // T-053：保存连接时可携带 expected_revision 做 CAS；
 // 没有 expected_revision 时整体替换（向后兼容旧调用方）。
-#[command]
-async fn save_connections(
-    connections: Vec<ConnectionRecord>,
-    expected_revisions: Option<std::collections::HashMap<String, u32>>,
+// T-014：密码**不落盘** —— 保存时先封存进密钥库，落盘的只有 SecretRef。
+//
+// 命令层刻意拆成「可注入 store 的内核 + 薄命令」：
+// 内核能带探针后端跑（不碰全局，测试之间不会互相污染），
+// 命令只负责把全局 store 递进去。
+async fn save_connections_with(
+    store: &dyn secrets::SecretStore,
+    connections: &[ConnectionRecord],
+    expected_revisions: Option<&std::collections::HashMap<String, u32>>,
 ) -> Result<(), String> {
+    let existing = queries::load_connections().await?;
     // CAS 校验：每个 id 的 expected_revision 必须等于磁盘上现有 revision
     if let Some(expected) = expected_revisions {
-        let existing = queries::load_connections().await?;
-        let existing_by_id: std::collections::HashMap<String, u32> =
-            existing.into_iter().map(|c| (c.id, c.revision)).collect();
-        for (id, exp_rev) in &expected {
+        let existing_by_id: std::collections::HashMap<String, u32> = existing
+            .iter()
+            .map(|c| (c.id.clone(), c.revision))
+            .collect();
+        for (id, exp_rev) in expected {
             match existing_by_id.get(id) {
                 Some(cur) if *cur != *exp_rev => {
                     return Err(format!(
@@ -2277,12 +3019,62 @@ async fn save_connections(
             }
         }
     }
-    queries::save_connections(&connections).await
+    // T-014：封存进密钥库。existing 用来复用未变更的密钥引用，
+    // 避免每次保存都往密钥库里堆一份新的明文副本。
+    let sealed = db::credentials::seal(store, connections, &existing)?;
+    // T-011：连接参数或凭据变了 ⇒ **旧池必须关掉**。
+    // 改之前编辑连接后旧池还活着（还指着旧库/旧凭据），要等 5 分钟 TTL 才被回收；
+    // 连接被删除同理（池还在，数据库端还以为这条会话有用）。
+    for old_rec in &existing {
+        let changed = match connections.iter().find(|c| c.id == old_rec.id) {
+            Some(new_rec) => {
+                // 密码变了没有？密钥引用换了就说明换了（seal 会在明文变化时换引用）。
+                let secret_changed = match (
+                    old_rec.secret_ref.as_ref().map(|r| r.id.clone()),
+                    sealed
+                        .iter()
+                        .find(|c| c.id == new_rec.id)
+                        .and_then(|c| c.secret_ref.as_ref())
+                        .map(|r| r.id.clone()),
+                ) {
+                    (Some(a), Some(b)) => a != b,
+                    (None, None) => false,
+                    _ => true,
+                };
+                conn_identity(old_rec) != conn_identity(new_rec) || secret_changed
+            }
+            None => true, // 连接被删了
+        };
+        if changed {
+            close_connection_pools(&old_rec.id);
+        }
+    }
+    queries::save_connections(&sealed).await
+}
+
+#[command]
+async fn save_connections(
+    connections: Vec<ConnectionRecord>,
+    expected_revisions: Option<std::collections::HashMap<String, u32>>,
+) -> Result<(), String> {
+    let store = secrets::secret_store();
+    save_connections_with(store.as_ref(), &connections, expected_revisions.as_ref()).await
+}
+
+/// T-014：从密钥库取回明文。取不回的记录会带上 credential_state=missing
+/// 与一句给用户看的原因，**不静默清空**。
+async fn load_connections_with(
+    store: &dyn secrets::SecretStore,
+) -> Result<Vec<ConnectionRecord>, String> {
+    let raw = queries::load_connections().await?;
+    let (unsealed, _missing) = db::credentials::unseal(store, raw);
+    Ok(unsealed)
 }
 
 #[command]
 async fn load_connections() -> Result<Vec<ConnectionRecord>, String> {
-    queries::load_connections().await
+    let store = secrets::secret_store();
+    load_connections_with(store.as_ref()).await
 }
 
 // 查询历史记录
@@ -2343,21 +3135,87 @@ fn spawn_pool_lifecycle() {
         let ttl = std::time::Duration::from_secs(5 * 60);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let _ = crate::db::connection::pool_registry().idle_sweep(ttl).await;
+            let _ = crate::db::connection::pool_registry().idle_sweep(ttl);
         }
     });
 }
 
+/// 关池的结果报告。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PoolCloseReport {
+    pub connection_id: String,
+    pub revision: u32,
+    /// 关掉了几个池
+    pub closed_pools: u32,
+    /// 作废了几条在途查询
+    pub invalidated_queries: u32,
+    /// 其中有几条的**取消结果无法确认**（连接都没了 ⇒ 服务端停没停不知道）
+    pub unknown_cancels: u32,
+    /// 关之前全局缓存里一共有几个池
+    pub pools_before: u32,
+    /// 关之前按驱动种类分的池数（诊断用：看池是不是按预期复用了）
+    pub pools_by_kind: Vec<(String, u32)>,
+}
+
+/// T-011：关掉某条连接的池，并把该连接上的在途查询标成 unknown。
+///
+/// 关池 ⇒ 服务端那边可能还活着 ⇒ 结果**无法确认** ⇒ 记 unknown，
+/// 不能假装"失败"或"成功"（界面必须提示用户"先隔离再重连"）。
+fn close_connection_pools(connection_id: &str) -> usize {
+    use crate::db::connection::pool_registry;
+    // 事务池也要丢：连接没了，这个事务永远结束不了
+    pool_registry().remove_tx_pool(connection_id);
+    let closed = pool_registry().remove_connection(connection_id);
+    let drained = db::cancel::in_flight().drain(connection_id);
+    for e in &drained {
+        db::session::registry().mark_unknown(&e.query_id);
+    }
+    closed
+}
+
+/// 连接的"身份"（池该跟着它走的那些参数）。变了 ⇒ 旧池作废。
+fn conn_identity(c: &ConnectionRecord) -> (String, String, u16, String, String, String, String) {
+    (
+        c.db_type.clone(),
+        c.host.clone(),
+        c.port,
+        c.username.clone(),
+        c.database.clone(),
+        c.tls_mode
+            .as_ref()
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default(),
+        c.tls_ca_path.clone().unwrap_or_default(),
+    )
+}
+
 #[tauri::command]
-async fn close_pool(connection_id: String, revision: u32) -> Result<(), String> {
+async fn close_pool(connection_id: String, revision: u32) -> Result<PoolCloseReport, String> {
     use crate::db::connection::pool_registry;
     let registry = pool_registry();
-    // 当前 PoolManager 没有逐项删除 API；清掉所有同 connection_id 的池。
-    // 简化实现：clear 全部；后续可加 remove(K) granular API。
-    let _ = connection_id;
-    let _ = revision;
-    registry.clear().await;
-    Ok(())
+    // **2026-10-22 修正**：原来这里是 `registry.clear()` ——
+    // 关一条连接会把**所有**连接（含别人的）的池一起清空，
+    // 正在跑的查询随即报"连接已关闭"；而 connection_id / revision 两个入参
+    // 是被 `let _ =` 丢掉的。现在按 connection_id 精确关。
+    // 关之前先把池子分布记下来：这是"池到底复用了没有"唯一能直接回答的口子。
+    let (pools_before, _) = registry.stats();
+    let pools_by_kind = registry.stats_by_kind();
+    let closed_pools = close_connection_pools(&connection_id);
+    // 这条连接上的在途查询：池没了 ⇒ 取消**无法确认** ⇒ 记成 unknown。
+    let drained = db::cancel::in_flight().drain(&connection_id);
+    let unknown_cancels = drained.iter().filter(|e| e.cancel_requested).count() as u32;
+    Ok(PoolCloseReport {
+        connection_id,
+        revision,
+        closed_pools: closed_pools as u32,
+        invalidated_queries: drained.len() as u32,
+        unknown_cancels,
+        pools_before: pools_before as u32,
+        pools_by_kind: pools_by_kind
+            .into_iter()
+            .map(|(k, n)| (k, n as u32))
+            .collect(),
+    })
 }
 
 // T-033: Keyset 表浏览
@@ -2421,8 +3279,7 @@ async fn keyset_query(
     };
 
     let start = std::time::Instant::now();
-    let (column_meta, rows, affected, is_query) = run_dispatch(&config, &sql).await?;
-    let id = uuid::Uuid::new_v4().to_string();
+    let (column_meta, rows, affected, _is_query) = run_dispatch(&config, &sql).await?;
     let columns: Vec<String> = column_meta.iter().map(|m| m.name.clone()).collect();
 
     let has_next = rows.len() as u32 > page_size;
@@ -2460,6 +3317,8 @@ pub fn run() {
             format_sql,
             query_status_v2,
             query_cancel_v2,
+            query_start,
+            query_next,
             run_secret_migration,
             check_connection_revision,
             export_connections,
@@ -2496,8 +3355,15 @@ pub fn run() {
             load_reports,
             delete_report,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // 应用退出 ⇒ 主动关掉所有连接池，让数据库端看到干净的断开。
+            // 不关的话 TCP 连接要等服务端超时才回收（默认可以到几分钟）。
+            if let tauri::RunEvent::Exit = event {
+                crate::db::connection::pool_registry().clear();
+            }
+        });
 }
 
 // ================== 真实测试（只做 SELECT，不碰写/删） ==================
@@ -2507,7 +3373,11 @@ mod tests {
     use super::*;
     /// 让会修改 Z_BIZ_TOOL_DB_DATA_DIR 环境变量的测试串行化；
     /// 避免在并行线程下互相污染。
-    pub static DATADIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// 用 **tokio** 的异步锁而不是 `std::sync::Mutex`：
+    /// 这些用例要持锁跨 `.await`（写盘/查库都在 await 里），而 std 的锁
+    /// 跨 await 在 `current_thread` runtime 下是**真死锁风险** ——
+    /// 同一线程上的别的任务要拿同一把锁就永远等不到。
+    pub static DATADIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn cfg(db_type: &str, host: &str, port: u16, db: &str) -> DBConfig {
         DBConfig {
@@ -2609,7 +3479,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn connections_persist_roundtrip() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-db-test-{}-{}-{}",
             std::process::id(),
@@ -2630,6 +3500,9 @@ mod tests {
             environment: "dev".into(),
             tls_mode: None,
             tls_ca_path: None,
+            secret_ref: None,
+            credential_state: String::new(),
+            credential_note: None,
         }];
         queries::save_connections(&records).await.unwrap();
         let loaded = queries::load_connections().await.unwrap();
@@ -2643,7 +3516,7 @@ mod tests {
     /// T-053 兼容：旧 connection 配置无 env 字段时也能反序列化
     #[tokio::test(flavor = "current_thread")]
     async fn legacy_connection_without_env_field_loads() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-legacy-conn-{}-{}",
             std::process::id(),
@@ -2664,7 +3537,12 @@ mod tests {
     #[tokio::test]
     async fn metadata_list_v2_ok_for_sqlite() {
         let c = cfg("sqlite", "", 0, ":memory:");
-        let r = metadata_list_v2(c).await.expect("v2 元数据");
+        let env = metadata_list_v2(c).await.expect("v2 元数据");
+        // T-019：v2 命令统一走包络（成功/失败同一个返回类型）
+        let r = match env {
+            db::ipc::V2Envelope::Ok { data, .. } => data,
+            db::ipc::V2Envelope::Err(e) => panic!("包络应是 ok 分支: {}", e),
+        };
         assert!(
             r.cache_version.starts_with("v"),
             "版本前缀 v: {}",
@@ -2674,23 +3552,61 @@ mod tests {
         assert!(r.objects.is_empty(), "空库应无对象");
     }
 
-    /// T-019 v2 IPC：query_status_v2 返回 pending 骨架（待 session actor 接入真实状态）
+    /// T-019 v2 IPC：query_status_v2 **真查**状态（2026-10-22：改之前是写死 pending 的骨架）
     #[tokio::test]
-    async fn query_status_v2_returns_skeleton() {
-        let resp = query_status_v2("demo-q".into()).await.expect("status");
+    async fn query_status_v2_reports_unknown_for_unregistered_id() {
+        let resp = match query_status_v2("demo-q".into()).await.expect("status") {
+            db::ipc::V2Envelope::Ok { data, .. } => data,
+            db::ipc::V2Envelope::Err(e) => panic!("包络应是 ok 分支: {}", e),
+        };
         assert_eq!(resp.query_id, "demo-q");
-        assert!(matches!(
-            resp.state,
-            crate::db::cancel::CancelState::Pending
-        ));
+        assert_eq!(
+            resp.state, "unknown",
+            "查无此作业必须报 unknown，不能像改之前那样写死一个状态"
+        );
+        assert!(resp.in_flight.is_none(), "没登记过的作业不该有在途快照");
+    }
+
+    /// T-019 v2 IPC：登记过的作业，状态查询要报得出 running / succeeded。
+    #[tokio::test]
+    async fn query_status_v2_reports_registered_job_state() {
+        let qid = "gen0|status-probe-1";
+        db::session::registry().insert(db::session::QueryJobInternal {
+            query_id: qid.to_string(),
+            state: db::session::QueryState::Running,
+            state_msg: "执行中".into(),
+            cancel_requested: false,
+            start_time: std::time::Instant::now(),
+            batch_tx: tokio::sync::mpsc::channel(1).0,
+            transaction_state: db::session::TransactionState::Idle,
+            generation: 0,
+            conflict_detected: false,
+            last_affected_rows: 0,
+        });
+        let resp = match query_status_v2(qid.to_string()).await.expect("status") {
+            db::ipc::V2Envelope::Ok { data, .. } => data,
+            db::ipc::V2Envelope::Err(e) => panic!("包络应是 ok 分支: {}", e),
+        };
+        assert_eq!(resp.state, "running");
+        db::session::registry().mark_succeeded(qid);
+        let resp2 = match query_status_v2(qid.to_string()).await.expect("status") {
+            db::ipc::V2Envelope::Ok { data, .. } => data,
+            db::ipc::V2Envelope::Err(e) => panic!("包络应是 ok 分支: {}", e),
+        };
+        assert_eq!(resp2.state, "succeeded");
+        db::session::registry().remove(qid);
     }
 
     /// T-019 v2 IPC：query_cancel_v2 处理未知 id
     #[tokio::test]
     async fn query_cancel_v2_unknown_returns_not_found() {
-        let resp = query_cancel_v2("never-registered".into())
+        let resp = match query_cancel_v2("never-registered".into())
             .await
-            .expect("cancel");
+            .expect("cancel")
+        {
+            db::ipc::V2Envelope::Ok { data, .. } => data,
+            db::ipc::V2Envelope::Err(e) => panic!("包络应是 ok 分支: {}", e),
+        };
         assert!(matches!(
             resp.state,
             crate::db::cancel::CancelState::NotFound
@@ -2724,7 +3640,7 @@ mod tests {
         assert!(!r.rows.is_empty(), "EXPLAIN 应至少 1 行（plan id）");
         // SQLite EXPLAIN QUERY PLAN 输出列：id, parent, notused, detail
         assert!(
-            r.column_meta.len() >= 1,
+            !r.column_meta.is_empty(),
             "SQLite EXPLAIN QUERY PLAN 至少 1 列"
         );
     }
@@ -2762,7 +3678,7 @@ mod tests {
     /// T-043 验收：BEGIN 语句执行后更新 registry 事务状态
     #[tokio::test(flavor = "current_thread")]
     async fn transaction_tracking_updates_registry() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-tx-test-{}-{}",
             std::process::id(),
@@ -2809,7 +3725,7 @@ mod tests {
         if let Some(v) = old {
             std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
         } else {
-            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+            std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
         }
     }
 
@@ -2818,7 +3734,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
     async fn auto_history_recorded_on_success() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-hist-test-{}-{}",
             std::process::id(),
@@ -2850,7 +3766,7 @@ mod tests {
         if let Some(v) = old {
             std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
         } else {
-            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+            std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
         }
     }
 
@@ -2859,7 +3775,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
     async fn auto_history_recorded_on_failure() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-hist-fail-{}-{}",
             std::process::id(),
@@ -2895,7 +3811,7 @@ mod tests {
         if let Some(v) = old {
             std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
         } else {
-            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+            std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
         }
     }
 
@@ -2970,7 +3886,7 @@ mod tests {
         exec_q(sql, c.clone(), Some("writable".to_string()))
             .await
             .map(|_| ())
-            .or_else(|_e| {
+            .map_err(|_e| {
                 // SQLite 内存未建 t 表，预期 SQL 错；但不应是审批错
                 Err::<(), String>(_e)
             })
@@ -3000,47 +3916,116 @@ mod tests {
         let _ = grant; // suppress unused
     }
 
-    /// T-015：迁移报告正反向测试
+    /// T-015：迁移报告 —— 判据是**真的去密钥库取一次**，
+    /// 而不是"猜 revision 水位"（旧口径报出来的数与能不能取回密码无关）。
     #[tokio::test(flavor = "current_thread")]
     async fn run_secret_migration_reports_reentry() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-mig-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
         std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
-        // 需要重新输入（旧）+ 已是新版本（新）
-        let old = ConnectionRecord {
-            id: "old".into(),
-            name: "old".into(),
+
+        let store = secrets::InMemorySecretStore::default();
+        let mk = |id: &str, pwd: &str| ConnectionRecord {
+            id: id.into(),
+            name: id.into(),
             db_type: "mysql".into(),
             host: "h".into(),
             port: 3306,
             username: "u".into(),
-            password: String::new(),
+            password: pwd.into(),
             database: "d".into(),
             revision: 0,
             environment: "dev".into(),
             tls_mode: None,
             tls_ca_path: None,
+            secret_ref: None,
+            credential_state: String::new(),
+            credential_note: None,
         };
-        let new = ConnectionRecord {
-            id: "new".into(),
-            revision: CURRENT_MIGRATION_WATERMARK,
-            ..old.clone()
-        };
-        queries::save_connections(&vec![old, new]).await.unwrap();
-        let report = run_secret_migration().await.unwrap();
+
+        // 一条能取回（密码进了密钥库）
+        let good = db::credentials::seal(&store, &[mk("ok", "p1")], &[]).unwrap();
+        // 一条取不回：封存后把密钥删掉（模拟进程重启 / 密钥丢失）
+        let lost = db::credentials::seal(&store, &[mk("lost", "p2")], &[]).unwrap();
+        let lost_ref = lost[0].secret_ref.clone().expect("secret_ref");
+        secrets::SecretStore::delete(&store, &lost_ref).expect("删除密钥");
+
+        queries::save_connections(&[good[0].clone(), lost[0].clone()])
+            .await
+            .unwrap();
+
+        let report = migration_report_with(&store).await.unwrap();
         assert_eq!(report.total_connections, 2);
-        assert_eq!(report.needs_reentry, 1);
-        assert_eq!(report.up_to_date, 1);
+        assert_eq!(report.up_to_date, 1, "能取回密码的应算 up_to_date");
+        assert_eq!(report.needs_reentry, 1, "密钥丢失的必须报 needs_reentry");
+        assert_eq!(report.missing_credentials.len(), 1);
+        assert_eq!(report.missing_credentials[0].id, "lost");
+        assert!(
+            report.missing_credentials[0]
+                .reason
+                .contains("请重新输入密码"),
+            "上报必须告诉用户要做什么: {}",
+            report.missing_credentials[0].reason
+        );
+    }
+
+    /// T-014 端到端：保存连接 → 落盘里**没有明文** → 读回时明文能还原。
+    #[tokio::test(flavor = "current_thread")]
+    async fn save_connections_seals_password_and_load_restores_it() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-seal-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+
+        let store = secrets::InMemorySecretStore::default();
+        let rec = ConnectionRecord {
+            id: "c1".into(),
+            name: "生产库".into(),
+            db_type: "mysql".into(),
+            host: "h".into(),
+            port: 3306,
+            username: "u".into(),
+            password: "p@ssw0rd".into(),
+            database: "d".into(),
+            revision: 1,
+            environment: "prod".into(),
+            tls_mode: None,
+            tls_ca_path: None,
+            secret_ref: None,
+            credential_state: String::new(),
+            credential_note: None,
+        };
+        save_connections_with(&store, std::slice::from_ref(&rec), None)
+            .await
+            .unwrap();
+
+        // 落盘文件里绝不能出现明文
+        let path = tmp.join("connections.json");
+        let raw = std::fs::read_to_string(&path).expect("落盘文件");
+        assert!(
+            !raw.contains("p@ssw0rd"),
+            "落盘文件里出现了明文密码: {}",
+            raw
+        );
+
+        // 读回时明文能还原
+        let loaded = load_connections_with(&store).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].password, "p@ssw0rd");
+        assert_eq!(loaded[0].credential_state, db::credentials::CREDENTIAL_OK);
     }
 
     /// T-046：连接 revision 校验
     #[tokio::test(flavor = "current_thread")]
     async fn check_connection_revision_matches() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-rev-check-{}-{}",
             std::process::id(),
@@ -3060,8 +4045,13 @@ mod tests {
             environment: "dev".into(),
             tls_mode: None,
             tls_ca_path: None,
+            secret_ref: None,
+            credential_state: String::new(),
+            credential_note: None,
         };
-        queries::save_connections(&vec![c]).await.unwrap();
+        queries::save_connections(std::slice::from_ref(&c))
+            .await
+            .unwrap();
         assert!(check_connection_revision("x1".into(), 7).await.unwrap());
         assert!(!check_connection_revision("x1".into(), 6).await.unwrap());
         assert!(check_connection_revision("nope".into(), 0).await.is_err());
@@ -3070,7 +4060,7 @@ mod tests {
     /// T-053 验收：save_connections CAS 拒绝过期 revision
     #[tokio::test(flavor = "current_thread")]
     async fn save_connections_cas_rejects_stale_revision() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-cas-test-{}-{}",
             std::process::id(),
@@ -3091,6 +4081,9 @@ mod tests {
             environment: "dev".into(),
             tls_mode: None,
             tls_ca_path: None,
+            secret_ref: None,
+            credential_state: String::new(),
+            credential_note: None,
         }];
         queries::save_connections(&records).await.unwrap();
 
@@ -3229,7 +4222,10 @@ mod tests {
         let cases: Vec<(serde_json::Value, bool)> = vec![
             (serde_json::json!(3306), true),
             (serde_json::json!((u16::MAX as u64) + 1), false),
-            (serde_json::json!(0u64), false),
+            // 端口 0 = "未指定"：反序列化层**不知道驱动**，
+            // 而 SQLite 压根没有端口（前端就送 0）⇒ 这里放行。
+            // "MySQL/PG 端口不能是 0"的校验挪到了建池处（见下面的用例）。
+            (serde_json::json!(0u64), true),
             (serde_json::json!("3306"), true),
             (serde_json::json!("65536"), false),
             (serde_json::json!("abc"), false),
@@ -3325,7 +4321,7 @@ mod tests {
     /// 报表簿落盘走的是同一套信封；这里验往返、按 id 覆盖、列表排序与删除
     #[tokio::test(flavor = "current_thread")]
     async fn report_book_roundtrip_upsert_and_order() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-report-book-{}-{}",
             std::process::id(),
@@ -3384,14 +4380,14 @@ mod tests {
         if let Some(v) = old {
             std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
         } else {
-            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+            std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
         }
     }
 
     /// 存进去就注定打不开的稿子要当场拒掉，并且一条都不能落盘
     #[tokio::test(flavor = "current_thread")]
     async fn report_book_rejects_unopenable_specs() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-report-shape-{}-{}",
             std::process::id(),
@@ -3456,7 +4452,7 @@ mod tests {
         if let Some(v) = old {
             std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
         } else {
-            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+            std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
         }
     }
 
@@ -3469,7 +4465,7 @@ mod tests {
     /// 这类错在这里炸掉，而不是等用户点保存才发现。
     #[tokio::test(flavor = "current_thread")]
     async fn report_book_accepts_real_frontend_payload() {
-        let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
         let tmp = std::env::temp_dir().join(format!(
             "zbiz-report-wire-{}-{}",
             std::process::id(),
@@ -3579,7 +4575,7 @@ mod tests {
         if let Some(v) = old {
             std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
         } else {
-            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+            std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
         }
     }
 
@@ -3743,6 +4739,457 @@ mod tests {
         assert_eq!(total, ROWS as i64, "丢掉流之后这条连接查出来的行数不对");
         drop(pool);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ================== T-031：流式查询 ==================
+
+    /// 每个用例独立的连接 id + 独立的 SQLite **文件**库。
+    ///
+    /// 为什么不用 `cfg()`：它的连接 id 恒为 "t"，而连接池按 (id, 参数指纹, 模式)
+    /// 缓存 ⇒ 所有用例共用同一个池。并行跑时，一个用例的流式查询占着那条连接，
+    /// 另一个用例就在等 —— 测的就不是功能而是并发调度了。
+    /// 用文件库（不是 `:memory:`）还有第二个好处：池被 LRU 回收后重建，
+    /// 数据还在（`:memory:` 重建就是空库 ⇒ 用例会莫名其妙地 "no such table"）。
+    fn cfg_isolated(label: &str) -> (DBConfig, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("zbiz-iso-{}-{}", label, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let db = dir.join("t.db");
+        // 本工具刻意不代建 SQLite 库文件（"本工具不会代建新库文件"），
+        // 所以测试要先自己建一个空文件。
+        std::fs::File::create(&db).expect("建空库文件");
+        let c = DBConfig {
+            id: format!("iso-{}", label),
+            name: label.to_string(),
+            db_type: "sqlite".to_string(),
+            host: String::new(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: db.to_string_lossy().to_string(),
+            tls_mode: None,
+            tls_ca_path: None,
+        };
+        (c, dir)
+    }
+
+    /// 写操作用的审批凭据（每次 SQL 不同 ⇒ 摘要不同 ⇒ 必须各配一个）
+    fn grant_for(sql: &str) -> security::ApprovalGrant {
+        security::ApprovalGrant {
+            approval_id: uuid::Uuid::new_v4().to_string(),
+            sql_digest: security::digest_sql(sql),
+            environment: "test".into(),
+            issued_at: 0,
+            expires_at: chrono::Utc::now().timestamp() + 60,
+            consumed: false,
+        }
+    }
+
+    /// 可写模式执行（带审批）
+    async fn exec_w(sql: &str, c: DBConfig) -> Result<QueryResult, String> {
+        execute_query(
+            sql.to_string(),
+            c,
+            Some("writable".into()),
+            Some(grant_for(sql)),
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// T-031 验收：query_start + query_next 能把结果**分批**取完，
+    /// 且批次受 MAX_BATCH_ROWS 约束（不是一口气全塞回来）。
+    #[tokio::test]
+    async fn stream_query_returns_rows_in_batches() {
+        let (c, _dir) = cfg_isolated("stream-batches");
+        exec_w(
+            "CREATE TABLE stream_t (id INTEGER PRIMARY KEY, v TEXT)",
+            c.clone(),
+        )
+        .await
+        .expect("建表");
+        let n = db::session::MAX_BATCH_ROWS + 7;
+        // 一条 INSERT 插多行（仍是**单条**语句 ⇒ 审批摘要对得上）
+        let mut vals = String::new();
+        for i in 0..n {
+            if i > 0 {
+                vals.push(',');
+            }
+            vals.push_str(&format!("({},'x')", i));
+        }
+        exec_w(
+            &format!("INSERT INTO stream_t (id, v) VALUES {}", vals),
+            c.clone(),
+        )
+        .await
+        .expect("插入");
+
+        let start = query_start(
+            c.clone(),
+            "SELECT id FROM stream_t ORDER BY id".to_string(),
+            Some("writable".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("起流");
+
+        assert!(!start.columns.is_empty(), "第一批应带出列元信息");
+        assert_eq!(start.columns[0].name, "id");
+
+        let mut total_rows = start.first_batch.rows.len();
+        let mut batches = 1usize;
+        let mut truncated = start.first_batch.truncated;
+        while let Some(b) = query_next(start.stream_id.clone()).await.expect("取下一批") {
+            total_rows += b.rows.len();
+            batches += 1;
+            truncated = truncated || b.truncated;
+        }
+        assert_eq!(total_rows, n, "所有行都要能取到");
+        assert!(
+            batches >= 2,
+            "行数超过一批上限，必须分多批返回（实际 {} 批）",
+            batches
+        );
+        assert!(!truncated, "没设 max_rows，不该报截断");
+    }
+
+    /// T-031：max_rows 到了要**如实**说"后面还有"，不能装作取全了。
+    #[tokio::test]
+    async fn stream_query_reports_truncation_at_max_rows() {
+        let (c, _dir) = cfg_isolated("stream-trunc");
+        exec_w("CREATE TABLE stream_t2 (id INTEGER PRIMARY KEY)", c.clone())
+            .await
+            .expect("建表");
+        let mut vals = String::new();
+        for i in 0..10 {
+            if i > 0 {
+                vals.push(',');
+            }
+            vals.push_str(&format!("({})", i));
+        }
+        exec_w(
+            &format!("INSERT INTO stream_t2 (id) VALUES {}", vals),
+            c.clone(),
+        )
+        .await
+        .expect("插入");
+
+        let start = query_start(
+            c.clone(),
+            "SELECT id FROM stream_t2 ORDER BY id".to_string(),
+            Some("writable".to_string()),
+            None,
+            None,
+            Some(4),
+        )
+        .await
+        .expect("起流");
+        let mut total = start.first_batch.rows.len();
+        let mut truncated = start.truncated;
+        while let Some(b) = query_next(start.stream_id.clone()).await.expect("取下一批") {
+            total += b.rows.len();
+            truncated = truncated || b.truncated;
+        }
+        assert_eq!(total, 4, "max_rows=4 就只能取 4 行");
+        assert!(truncated, "被上限截断必须如实报 truncated");
+    }
+
+    /// T-031：流式接口**不能绕过门禁**。
+    ///
+    /// 流式接口是新加的，如果它自己写一套判定而不用 `gate_execution`，
+    /// 两套判据迟早漂移 ⇒ 漂移的后果就是"流式接口能绕过审批/只读限制"。
+    #[tokio::test]
+    async fn stream_query_cannot_bypass_readonly_gate() {
+        let (c, _dir) = cfg_isolated("stream-gate");
+        let err = query_start(
+            c.clone(),
+            "DELETE FROM whatever".to_string(),
+            Some("readOnly".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("只读通道必须拒绝写语句");
+        assert!(
+            err.contains("READONLY_BLOCKED"),
+            "错误要带机器可读码，实际: {}",
+            err
+        );
+    }
+
+    /// 多语句一律拒（两个通道都拒）。
+    ///
+    /// `SELECT 1; DROP TABLE x` 的第一条是安全 SELECT —— 审批与只读判据
+    /// 都只看第一条，不挡住它就等于留了个删表的后门。
+    #[tokio::test]
+    async fn multi_statement_is_rejected_in_readonly_channel() {
+        let (c, _dir) = cfg_isolated("multi-stmt-ro");
+        let err = query_start(
+            c.clone(),
+            "SELECT 1; DROP TABLE t".to_string(),
+            Some("readOnly".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("多语句必须被拒");
+        assert!(
+            err.contains("SQL_CLASSIFY"),
+            "错误要带机器可读码，实际: {}",
+            err
+        );
+        assert!(err.contains("2 条语句"), "要说清有几条: {}", err);
+    }
+
+    /// 同一个门禁走 execute_query 也要拒（证明两处共用同一套判据）。
+    #[tokio::test]
+    async fn multi_statement_is_rejected_in_execute_query() {
+        let (c, _dir) = cfg_isolated("multi-stmt-exec");
+        let err = exec_q("SELECT 1; DROP TABLE t", c.clone(), None)
+            .await
+            .expect_err("多语句必须被拒");
+        assert!(
+            err.contains("SQL_CLASSIFY"),
+            "错误要带机器可读码，实际: {}",
+            err
+        );
+    }
+
+    /// 批量接口也必须过同一道门（改之前它只判 access_mode，完全不查审批）。
+    #[tokio::test]
+    async fn execute_batch_requires_approval_for_writes() {
+        let (c, _dir) = cfg_isolated("batch-approval");
+        let err = execute_batch(
+            vec!["CREATE TABLE batch_t (id INTEGER)".to_string()],
+            c.clone(),
+            Some("writable".to_string()),
+            None,
+        )
+        .await
+        .expect_err("可写模式下的写操作必须有审批");
+        assert!(
+            err.contains("APPROVAL_DENIED"),
+            "错误要带机器可读码，实际: {}",
+            err
+        );
+    }
+
+    /// T-043：同一条连接上的**第二个** BEGIN 不能被状态机拒死。
+    ///
+    /// 上一个事务已经提交（Committed）⇒ 状态机不允许 Committed → Active；
+    /// 不重置的话用户在这条连接上就再也开不了新事务了。
+    #[tokio::test]
+    async fn second_begin_on_same_connection_is_allowed() {
+        let (c, _dir) = cfg_isolated("tx-second-begin");
+        // 用一个专属代次，避免与其它用例共用同一条事务键
+        let gen = 7_777u32;
+        for sql in ["BEGIN TRANSACTION", "COMMIT"] {
+            let r = execute_query(
+                sql.to_string(),
+                c.clone(),
+                Some("writable".into()),
+                Some(grant_for(sql)),
+                Some(gen),
+                None,
+            )
+            .await;
+            assert!(r.is_ok(), "{} 应成功: {:?}", sql, r.err());
+        }
+        // 第二个 BEGIN 必须能用
+        let sql = "BEGIN TRANSACTION";
+        let r = execute_query(
+            sql.to_string(),
+            c.clone(),
+            Some("writable".into()),
+            Some(grant_for(sql)),
+            Some(gen),
+            None,
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "同一条连接上的第二个 BEGIN 应被允许，实际: {:?}",
+            r.err()
+        );
+        let sql = "ROLLBACK";
+        let r = execute_query(
+            sql.to_string(),
+            c.clone(),
+            Some("writable".into()),
+            Some(grant_for(sql)),
+            Some(gen),
+            None,
+        )
+        .await;
+        assert!(r.is_ok(), "ROLLBACK 应成功: {:?}", r.err());
+    }
+
+    /// 端口 0 的校验挪到了**按驱动**的地方：反序列化层不知道驱动，
+    /// 而 SQLite 压根没有端口（前端就送 0）⇒ 放行；
+    /// MySQL/PostgreSQL 端口为 0 仍必须被拒 —— 在建池那一刻拒。
+    #[tokio::test]
+    async fn mysql_connection_without_port_is_rejected() {
+        let c = DBConfig {
+            id: "port0-probe".into(),
+            name: "port0".into(),
+            db_type: "mysql".into(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            username: "u".into(),
+            password: "p".into(),
+            database: "d".into(),
+            tls_mode: None,
+            tls_ca_path: None,
+        };
+        let err = mysql_pool_new(&c, 10)
+            .await
+            .expect_err("MySQL 端口为 0 必须被拒");
+        assert!(err.contains("INVALID_PORT"), "错误要带机器可读码: {}", err);
+    }
+
+    /// T-046：写操作影响 0 行 ⇒ 乐观并发冲突，必须能被查出来。
+    #[tokio::test]
+    async fn write_impact_zero_rows_is_reported_as_conflict() {
+        let reg = db::session::registry();
+        reg.insert(db::session::QueryJobInternal {
+            query_id: "conflict-probe".to_string(),
+            state: db::session::QueryState::Running,
+            state_msg: "执行中".into(),
+            cancel_requested: false,
+            start_time: std::time::Instant::now(),
+            batch_tx: tokio::sync::mpsc::channel(1).0,
+            transaction_state: db::session::TransactionState::Active,
+            generation: 0,
+            conflict_detected: false,
+            last_affected_rows: 0,
+        });
+        // 影响 0 行（表是空的）⇒ 冲突
+        reg.record_write_impact("conflict-probe", 0);
+        assert!(reg.has_conflict("conflict-probe"), "0 行影响应判为冲突");
+        // 影响 1 行 ⇒ 不是冲突
+        reg.record_write_impact("conflict-probe", 1);
+        assert!(!reg.has_conflict("conflict-probe"), "1 行影响不该算冲突");
+        reg.remove("conflict-probe");
+    }
+
+    /// T-014：迁移报告的"需重输"清单要能点名到具体连接。
+    #[tokio::test]
+    async fn secret_migration_names_missing_connections() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-mig2-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+        let store = secrets::InMemorySecretStore::default();
+        let rec = ConnectionRecord {
+            id: "m1".into(),
+            name: "旧连接".into(),
+            db_type: "mysql".into(),
+            host: "h".into(),
+            port: 3306,
+            username: "u".into(),
+            password: "p".into(),
+            database: "d".into(),
+            revision: 1,
+            environment: "dev".into(),
+            tls_mode: None,
+            tls_ca_path: None,
+            secret_ref: None,
+            credential_state: String::new(),
+            credential_note: None,
+        };
+        let sealed = db::credentials::seal(&store, &[rec], &[]).unwrap();
+        // 换个空后端 ⇒ 密钥取不回来了
+        let empty = secrets::InMemorySecretStore::default();
+        queries::save_connections(&sealed).await.unwrap();
+        let report = migration_report_with(&empty).await.unwrap();
+        assert_eq!(report.total_connections, 1);
+        assert_eq!(report.needs_reentry, 1);
+        assert_eq!(report.missing_credentials[0].id, "m1");
+        assert_eq!(report.missing_credentials[0].name, "旧连接");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// T-011：改连接参数后旧池必须关掉（否则还连着旧库/旧凭据）。
+    #[tokio::test]
+    async fn editing_connection_closes_stale_pool() {
+        let _guard = crate::tests::DATADIR_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-pooledit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
+
+        use crate::db::connection::{fingerprint, pool_registry, AnyPool, PoolKey};
+        let registry = pool_registry();
+        let base = DBConfig {
+            id: "pool-edit-probe".into(),
+            name: "n".into(),
+            db_type: "sqlite".into(),
+            host: "old-host".into(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: ":memory:".into(),
+            tls_mode: None,
+            tls_ca_path: None,
+        };
+        let key = PoolKey {
+            connection_id: base.id.clone(),
+            fingerprint: fingerprint(&base),
+            access_mode: "readOnly".into(),
+        };
+        registry
+            .get_or_insert(key.clone(), || async {
+                Ok(AnyPool::Sqlite(
+                    sqlx::SqlitePool::connect("sqlite::memory:")
+                        .await
+                        .map_err(|e| e.to_string())?,
+                ))
+            })
+            .await
+            .expect("建池");
+
+        let mk_rec = |host: &str| ConnectionRecord {
+            id: base.id.clone(),
+            name: "n".into(),
+            db_type: "sqlite".into(),
+            host: host.into(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: ":memory:".into(),
+            revision: 1,
+            environment: "dev".into(),
+            tls_mode: None,
+            tls_ca_path: None,
+            secret_ref: None,
+            credential_state: String::new(),
+            credential_note: None,
+        };
+        // 磁盘上先放一份"旧参数"的记录
+        queries::save_connections(std::slice::from_ref(&mk_rec("old-host")))
+            .await
+            .unwrap();
+        // 改成新 host 保存 ⇒ 旧池必须被关掉
+        let store = secrets::InMemorySecretStore::default();
+        save_connections_with(&store, std::slice::from_ref(&mk_rec("new-host")), None)
+            .await
+            .unwrap();
+        // 再关一次应当关不到东西（说明保存时已经关过了）
+        assert_eq!(
+            registry.remove_connection(&base.id),
+            0,
+            "改连接参数后旧池应已在保存时被关掉"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
