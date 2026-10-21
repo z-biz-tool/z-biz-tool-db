@@ -101,8 +101,15 @@ mod tests {
     #[test]
     fn insert_without_grant_rejected() {
         let c = classify("INSERT INTO t VALUES (1)");
-        let err = evaluate(None, c.kind, c.safety, "INSERT INTO t VALUES (1)", now(), "dev")
-            .expect_err("写入需审批");
+        let err = evaluate(
+            None,
+            c.kind,
+            c.safety,
+            "INSERT INTO t VALUES (1)",
+            now(),
+            "dev",
+        )
+        .expect_err("写入需审批");
         assert!(matches!(err, ApprovalError::Missing(_)), "got {:?}", err);
     }
 
@@ -123,8 +130,8 @@ mod tests {
         let mut grant = make_grant(sql, 60);
         grant.expires_at = now() - 10;
         let c = classify(sql);
-        let err = evaluate(Some(&grant), c.kind, c.safety, sql, now(), "dev")
-            .expect_err("过期应拒");
+        let err =
+            evaluate(Some(&grant), c.kind, c.safety, sql, now(), "dev").expect_err("过期应拒");
         assert!(matches!(err, ApprovalError::Expired(_)), "got {:?}", err);
     }
 
@@ -141,6 +148,10 @@ mod tests {
             "dev",
         )
         .expect_err("摘要不匹配应拒");
-        assert!(matches!(err, ApprovalError::SqlMismatch(_)), "got {:?}", err);
+        assert!(
+            matches!(err, ApprovalError::SqlMismatch(_)),
+            "got {:?}",
+            err
+        );
     }
 }

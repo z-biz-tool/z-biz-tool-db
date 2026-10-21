@@ -74,11 +74,7 @@ impl ConnectionManager {
     /// 上限缓存条数；超出时按最久未用淘汰。
     const MAX_ENTRIES: usize = 16;
 
-    pub async fn get_or_insert<F, Fut>(
-        &self,
-        key: PoolKey,
-        ctor: F,
-    ) -> Result<AnyPool, String>
+    pub async fn get_or_insert<F, Fut>(&self, key: PoolKey, ctor: F) -> Result<AnyPool, String>
     where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<AnyPool, String>> + Send,
@@ -190,7 +186,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "第二次应命中缓存而非重建");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "第二次应命中缓存而非重建"
+        );
         assert_eq!(p1.kind(), p2.kind(), "两次缓存应返回相同 kind");
     }
 

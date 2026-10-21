@@ -31,6 +31,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Install system deps (Tauri)
         run: |
@@ -68,6 +70,21 @@ jobs:
           # MySQL/PG 集成测试需要 docker，标了 #[ignore]，只在手动跑
           # （--no-run 是 cargo 级参数，放在 `--` 后 libtest 会报 Unrecognized option）
           cargo test --lib --no-run
+
+      # 2026-10-21 新增：rustfmt 门禁（本仓此前**一条静态门都没有**）。
+      # 本地实测 `cargo fmt --all --check` 有 **405 处差异**散在 30 多个文件里，
+      # CI 完全不跑 fmt ⇒ 谁把格式改乱了没人知道，评审只能靠肉眼。
+      # 格式债已在同一次提交里整仓清零（纯排版重排，Rust + TS 测试全过）。
+      #
+      # **clippy 暂不收严**（如实记账）：本仓 `cargo clippy --all-targets -- -D warnings`
+      # 实测约 **100 条**，其中约 40 条是「从未构造/从未接线」的 API
+      # （Pool / SecretStore / V2Envelope / 连接池 / 密钥持有者等），
+      # 另有多条 `await_holding_lock` 落在测试代码的共享目录锁上。
+      # 这些不是改几行能清的，是「接线还是删掉」的工程判断 ⇒ 不在这一轮里草率收严，
+      # 更不能挂一条永远红的门禁。债记在 lead 的 `06_验收与风险清单.md` R12。
+      - name: Format
+        working-directory: src-tauri
+        run: cargo fmt --all --check
 
   build:
     needs: test

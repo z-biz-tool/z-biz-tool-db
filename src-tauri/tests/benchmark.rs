@@ -5,8 +5,8 @@
 // - 记录查询耗时
 // - 基线参考：首批 p95 ≤ 1s，RSS ≤ 200 MiB
 
-use std::time::Instant;
 use sqlx::sqlite::SqlitePool;
+use std::time::Instant;
 
 /// 生成合成数据并执行基准测试
 async fn run_benchmark() {
@@ -23,7 +23,7 @@ async fn run_benchmark() {
             col9 REAL, col10 TEXT, col11 INTEGER, col12 REAL,
             col13 TEXT, col14 INTEGER, col15 REAL, col16 TEXT,
             col17 INTEGER, col18 REAL, col19 TEXT, col20 INTEGER
-        )"
+        )",
     )
     .execute(&pool)
     .await
@@ -56,7 +56,10 @@ async fn run_benchmark() {
             values.push(format!("({},'v{}',{},1.0,'t{}',{},1.0,'d{}',{},1.0,'i{}',{},1.0,'s{}',{},1.0,'r{}',{},1.0,'f{}',{},1.0,'g{}',{},1.0,'h{}',{})", row, a, b, c, d, e, f, g, h, j, k, m, n, p, q, s, t, u, v));
         }
         let sql = format!("INSERT INTO benchmark VALUES {}", values.join(","));
-        sqlx::query(&sql).execute(&pool).await.expect("insert batch");
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .expect("insert batch");
     }
     let insert_time = start.elapsed().as_millis();
     println!("[T-042] Insert 100000 rows: {}ms", insert_time);
@@ -68,7 +71,11 @@ async fn run_benchmark() {
         .await
         .expect("count");
     let count = rows[0].0;
-    println!("[T-042] SELECT COUNT: {}ms, rows={}", start.elapsed().as_millis(), count);
+    println!(
+        "[T-042] SELECT COUNT: {}ms, rows={}",
+        start.elapsed().as_millis(),
+        count
+    );
     assert_eq!(count, 100000);
 
     // 基准测试：索引查询
@@ -80,14 +87,18 @@ async fn run_benchmark() {
             .await
             .expect("index query");
     }
-    println!("[T-042] 1000 indexed queries: {}ms", start.elapsed().as_millis());
+    println!(
+        "[T-042] 1000 indexed queries: {}ms",
+        start.elapsed().as_millis()
+    );
 
     // 基准测试：范围查询
     let start = Instant::now();
-    let _: Vec<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM benchmark WHERE col2 BETWEEN 1000 AND 2000")
-        .fetch_all(&pool)
-        .await
-        .expect("range query");
+    let _: Vec<(i64,)> =
+        sqlx::query_as("SELECT COUNT(*) FROM benchmark WHERE col2 BETWEEN 1000 AND 2000")
+            .fetch_all(&pool)
+            .await
+            .expect("range query");
     println!("[T-042] Range query: {}ms", start.elapsed().as_millis());
 
     println!("[T-042] Benchmark complete");

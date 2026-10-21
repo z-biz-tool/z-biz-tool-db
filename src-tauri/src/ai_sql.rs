@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::db::sql_classify;
-use crate::report::ai::{strip_fences, column_list, CatalogTable, Model, HttpModel, MAX_REPAIRS};
+use crate::report::ai::{column_list, strip_fences, CatalogTable, HttpModel, Model, MAX_REPAIRS};
 use crate::report::view::problem_list;
 use crate::AIConfig;
 
@@ -56,7 +56,10 @@ pub struct SqlReject {
 impl SqlReject {
     /// 还没见到模型输出的 SQL 就被拒（空问题、请求发不出去）：没有底稿可带
     fn of(error: impl Into<String>) -> Self {
-        SqlReject { error: error.into(), sql: None }
+        SqlReject {
+            error: error.into(),
+            sql: None,
+        }
     }
 }
 
@@ -196,9 +199,33 @@ fn tokenize(sql: &str) -> Vec<Tok> {
 
 /// 不该被当成表别名的词：`FROM orders WHERE` 里的 WHERE 不是别名
 const AFTER_TABLE: &[&str] = &[
-    "where", "group", "order", "having", "limit", "offset", "on", "using", "join", "inner",
-    "left", "right", "full", "cross", "outer", "union", "except", "intersect", "set", "values",
-    "into", "as", "for", "window", "fetch", "with", "returning",
+    "where",
+    "group",
+    "order",
+    "having",
+    "limit",
+    "offset",
+    "on",
+    "using",
+    "join",
+    "inner",
+    "left",
+    "right",
+    "full",
+    "cross",
+    "outer",
+    "union",
+    "except",
+    "intersect",
+    "set",
+    "values",
+    "into",
+    "as",
+    "for",
+    "window",
+    "fetch",
+    "with",
+    "returning",
 ];
 
 /// 取某个位置的裸词（引号标识符也算），越界或非词返回 None
@@ -235,11 +262,7 @@ pub fn prompt(
         if t.columns.is_empty() {
             s.push_str(&format!("  · {}（本机没读到列清单）\n", qualified(t)));
         } else {
-            s.push_str(&format!(
-                "  · {}({})\n",
-                qualified(t),
-                column_list(t)
-            ));
+            s.push_str(&format!("  · {}({})\n", qualified(t), column_list(t)));
         }
     }
     s.push_str(
@@ -716,7 +739,9 @@ pub async fn generate(
         return Err(SqlReject::of("先选至少一张表，模型没有列清单就只能编字段"));
     }
     // 空白的错误单和没带一样
-    let mut feedback = feedback.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut feedback = feedback
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let mut kept = catalog;
     let mut trim: Option<String> = None;
     if catalog.len() > MAX_TABLES {
@@ -854,7 +879,10 @@ mod tests {
     }
 
     impl Model for Scripted {
-        fn complete(&self, prompt: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        fn complete(
+            &self,
+            prompt: String,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
             self.prompts.lock().unwrap().push(prompt);
             let n = self.prompts.lock().unwrap().len();
             let answer = self
@@ -867,7 +895,10 @@ mod tests {
     }
 
     fn scripted(answers: Vec<String>) -> Scripted {
-        Scripted { answers, prompts: std::sync::Mutex::new(Vec::new()) }
+        Scripted {
+            answers,
+            prompts: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     // ==================== 提示词 ====================
@@ -882,12 +913,28 @@ mod tests {
         );
         assert!(!p.contains("上一稿"), "{p}");
 
-        let with_fb = prompt("各城市成交额", &catalog(), "mysql", None, Some("表 invoicez 不在本次目录里"));
+        let with_fb = prompt(
+            "各城市成交额",
+            &catalog(),
+            "mysql",
+            None,
+            Some("表 invoicez 不在本次目录里"),
+        );
         assert!(with_fb.contains("上一稿没有通过本机校验"), "{with_fb}");
         assert!(with_fb.contains("invoicez"), "{with_fb}");
 
-        let no_cols = prompt("随便", &[cat_table("crm", "postgresql", "", "customers", &[])], "postgresql", None, None);
-        assert!(no_cols.contains("customers（本机没读到列清单）"), "{no_cols}");    }
+        let no_cols = prompt(
+            "随便",
+            &[cat_table("crm", "postgresql", "", "customers", &[])],
+            "postgresql",
+            None,
+            None,
+        );
+        assert!(
+            no_cols.contains("customers（本机没读到列清单）"),
+            "{no_cols}"
+        );
+    }
 
     /// 追问式改稿：上一稿和它当时的需求都要送进提示词，否则模型只能从零重写
     #[test]
@@ -919,7 +966,10 @@ mod tests {
             &["id int(11)", "amount decimal(12,2)", "status varchar(20)"],
         )];
         let p = prompt("按金额汇总", &c, "mysql", None, None);
-        assert!(p.contains("orders(id int(11), amount decimal(12,2), status varchar(20))"), "{p}");
+        assert!(
+            p.contains("orders(id int(11), amount decimal(12,2), status varchar(20))"),
+            "{p}"
+        );
         assert!(p.contains("列名 类型"), "{p}");
         let out = check_sql(
             "SELECT status, SUM(amount) AS total FROM orders GROUP BY status",
@@ -945,7 +995,10 @@ mod tests {
             "SELECT city, SUM(amount) AS total\nFROM orders\nGROUP BY city"
         );
         // 没有围栏、直接就是 SQL
-        assert_eq!(extract_sql("SELECT id FROM orders").unwrap(), "SELECT id FROM orders");
+        assert_eq!(
+            extract_sql("SELECT id FROM orders").unwrap(),
+            "SELECT id FROM orders"
+        );
         // 结尾带中文说明：全角句号之前才是 SQL
         assert_eq!(
             extract_sql("SELECT id FROM orders\n\n这样就能拿到全部订单号。").unwrap(),
@@ -1098,7 +1151,10 @@ mod tests {
             &catalog(),
         )
         .unwrap();
-        assert_eq!(out.tables, vec!["order_items".to_string(), "orders".to_string()]);
+        assert_eq!(
+            out.tables,
+            vec!["order_items".to_string(), "orders".to_string()]
+        );
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
 
@@ -1175,9 +1231,14 @@ mod tests {
             "SELECT city, total FROM invoicez".into(),
             "```sql\nSELECT city, SUM(amount) AS total FROM orders GROUP BY city;\n```".into(),
         ]);
-        let out = generate(&model, "各城市成交额", &catalog(), 3, None, None).await.unwrap();
+        let out = generate(&model, "各城市成交额", &catalog(), 3, None, None)
+            .await
+            .unwrap();
         assert_eq!(out.repairs, 1);
-        assert_eq!(out.sql, "SELECT city, SUM(amount) AS total FROM orders GROUP BY city");
+        assert_eq!(
+            out.sql,
+            "SELECT city, SUM(amount) AS total FROM orders GROUP BY city"
+        );
         assert_eq!(out.dialect, "mysql");
         assert_eq!(out.tables, vec!["orders".to_string()]);
         let prompts = model.prompts.lock().unwrap();
@@ -1193,19 +1254,30 @@ mod tests {
             "SELECT o.net_amount FROM orders o JOIN invoicez i ON o.id = i.id".into(),
             "SELECT o.amount FROM orders o".into(),
         ]);
-        let out = generate(&model, "各城市成交额", &catalog(), 3, None, None).await.unwrap();
+        let out = generate(&model, "各城市成交额", &catalog(), 3, None, None)
+            .await
+            .unwrap();
         assert_eq!(out.repairs, 1);
         let prompts = model.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
         assert!(prompts[1].contains("共 2 处问题"), "{}", prompts[1]);
-        assert!(prompts[1].contains("invoicez 不在本次目录里"), "{}", prompts[1]);
+        assert!(
+            prompts[1].contains("invoicez 不在本次目录里"),
+            "{}",
+            prompts[1]
+        );
         assert!(prompts[1].contains("orders.net_amount"), "{}", prompts[1]);
     }
 
     #[tokio::test]
     async fn generate_gives_up_after_the_last_round_and_says_why() {
-        let model = scripted(vec!["SELECT * FROM ghost_a".into(), "SELECT * FROM ghost_b".into()]);
-        let e = generate(&model, "随便查查", &catalog(), 1, None, None).await.unwrap_err();
+        let model = scripted(vec![
+            "SELECT * FROM ghost_a".into(),
+            "SELECT * FROM ghost_b".into(),
+        ]);
+        let e = generate(&model, "随便查查", &catalog(), 1, None, None)
+            .await
+            .unwrap_err();
         assert!(e.error.contains("重试 2 次"), "{e:?}");
         assert!(e.error.contains("ghost_b"), "{e:?}");
         assert_eq!(model.prompts.lock().unwrap().len(), 2);
@@ -1218,7 +1290,9 @@ mod tests {
             big.push(cat_table("shop", "mysql", "", &format!("t{i}"), &["id"]));
         }
         let model = scripted(vec!["SELECT id FROM t24".into()]);
-        let out = generate(&model, "查 t24", &big, 2, None, None).await.unwrap();
+        let out = generate(&model, "查 t24", &big, 2, None, None)
+            .await
+            .unwrap();
         assert_eq!(out.sql, "SELECT id FROM t24");
         assert!(
             out.warnings.iter().any(|w| w.contains("只带了前 20 张")),
@@ -1235,7 +1309,9 @@ mod tests {
         let model = scripted(vec![]);
         // 还没见到模型输出的 SQL 就被挡下：回执里不该凭空带出一条"底稿"
         for (question, cat) in [("  ", catalog()), ("查订单", vec![])] {
-            let e = generate(&model, question, &cat, 1, None, None).await.unwrap_err();
+            let e = generate(&model, question, &cat, 1, None, None)
+                .await
+                .unwrap_err();
             assert!(!e.error.is_empty(), "{e:?}");
             assert!(e.sql.is_none(), "前置闸没有底稿可带：{e:?}");
         }
@@ -1246,17 +1322,25 @@ mod tests {
     async fn generate_reports_a_model_error_instead_of_looping() {
         struct Down;
         impl Model for Down {
-            fn complete(&self, _p: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+            fn complete(
+                &self,
+                _p: String,
+            ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
                 Box::pin(async { Err("AI 服务请求失败: 连接超时".into()) })
             }
         }
-        let e = generate(&Down, "查订单", &catalog(), 3, None, None).await.unwrap_err();
+        let e = generate(&Down, "查订单", &catalog(), 3, None, None)
+            .await
+            .unwrap_err();
         assert_eq!(e.error, "AI 服务请求失败: 连接超时");
         assert!(e.sql.is_none(), "{e:?}");
     }
 
     fn prior_draft(question: &str, sql: &str) -> PriorDraft {
-        PriorDraft { question: question.into(), sql: sql.into() }
+        PriorDraft {
+            question: question.into(),
+            sql: sql.into(),
+        }
     }
 
     /// 空白的上一稿（用户新开会话、或上一轮什么都没写）不该往提示词里塞噪音
@@ -1287,14 +1371,25 @@ mod tests {
             "SELECT city, total FROM invoicez".into(),
             "SELECT city, SUM(amount) AS total FROM orders GROUP BY city".into(),
         ]);
-        let p = prior_draft("各城市成交额", "SELECT id, city FROM orders WHERE status = 'paid'");
-        let out = generate(&model, "再按月拆开", &catalog(), 3, Some(&p), None).await.unwrap();
+        let p = prior_draft(
+            "各城市成交额",
+            "SELECT id, city FROM orders WHERE status = 'paid'",
+        );
+        let out = generate(&model, "再按月拆开", &catalog(), 3, Some(&p), None)
+            .await
+            .unwrap();
         assert_eq!(out.repairs, 1);
-        assert_eq!(out.sql, "SELECT city, SUM(amount) AS total FROM orders GROUP BY city");
+        assert_eq!(
+            out.sql,
+            "SELECT city, SUM(amount) AS total FROM orders GROUP BY city"
+        );
         let ps = model.prompts.lock().unwrap();
         assert_eq!(ps.len(), 2);
         for round in ps.iter() {
-            assert!(round.contains("SELECT id, city FROM orders WHERE status = 'paid'"), "{round}");
+            assert!(
+                round.contains("SELECT id, city FROM orders WHERE status = 'paid'"),
+                "{round}"
+            );
             assert!(round.contains("再按月拆开"), "{round}");
         }
         // 改稿提示和校验拒因同时在场，模型才知道既要在旧稿上改、又要修哪个错
@@ -1327,16 +1422,21 @@ mod tests {
             .unwrap_err();
         assert!(e.error.contains("orders.net_amount"), "{e:?}");
         // 带回来的是模型自己写的那一条（剥过围栏和尾分号），不是校验器修好的
-        assert_eq!(e.sql.as_deref(), Some("SELECT o.city, o.net_amount FROM orders o"));
+        assert_eq!(
+            e.sql.as_deref(),
+            Some("SELECT o.city, o.net_amount FROM orders o")
+        );
         // 过到线上一份不落的形状：前端就按 {error, sql} 这两个键解
         let wire = serde_json::to_value(&e).unwrap();
         assert_eq!(
-            wire
-                .as_object()
+            wire.as_object()
                 .map(|m| m.keys().map(|k| k.as_str()).collect::<Vec<_>>()),
             Some(vec!["error", "sql"])
         );
-        assert_eq!(wire["sql"], serde_json::json!("SELECT o.city, o.net_amount FROM orders o"));
+        assert_eq!(
+            wire["sql"],
+            serde_json::json!("SELECT o.city, o.net_amount FROM orders o")
+        );
     }
 
     /// 一键「照这条错误改」：拒因和被拒的那条 SQL 要在第一次请求就同时到场，
@@ -1347,7 +1447,8 @@ mod tests {
         // 只准备一条好答案：错误单和旧 SQL 在第一轮就同时到场，模型一次改对才算这次
         // 请求没白头发（脚本给多条的话，第二轮起是后端自己在修，量不到这一键）
         let model = scripted(vec!["SELECT o.city, o.amount FROM orders o".into()]);
-        let ticket = format!("重试 1 次后仍未通过本机校验：SQL 用到了目录里不存在的列：orders.net_amount");
+        let ticket =
+            format!("重试 1 次后仍未通过本机校验：SQL 用到了目录里不存在的列：orders.net_amount");
         let out = generate(
             &model,
             "各城市成交额",

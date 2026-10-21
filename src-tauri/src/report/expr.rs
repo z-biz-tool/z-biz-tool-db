@@ -45,9 +45,11 @@ impl Value {
             Value::Int(i) => Some(*i),
             Value::Float(f) => Some(*f as i64),
             Value::Bool(b) => Some(*b as i64),
-            Value::Text(s) => s.trim().parse::<i64>().ok().or_else(|| {
-                s.trim().parse::<f64>().ok().map(|f| f as i64)
-            }),
+            Value::Text(s) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .or_else(|| s.trim().parse::<f64>().ok().map(|f| f as i64)),
             Value::Null => None,
         }
     }
@@ -237,7 +239,8 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             continue;
         }
         // 数字
-        if c.is_ascii_digit() || (c == '.' && i + 1 < b.len() && (b[i + 1] as char).is_ascii_digit())
+        if c.is_ascii_digit()
+            || (c == '.' && i + 1 < b.len() && (b[i + 1] as char).is_ascii_digit())
         {
             let start = i;
             let mut is_float = false;
@@ -475,11 +478,7 @@ impl Parser {
         let mut lhs = self.parse_primary(cols)?;
         loop {
             let op = match self.peek() {
-                Tok::Op(s)
-                    if s == "*" || s == "/" || s == "%" || s == "||" =>
-                {
-                    s.clone()
-                }
+                Tok::Op(s) if s == "*" || s == "/" || s == "%" || s == "||" => s.clone(),
                 _ => break,
             };
             self.pos += 1;
@@ -525,9 +524,16 @@ impl Parser {
                         if !self.eat_ident_kw("NULL") {
                             return Err("IS 之后只支持 NULL".into());
                         }
-                        let is_null =
-                            Expr::Bin(BinOp::IsNull, Box::new(lhs), Box::new(Expr::Literal(Value::Null)));
-                        lhs = if negated { Expr::Not(Box::new(is_null)) } else { is_null };
+                        let is_null = Expr::Bin(
+                            BinOp::IsNull,
+                            Box::new(lhs),
+                            Box::new(Expr::Literal(Value::Null)),
+                        );
+                        lhs = if negated {
+                            Expr::Not(Box::new(is_null))
+                        } else {
+                            is_null
+                        };
                         continue;
                     }
                     break;
@@ -570,9 +576,29 @@ impl Parser {
 
 /// 白名单函数：避免把 SQL 全量函数面暴露给 AI 或用户
 pub const ALLOWED_FUNCTIONS: &[&str] = &[
-    "ABS", "ROUND", "CEIL", "FLOOR", "SQRT", "POW", "POWER", "MOD", "GREATEST", "LEAST",
-    "COALESCE", "NULLIF", "IF", "CONCAT", "UPPER", "LOWER", "TRIM", "LENGTH", "SUBSTR",
-    "SUBSTRING", "REPLACE", "CAST_NUM", "CAST_INT",
+    "ABS",
+    "ROUND",
+    "CEIL",
+    "FLOOR",
+    "SQRT",
+    "POW",
+    "POWER",
+    "MOD",
+    "GREATEST",
+    "LEAST",
+    "COALESCE",
+    "NULLIF",
+    "IF",
+    "CONCAT",
+    "UPPER",
+    "LOWER",
+    "TRIM",
+    "LENGTH",
+    "SUBSTR",
+    "SUBSTRING",
+    "REPLACE",
+    "CAST_NUM",
+    "CAST_INT",
 ];
 
 fn check_fn_allowed(name: &str) -> Result<(), String> {
@@ -682,12 +708,7 @@ impl Expr {
 }
 
 /// SQL 语义：NULL 参与算术 → NULL；字符串比较按文本。
-fn eval_bin(
-    op: BinOp,
-    l: &Expr,
-    r: &Expr,
-    row: &HashMap<String, Value>,
-) -> Result<Value, String> {
+fn eval_bin(op: BinOp, l: &Expr, r: &Expr, row: &HashMap<String, Value>) -> Result<Value, String> {
     use BinOp::*;
     // 逻辑算子短路（并把 NULL 当 false 处理，符合 SQL WHERE 语义）
     match op {
@@ -700,7 +721,9 @@ fn eval_bin(
             if b.truthy() == Some(false) {
                 return Ok(Value::Bool(false));
             }
-            return Ok(Value::Bool(a.truthy() == Some(true) && b.truthy() == Some(true)));
+            return Ok(Value::Bool(
+                a.truthy() == Some(true) && b.truthy() == Some(true),
+            ));
         }
         Or => {
             let a = l.eval(row)?;
@@ -708,7 +731,9 @@ fn eval_bin(
                 return Ok(Value::Bool(true));
             }
             let b = r.eval(row)?;
-            return Ok(Value::Bool(a.truthy() == Some(true) || b.truthy() == Some(true)));
+            return Ok(Value::Bool(
+                a.truthy() == Some(true) || b.truthy() == Some(true),
+            ));
         }
         Concat => {
             let a = l.eval(row)?;
@@ -940,11 +965,7 @@ pub fn bucket_of(v: &Value) -> String {
     }
 }
 
-fn eval_fn(
-    name: &str,
-    args: &[Expr],
-    row: &HashMap<String, Value>,
-) -> Result<Value, String> {
+fn eval_fn(name: &str, args: &[Expr], row: &HashMap<String, Value>) -> Result<Value, String> {
     let arg = |i: usize| -> Result<Value, String> {
         args.get(i)
             .ok_or_else(|| format!("函数 {} 缺少第 {} 个参数", name, i + 1))
@@ -975,11 +996,24 @@ fn eval_fn(
                 (scaled - 0.5).ceil()
             };
             let out = r / p;
-            Ok(if d == 0 { Value::Int(out as i64) } else { Value::Float(out) })
+            Ok(if d == 0 {
+                Value::Int(out as i64)
+            } else {
+                Value::Float(out)
+            })
         }
-        "CEIL" => Ok(arg(0)?.as_f64().map(|f| Value::Int(f.ceil() as i64)).unwrap_or(Value::Null)),
-        "FLOOR" => Ok(arg(0)?.as_f64().map(|f| Value::Int(f.floor() as i64)).unwrap_or(Value::Null)),
-        "SQRT" => Ok(arg(0)?.as_f64().map(|f| Value::Float(f.sqrt())).unwrap_or(Value::Null)),
+        "CEIL" => Ok(arg(0)?
+            .as_f64()
+            .map(|f| Value::Int(f.ceil() as i64))
+            .unwrap_or(Value::Null)),
+        "FLOOR" => Ok(arg(0)?
+            .as_f64()
+            .map(|f| Value::Int(f.floor() as i64))
+            .unwrap_or(Value::Null)),
+        "SQRT" => Ok(arg(0)?
+            .as_f64()
+            .map(|f| Value::Float(f.sqrt()))
+            .unwrap_or(Value::Null)),
         "POW" | "POWER" => {
             let a = arg(0)?.as_f64();
             let b = arg(1)?.as_f64();
@@ -1011,7 +1045,11 @@ fn eval_fn(
                         } else {
                             ord_key(&v, &cur).map(|k| k < 0).unwrap_or(false)
                         };
-                        if take_new { v } else { cur }
+                        if take_new {
+                            v
+                        } else {
+                            cur
+                        }
                     }
                 });
             }
@@ -1053,7 +1091,9 @@ fn eval_fn(
             Ok(Value::Text(s))
         }
         "UPPER" | "LOWER" | "TRIM" => {
-            let s = arg(0)?.as_text().ok_or_else(|| "参数须为文本".to_string())?;
+            let s = arg(0)?
+                .as_text()
+                .ok_or_else(|| "参数须为文本".to_string())?;
             let _ = name;
             Ok(Value::Text(match name {
                 "UPPER" => s.to_uppercase(),
@@ -1061,7 +1101,10 @@ fn eval_fn(
                 _ => s.trim().to_string(),
             }))
         }
-        "LENGTH" => Ok(arg(0)?.as_text().map(|s| Value::Int(s.chars().count() as i64)).unwrap_or(Value::Null)),
+        "LENGTH" => Ok(arg(0)?
+            .as_text()
+            .map(|s| Value::Int(s.chars().count() as i64))
+            .unwrap_or(Value::Null)),
         "SUBSTR" | "SUBSTRING" => {
             let s = match arg(0)?.as_text() {
                 Some(s) => s,
@@ -1081,7 +1124,9 @@ fn eval_fn(
                 Some(e) => e.eval(row)?.as_i64().unwrap_or(0).max(0) as usize,
                 None => chars.len() - from,
             };
-            Ok(Value::Text(chars[from..(from + take).min(chars.len())].iter().collect()))
+            Ok(Value::Text(
+                chars[from..(from + take).min(chars.len())].iter().collect(),
+            ))
         }
         "REPLACE" => {
             let s = arg(0)?.as_text().unwrap_or_default();
@@ -1103,7 +1148,10 @@ mod tests {
     use super::*;
 
     fn row(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     fn cols(names: &[&str]) -> AllowedColumns {
@@ -1111,8 +1159,10 @@ mod tests {
     }
 
     fn ev(src: &str, names: &[&str], r: &HashMap<String, Value>) -> Value {
-        let e = parse_expr(src, &cols(names)).unwrap_or_else(|err| panic!("解析 {} 失败: {}", src, err));
-        e.eval(r).unwrap_or_else(|err| panic!("求值 {} 失败: {}", src, err))
+        let e = parse_expr(src, &cols(names))
+            .unwrap_or_else(|err| panic!("解析 {} 失败: {}", src, err));
+        e.eval(r)
+            .unwrap_or_else(|err| panic!("求值 {} 失败: {}", src, err))
     }
 
     #[test]
@@ -1135,7 +1185,10 @@ mod tests {
 
     #[test]
     fn string_concat_and_compare() {
-        let r = row(&[("first", Value::Text("张".into())), ("last", Value::Text("三".into()))]);
+        let r = row(&[
+            ("first", Value::Text("张".into())),
+            ("last", Value::Text("三".into())),
+        ]);
         assert_eq!(
             ev("last || first", &["first", "last"], &r),
             Value::Text("三张".into())
@@ -1147,7 +1200,10 @@ mod tests {
 
     #[test]
     fn case_when_both_forms() {
-        let r = row(&[("score", Value::Int(73)), ("grade", Value::Text("B".into()))]);
+        let r = row(&[
+            ("score", Value::Int(73)),
+            ("grade", Value::Text("B".into())),
+        ]);
         assert_eq!(
             ev(
                 "CASE WHEN score >= 90 THEN 'A' WHEN score >= 60 THEN 'B' ELSE 'C' END",
@@ -1158,14 +1214,22 @@ mod tests {
         );
         // 简单 CASE
         assert_eq!(
-            ev("CASE grade WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 0 END", &["grade"], &row(&[("grade", Value::Text("B".into()))])),
+            ev(
+                "CASE grade WHEN 'A' THEN 1 WHEN 'B' THEN 2 ELSE 0 END",
+                &["grade"],
+                &row(&[("grade", Value::Text("B".into()))])
+            ),
             Value::Int(2)
         );
     }
 
     #[test]
     fn coalesce_nullif_round() {
-        let r = row(&[("a", Value::Null), ("b", Value::Int(5)), ("f", Value::Float(1.61803))]);
+        let r = row(&[
+            ("a", Value::Null),
+            ("b", Value::Int(5)),
+            ("f", Value::Float(1.61803)),
+        ]);
         assert_eq!(ev("COALESCE(a, b, 0)", &["a", "b", "f"], &r), Value::Int(5));
         assert_eq!(ev("NULLIF(b, 5)", &["a", "b", "f"], &r), Value::Null);
         assert_eq!(ev("ROUND(f, 2)", &["a", "b", "f"], &r), Value::Float(1.62));
@@ -1199,7 +1263,11 @@ mod tests {
     fn rejects_non_whitelisted_function() {
         // 关键安全点：AI 若幻觉出 DROP/PG_SLEEP 之类，这里直接挡下
         let err = parse_expr("PG_SLEEP(10)", &cols(&["a"])).unwrap_err();
-        assert!(err.contains("不允许") || err.contains("不在允许"), "实际: {}", err);
+        assert!(
+            err.contains("不允许") || err.contains("不在允许"),
+            "实际: {}",
+            err
+        );
     }
 
     #[test]
@@ -1265,7 +1333,11 @@ mod tests {
         // 修复点：解析操作数时用 eat 吞掉了首个 WHEN，导致 searched 形式直接空转报错
         let r = row(&[("x", Value::Int(5))]);
         assert_eq!(
-            ev("CASE WHEN x > 10 THEN 'big' WHEN x > 1 THEN 'mid' ELSE 'small' END", &["x"], &r),
+            ev(
+                "CASE WHEN x > 10 THEN 'big' WHEN x > 1 THEN 'mid' ELSE 'small' END",
+                &["x"],
+                &r
+            ),
             Value::Text("mid".into())
         );
         // 无 ELSE 且不命中 → NULL
@@ -1307,7 +1379,11 @@ mod tests {
 
     #[test]
     fn text_ordering_and_div_zero() {
-        let r = row(&[("s", Value::Text("apple".into())), ("z", Value::Int(0)), ("n", Value::Int(9))]);
+        let r = row(&[
+            ("s", Value::Text("apple".into())),
+            ("z", Value::Int(0)),
+            ("n", Value::Int(9)),
+        ]);
         assert_eq!(ev("s < 'b'", &["s", "z", "n"], &r), Value::Bool(true));
         assert_eq!(ev("n / z", &["s", "z", "n"], &r), Value::Null);
         assert_eq!(ev("n % z", &["s", "z", "n"], &r), Value::Null);
@@ -1349,7 +1425,10 @@ mod tests {
     fn value_crosses_the_ipc_boundary_as_a_plain_scalar() {
         // 前端拿到的必须是 300 而不是 {"Int":300}
         assert_eq!(serde_json::to_string(&Value::Int(300)).unwrap(), "300");
-        assert_eq!(serde_json::to_string(&Value::Text("SH".into())).unwrap(), "\"SH\"");
+        assert_eq!(
+            serde_json::to_string(&Value::Text("SH".into())).unwrap(),
+            "\"SH\""
+        );
         assert_eq!(serde_json::to_string(&Value::Bool(true)).unwrap(), "true");
         assert_eq!(serde_json::to_string(&Value::Null).unwrap(), "null");
         // 超出 JS 精确整数域时降文本，这是 to_json 既有的取舍
@@ -1388,7 +1467,13 @@ mod tests {
             (Value::Int(1001), Value::Text("1001".into())),
             (Value::Int(5), Value::Text("apple".into())),
         ] {
-            assert_eq!(cmp_eq(&a, &b), Value::Null, "{:?} = {:?} 在 SQL 里是 NULL", a, b);
+            assert_eq!(
+                cmp_eq(&a, &b),
+                Value::Null,
+                "{:?} = {:?} 在 SQL 里是 NULL",
+                a,
+                b
+            );
             assert!(
                 !group_eq(&a, &b),
                 "group by 不能跟着放宽：{:?} 与 {:?} 必须分属两组",
@@ -1410,10 +1495,17 @@ mod tests {
         }
 
         // NULL / 非有限浮点永不匹配，连自己都不配；但 group by 的 NULL 自成一组
-        for v in [Value::Null, Value::Float(f64::NAN), Value::Float(f64::NEG_INFINITY)] {
+        for v in [
+            Value::Null,
+            Value::Float(f64::NAN),
+            Value::Float(f64::NEG_INFINITY),
+        ] {
             assert!(!join_eq(&v, &v), "{:?} 不该与自己配", v);
         }
-        assert!(group_eq(&Value::Null, &Value::Null), "NULL 在 group by 里仍自成一组");
+        assert!(
+            group_eq(&Value::Null, &Value::Null),
+            "NULL 在 group by 里仍自成一组"
+        );
 
         // 精确十进制比对：超出 f64 有效位的两个大整数不再错配
         assert!(!join_eq(

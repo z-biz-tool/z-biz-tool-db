@@ -6,17 +6,17 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 
-#[path = "queries.rs"]
-mod queries;
-#[path = "db/mod.rs"]
-mod db;
-#[path = "security.rs"]
-mod security;
-#[path = "secrets.rs"]
-mod secrets;
 #[path = "ai_sql.rs"]
 mod ai_sql;
+#[path = "db/mod.rs"]
+mod db;
+#[path = "queries.rs"]
+mod queries;
 pub mod report;
+#[path = "secrets.rs"]
+mod secrets;
+#[path = "security.rs"]
+mod security;
 
 // ================== 数据结构 ==================
 
@@ -465,11 +465,11 @@ async fn mysql_pool(cfg: &DBConfig) -> Result<MySqlPool, String> {
             .acquire_timeout(POOL_CONNECT_TIMEOUT)
             .connect_with(opts),
     )
-        .await
-        .map_err(|_| {
-            "连接超时（15 秒）：网络不可达或防火墙丢包，请检查 VPN / 安全组 / 主机端口".to_string()
-        })?
-        .map_err(|e| e.to_string())
+    .await
+    .map_err(|_| {
+        "连接超时（15 秒）：网络不可达或防火墙丢包，请检查 VPN / 安全组 / 主机端口".to_string()
+    })?
+    .map_err(|e| e.to_string())
 }
 
 async fn pg_pool(cfg: &DBConfig) -> Result<PgPool, String> {
@@ -497,11 +497,11 @@ async fn pg_pool(cfg: &DBConfig) -> Result<PgPool, String> {
             .acquire_timeout(POOL_CONNECT_TIMEOUT)
             .connect_with(opts),
     )
-        .await
-        .map_err(|_| {
-            "连接超时（15 秒）：网络不可达或防火墙丢包，请检查 VPN / 安全组 / 主机端口".to_string()
-        })?
-        .map_err(|e| e.to_string())
+    .await
+    .map_err(|_| {
+        "连接超时（15 秒）：网络不可达或防火墙丢包，请检查 VPN / 安全组 / 主机端口".to_string()
+    })?
+    .map_err(|e| e.to_string())
 }
 
 async fn sqlite_pool(cfg: &DBConfig) -> Result<SqlitePool, String> {
@@ -516,7 +516,10 @@ async fn sqlite_pool(cfg: &DBConfig) -> Result<SqlitePool, String> {
     if !special {
         let p = std::path::Path::new(path);
         if !p.exists() {
-            return Err(format!("SQLite 文件不存在：{}（本工具不会代建新库文件）", path));
+            return Err(format!(
+                "SQLite 文件不存在：{}（本工具不会代建新库文件）",
+                path
+            ));
         }
         if !p.is_file() {
             return Err(format!("SQLite 路径不是文件：{}", path));
@@ -626,9 +629,10 @@ fn decode_error_value(message: &str) -> serde_json::Value {
 fn bytes_to_value(v: Option<Vec<u8>>) -> serde_json::Value {
     // 二进制路径：使用 base64 编码而非 from_utf8_lossy，避免有损还原
     match v {
-        Some(b) => {
-            tagged_cell(CellKind::Binary, serde_json::Value::String(base64_encode(&b)))
-        }
+        Some(b) => tagged_cell(
+            CellKind::Binary,
+            serde_json::Value::String(base64_encode(&b)),
+        ),
         None => tagged_cell(CellKind::Null, serde_json::Value::Null),
     }
 }
@@ -719,17 +723,21 @@ fn mysql_cell(row: &MySqlRow, i: usize) -> serde_json::Value {
     }
     let type_info = raw.type_info();
     let type_name: &str = type_info.name();
-    macro_rules! int_cell { ($k:expr) => { $k.map(|v| wrap(CellKind::Integer, v)) } }
-    macro_rules! dec_cell { () => {
-        mysql_dec::<sqlx::types::Decimal>(row, i).map(|v| {
-            wrap(
-                CellKind::Decimal,
-                serde_json::Value::String(v.to_string()),
-            )
-        })
-    }}
+    macro_rules! int_cell {
+        ($k:expr) => {
+            $k.map(|v| wrap(CellKind::Integer, v))
+        };
+    }
+    macro_rules! dec_cell {
+        () => {
+            mysql_dec::<sqlx::types::Decimal>(row, i)
+                .map(|v| wrap(CellKind::Decimal, serde_json::Value::String(v.to_string())))
+        };
+    }
     let value: Option<serde_json::Value> = match type_name {
-        "BOOLEAN" => mysql_dec::<bool>(row, i).or_else(|| mysql_dec::<i8>(row, i)).map(|v| wrap(CellKind::Integer, v)),
+        "BOOLEAN" => mysql_dec::<bool>(row, i)
+            .or_else(|| mysql_dec::<i8>(row, i))
+            .map(|v| wrap(CellKind::Integer, v)),
         "TINYINT" => int_cell!(mysql_dec::<i8>(row, i)),
         "TINYINT UNSIGNED" => int_cell!(mysql_dec::<u8>(row, i)),
         "SMALLINT" | "YEAR" => int_cell!(mysql_dec::<i16>(row, i)),
@@ -767,7 +775,9 @@ fn mysql_cell(row: &MySqlRow, i: usize) -> serde_json::Value {
         "DATETIME" | "TIMESTAMP" => mysql_dec::<chrono::NaiveDateTime>(row, i)
             .map(|v| wrap(CellKind::DateTime, serde_json::Value::String(v.to_string()))),
         "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "GEOMETRY" => {
-            Some(bytes_to_value(row.try_get::<Option<Vec<u8>>, _>(i).ok().flatten()))
+            Some(bytes_to_value(
+                row.try_get::<Option<Vec<u8>>, _>(i).ok().flatten(),
+            ))
         }
         _ => mysql_dec::<String>(row, i).map(|v| wrap(CellKind::Text, v)),
     };
@@ -784,15 +794,17 @@ fn pg_cell(row: &PgRow, i: usize) -> serde_json::Value {
     }
     let type_info = raw.type_info();
     let type_name: &str = type_info.name();
-    macro_rules! int_cell { ($k:expr) => { $k.map(|v| wrap(CellKind::Integer, v)) } }
-    macro_rules! dec_cell { () => {
-        pg_dec::<sqlx::types::Decimal>(row, i).map(|v| {
-            wrap(
-                CellKind::Decimal,
-                serde_json::Value::String(v.to_string()),
-            )
-        })
-    }}
+    macro_rules! int_cell {
+        ($k:expr) => {
+            $k.map(|v| wrap(CellKind::Integer, v))
+        };
+    }
+    macro_rules! dec_cell {
+        () => {
+            pg_dec::<sqlx::types::Decimal>(row, i)
+                .map(|v| wrap(CellKind::Decimal, serde_json::Value::String(v.to_string())))
+        };
+    }
     let value: Option<serde_json::Value> = match type_name {
         "bool" => int_cell!(pg_dec::<bool>(row, i)),
         "int2" => int_cell!(pg_dec::<i16>(row, i)),
@@ -813,12 +825,8 @@ fn pg_cell(row: &PgRow, i: usize) -> serde_json::Value {
                 serde_json::Value::String(v.to_string()),
             )
         }),
-        "uuid" => pg_dec::<sqlx::types::Uuid>(row, i).map(|v| {
-            wrap(
-                CellKind::Uuid,
-                serde_json::Value::String(v.to_string()),
-            )
-        }),
+        "uuid" => pg_dec::<sqlx::types::Uuid>(row, i)
+            .map(|v| wrap(CellKind::Uuid, serde_json::Value::String(v.to_string()))),
         "json" | "jsonb" => pg_dec::<serde_json::Value>(row, i).map(|v| wrap(CellKind::Json, v)),
         "bytea" => Some(bytes_to_value(
             row.try_get::<Option<Vec<u8>>, _>(i).ok().flatten(),
@@ -865,7 +873,7 @@ fn column_meta_from_row<C: Column>(cols: &[C]) -> Vec<ColumnMeta> {
             logical_type: map_logical_type(c.type_info().name()),
             nullable: true, // 驱动未提供可靠 nullable 信息，默认 true（保守处理）
         })
-    .collect()
+        .collect()
 }
 
 fn map_logical_type(native: &str) -> String {
@@ -893,7 +901,10 @@ fn map_logical_type(native: &str) -> String {
 async fn mysql_run(pool: &MySqlPool, sql: &str) -> Result<RunOutput, String> {
     if is_query_stmt(sql) {
         // 先用空参数 prepare 获取列元数据，避免 0 行时丢失列定义
-        let stmt = sqlx::query(sql).fetch_all(pool).await.map_err(|e| e.to_string())?;
+        let stmt = sqlx::query(sql)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         let meta: Vec<ColumnMeta> = stmt
             .first()
             .map(|r| column_meta_from_row(r.columns()))
@@ -908,14 +919,20 @@ async fn mysql_run(pool: &MySqlPool, sql: &str) -> Result<RunOutput, String> {
         }
         Ok((meta, data, 0, true))
     } else {
-        let res = sqlx::query(sql).execute(pool).await.map_err(|e| e.to_string())?;
+        let res = sqlx::query(sql)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok((Vec::new(), Vec::new(), res.rows_affected(), false))
     }
 }
 
 async fn pg_run(pool: &PgPool, sql: &str) -> Result<RunOutput, String> {
     if is_query_stmt(sql) {
-        let rows = sqlx::query(sql).fetch_all(pool).await.map_err(|e| e.to_string())?;
+        let rows = sqlx::query(sql)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         let meta: Vec<ColumnMeta> = rows
             .first()
             .map(|r| column_meta_from_row(r.columns()))
@@ -933,7 +950,10 @@ async fn pg_run(pool: &PgPool, sql: &str) -> Result<RunOutput, String> {
         }
         Ok((meta, data, 0, true))
     } else {
-        let res = sqlx::query(sql).execute(pool).await.map_err(|e| e.to_string())?;
+        let res = sqlx::query(sql)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok((Vec::new(), Vec::new(), res.rows_affected(), false))
     }
 }
@@ -978,7 +998,10 @@ async fn sqlite_run_capped(
 
 async fn sqlite_run(pool: &SqlitePool, sql: &str) -> Result<RunOutput, String> {
     if is_query_stmt(sql) {
-        let rows = sqlx::query(sql).fetch_all(pool).await.map_err(|e| e.to_string())?;
+        let rows = sqlx::query(sql)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         let meta: Vec<ColumnMeta> = rows
             .first()
             .map(|r| column_meta_from_row(r.columns()))
@@ -996,7 +1019,10 @@ async fn sqlite_run(pool: &SqlitePool, sql: &str) -> Result<RunOutput, String> {
         }
         Ok((meta, data, 0, true))
     } else {
-        let res = sqlx::query(sql).execute(pool).await.map_err(|e| e.to_string())?;
+        let res = sqlx::query(sql)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok((Vec::new(), Vec::new(), res.rows_affected(), false))
     }
 }
@@ -1021,11 +1047,11 @@ async fn get_ai_config() -> Result<AIConfig, String> {
     let config_path = data_dir.join("ai_config.json");
 
     if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("读取配置失败: {}", e))?;
+        let content =
+            std::fs::read_to_string(&config_path).map_err(|e| format!("读取配置失败: {}", e))?;
         // S0：不返回 API key 明文回前端，由前端通过专用脱敏通道显示
-        let mut cfg: AIConfig = serde_json::from_str(&content)
-            .map_err(|e| format!("解析配置失败: {}", e))?;
+        let mut cfg: AIConfig =
+            serde_json::from_str(&content).map_err(|e| format!("解析配置失败: {}", e))?;
         cfg.api_key.clear();
         Ok(cfg)
     } else {
@@ -1044,8 +1070,8 @@ async fn save_ai_config(config: AIConfig) -> Result<(), String> {
     let data_dir = queries::get_data_dir()?;
     let config_path = data_dir.join("ai_config.json");
 
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("序列化失败: {}", e))?;
+    let content =
+        serde_json::to_string_pretty(&config).map_err(|e| format!("序列化失败: {}", e))?;
 
     queries::atomic_write_pub(&config_path, content.as_bytes())?;
     Ok(())
@@ -1061,14 +1087,18 @@ async fn call_ai_service(config: &AIConfig, prompt: &str) -> Result<String, Stri
 
 // AI 解释查询结果
 #[command]
-async fn ai_explain_results(sql: String, results: Vec<serde_json::Value>, config: AIConfig) -> Result<String, String> {
+async fn ai_explain_results(
+    sql: String,
+    results: Vec<serde_json::Value>,
+    config: AIConfig,
+) -> Result<String, String> {
     if config.base_url.is_empty() || config.api_key.is_empty() {
         return Err("请先在设置中配置 AI 参数".to_string());
     }
-    
-    let results_str = serde_json::to_string_pretty(&results)
-        .unwrap_or_else(|_| "无法序列化结果".to_string());
-    
+
+    let results_str =
+        serde_json::to_string_pretty(&results).unwrap_or_else(|_| "无法序列化结果".to_string());
+
     let prompt = format!(
         "你是一个数据分析专家。请分析以下 SQL 查询结果并提供洞察。\n\n\
          SQL: {}\n\n\
@@ -1080,23 +1110,40 @@ async fn ai_explain_results(sql: String, results: Vec<serde_json::Value>, config
          4. 进一步分析建议",
         sql, results_str
     );
-    
+
     call_ai_service(&config, &prompt).await
 }
 
 // AI 优化 SQL
 #[command]
-async fn ai_optimize_sql(sql: String, table_schema: Vec<ColumnInfo>, config: AIConfig) -> Result<String, String> {
+async fn ai_optimize_sql(
+    sql: String,
+    table_schema: Vec<ColumnInfo>,
+    config: AIConfig,
+) -> Result<String, String> {
     if config.base_url.is_empty() || config.api_key.is_empty() {
         return Err("请先在设置中配置 AI 参数".to_string());
     }
-    
-    let schema_str = table_schema.iter()
-        .map(|c| format!("- {} ({}), {}", c.name, c.data_type, 
-            if c.is_primary { "主键" } else if !c.nullable { "NOT NULL" } else { "可空" }))
+
+    let schema_str = table_schema
+        .iter()
+        .map(|c| {
+            format!(
+                "- {} ({}), {}",
+                c.name,
+                c.data_type,
+                if c.is_primary {
+                    "主键"
+                } else if !c.nullable {
+                    "NOT NULL"
+                } else {
+                    "可空"
+                }
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
-    
+
     let prompt = format!(
         "你是一个 SQL 优化专家。请分析并优化以下 SQL 语句。\n\n\
          表结构:\n{}\n\n\
@@ -1109,7 +1156,7 @@ async fn ai_optimize_sql(sql: String, table_schema: Vec<ColumnInfo>, config: AIC
          优化后的 SQL:",
         schema_str, sql
     );
-    
+
     call_ai_service(&config, &prompt).await
 }
 
@@ -1119,7 +1166,7 @@ async fn ai_explain_sql(sql: String, config: AIConfig) -> Result<String, String>
     if config.base_url.is_empty() || config.api_key.is_empty() {
         return Err("请先在设置中配置 AI 参数".to_string());
     }
-    
+
     let prompt = format!(
         "你是一个 SQL 教学专家。请详细解释以下 SQL 语句的执行逻辑。\n\n\
          SQL: {}\n\n\
@@ -1130,17 +1177,21 @@ async fn ai_explain_sql(sql: String, config: AIConfig) -> Result<String, String>
          4. 潜在的性能问题",
         sql
     );
-    
+
     call_ai_service(&config, &prompt).await
 }
 
 // AI 错误诊断
 #[command]
-async fn ai_diagnose_error(error_message: String, sql: String, config: AIConfig) -> Result<String, String> {
+async fn ai_diagnose_error(
+    error_message: String,
+    sql: String,
+    config: AIConfig,
+) -> Result<String, String> {
     if config.base_url.is_empty() || config.api_key.is_empty() {
         return Err("请先在设置中配置 AI 参数".to_string());
     }
-    
+
     let prompt = format!(
         "你是一个数据库排错专家。请分析以下 SQL 错误。\n\n\
          错误信息: {}\n\n\
@@ -1151,7 +1202,7 @@ async fn ai_diagnose_error(error_message: String, sql: String, config: AIConfig)
          3. 预防建议",
         error_message, sql
     );
-    
+
     call_ai_service(&config, &prompt).await
 }
 
@@ -1338,7 +1389,9 @@ async fn execute_query_inner(
         "mysql" => {
             let pool = mysql_pool(&config).await?;
             let es = std::time::Instant::now();
-            mysql_run(&pool, &sql).await.map(|r| (r.0, r.1, r.2, r.3, es))
+            mysql_run(&pool, &sql)
+                .await
+                .map(|r| (r.0, r.1, r.2, r.3, es))
         }
         "postgresql" => {
             let pool = pg_pool(&config).await?;
@@ -1398,10 +1451,7 @@ async fn execute_query_inner(
     // 但总行数没数过——total_rows 给 0，由前端说"后面的行没取"而不是编一个总数。
     let max = max_rows.unwrap_or(u32::MAX) as usize;
     let (total_rows, truncated) = match streamed_more {
-        Some(more) => (
-            if more { 0 } else { rows.len() as u64 },
-            more,
-        ),
+        Some(more) => (if more { 0 } else { rows.len() as u64 }, more),
         None => {
             let total = rows.len() as u64;
             let cut = rows.len() > max;
@@ -1525,7 +1575,10 @@ async fn metadata_list_v2(config: DBConfig) -> Result<MetadataListV2, String> {
     }
     // 缓存版本：当前时间秒 + 表数；后端可换成实际缓存 hash
     let cache_version = format!("v{}-{}", chrono::Utc::now().timestamp(), objects.len());
-    Ok(MetadataListV2 { objects, cache_version })
+    Ok(MetadataListV2 {
+        objects,
+        cache_version,
+    })
 }
 
 // T-019 v2 IPC：query_status_v2
@@ -1605,7 +1658,10 @@ async fn get_tables(config: DBConfig) -> Result<Vec<TableInfo>, String> {
                     name: r.try_get::<String, _>("name").unwrap_or_default(),
                     schema: r.try_get::<String, _>("schema").ok(),
                     row_estimate: r.try_get::<i64, _>("row_estimate").ok().map(|v| v as u64),
-                    size_bytes: r.try_get::<i64, _>("size_bytes").ok().map(|v| v.max(0) as u64),
+                    size_bytes: r
+                        .try_get::<i64, _>("size_bytes")
+                        .ok()
+                        .map(|v| v.max(0) as u64),
                 });
             }
         }
@@ -1667,7 +1723,9 @@ async fn get_table_structure(
         "postgresql" => {
             let pool = pg_pool(&config).await?;
             // 显式 schema 优先；缺省回退 current_schema() 维持向后兼容
-            let explicit_schema = schema.clone().unwrap_or_else(|| "current_schema()".to_string());
+            let explicit_schema = schema
+                .clone()
+                .unwrap_or_else(|| "current_schema()".to_string());
             let where_schema = if explicit_schema == "current_schema()" {
                 "c.table_schema = current_schema()".to_string()
             } else {
@@ -1704,10 +1762,7 @@ async fn get_table_structure(
         }
         "sqlite" => {
             let pool = sqlite_pool(&config).await?;
-            let sql = format!(
-                "PRAGMA table_info('{}')",
-                table_name.replace('\'', "''")
-            );
+            let sql = format!("PRAGMA table_info('{}')", table_name.replace('\'', "''"));
             let rows = sqlx::query(&sql)
                 .fetch_all(&pool)
                 .await
@@ -1738,7 +1793,9 @@ async fn execute_batch(
 ) -> Result<Vec<QueryResult>, String> {
     let mode = access_mode.unwrap_or_else(|| "readOnly".to_string());
     if mode == "readOnly" {
-        return Err("批量接口当前为只读模式；写入请使用 execute_query 并显式开启可写授权".to_string());
+        return Err(
+            "批量接口当前为只读模式；写入请使用 execute_query 并显式开启可写授权".to_string(),
+        );
     }
     let mut out = Vec::new();
     for q in queries {
@@ -1783,11 +1840,30 @@ async fn format_sql(sql: String) -> Result<String, String> {
 
     // 2) 在 safe 位置检出关键字并在其前插入换行
     const NEWLINE_KEYWORDS: &[&str] = &[
-        "SELECT", "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "OFFSET",
-        "LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "OUTER JOIN", "JOIN",
-        "UNION ALL", "UNION", "INTERSECT", "EXCEPT",
-        "INSERT INTO", "VALUES", "UPDATE", "SET", "DELETE FROM",
-        "RETURNING", "ON",
+        "SELECT",
+        "FROM",
+        "WHERE",
+        "GROUP BY",
+        "ORDER BY",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "LEFT JOIN",
+        "RIGHT JOIN",
+        "INNER JOIN",
+        "OUTER JOIN",
+        "JOIN",
+        "UNION ALL",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "INSERT INTO",
+        "VALUES",
+        "UPDATE",
+        "SET",
+        "DELETE FROM",
+        "RETURNING",
+        "ON",
     ];
 
     // 按出现位置倒序处理，避免前面插入换行影响后续位置
@@ -1800,11 +1876,7 @@ async fn format_sql(sql: String) -> Result<String, String> {
         while i + kl <= bytes.len() {
             let prev_ok = i == 0 || !is_sql_word_byte(bytes[i - 1]);
             let next_ok = i + kl == bytes.len() || !is_sql_word_byte(bytes[i + kl]);
-            if prev_ok
-                && next_ok
-                && &bytes[i..i + kl] == kw_bytes
-                && safe_positions[i]
-            {
+            if prev_ok && next_ok && &bytes[i..i + kl] == kw_bytes && safe_positions[i] {
                 inserts.push((i, "\n".to_string()));
             }
             i += 1;
@@ -1816,12 +1888,7 @@ async fn format_sql(sql: String) -> Result<String, String> {
     for (pos, ins) in &inserts {
         let split_at = *pos;
         let after_pos = split_at + ins.len();
-        let new_output = format!(
-            "{}{}{}",
-            &output[..split_at],
-            ins,
-            &output[split_at..]
-        );
+        let new_output = format!("{}{}{}", &output[..split_at], ins, &output[split_at..]);
         output = new_output;
         let _ = after_pos;
     }
@@ -1844,7 +1911,9 @@ async fn format_sql(sql: String) -> Result<String, String> {
     // 前缀警告以行注释插入
     let prefix = match classification.safety {
         SafetyClass::ReadOnlySafe => String::new(),
-        SafetyClass::ReadOnlyUnsafe => "-- ⚠ 含 FOR UPDATE / EXPLAIN ANALYZE 等带副作用子句\n".to_string(),
+        SafetyClass::ReadOnlyUnsafe => {
+            "-- ⚠ 含 FOR UPDATE / EXPLAIN ANALYZE 等带副作用子句\n".to_string()
+        }
         SafetyClass::Write => "-- ⚠ 含写入语句，建议在「可写」通道并通过审批执行\n".to_string(),
         SafetyClass::Unknown => "-- ⚠ 静态分类器无法判定，请人工确认\n".to_string(),
     };
@@ -1940,21 +2009,20 @@ fn compute_safe_positions(sql: &str) -> Vec<bool> {
 // - 强制 readOnly；识别 ANALYZE 后缀并拒绝，避免静默执行
 // - 结果走标准的 QueryResult 通道（columns + rows 都是 tagged cell）
 #[command]
-async fn explain_query(
-    sql: String,
-    config: DBConfig,
-) -> Result<QueryResult, String> {
+async fn explain_query(sql: String, config: DBConfig) -> Result<QueryResult, String> {
     let upper = sql.trim().to_ascii_uppercase();
     if upper.contains("ANALYZE") {
-        return Err("EXPLAIN ANALYZE 会真正执行 SQL；S0 拒绝自动执行；如确需请人工单次授权".to_string());
+        return Err(
+            "EXPLAIN ANALYZE 会真正执行 SQL；S0 拒绝自动执行；如确需请人工单次授权".to_string(),
+        );
     }
     if upper.starts_with("EXPLAIN") {
         return Err("请仅提供被分析的 SQL 语句（不含 EXPLAIN 前缀）".to_string());
     }
 
     let dialect_explain: &str = match dispatch_db_type(&config)? {
-        "mysql" => "",                  // MySQL 直接用 EXPLAIN <sql>
-        "postgresql" => "",             // PG 默认走 FORMAT TEXT；之后可加 FORMAT JSON
+        "mysql" => "",                     // MySQL 直接用 EXPLAIN <sql>
+        "postgresql" => "",                // PG 默认走 FORMAT TEXT；之后可加 FORMAT JSON
         "sqlite" => "EXPLAIN QUERY PLAN ", // SQLite 必须显式
         _ => return Err("不支持的数据库类型".to_string()),
     };
@@ -2004,9 +2072,7 @@ async fn explain_query(
 
 // 导出连接配置
 #[command]
-async fn export_connections(
-    connections: Vec<ExportedConnection>,
-) -> Result<String, String> {
+async fn export_connections(connections: Vec<ExportedConnection>) -> Result<String, String> {
     let export = ConnectionExport {
         version: 1,
         exported_at: chrono::Utc::now().timestamp(),
@@ -2044,7 +2110,11 @@ async fn import_connections(
     });
     let max_bytes = opts.max_bytes.unwrap_or(DEFAULT_IMPORT_MAX_BYTES);
     if json.len() > max_bytes {
-        return Err(format!("导入文件过大（{} bytes > 限额 {}）", json.len(), max_bytes));
+        return Err(format!(
+            "导入文件过大（{} bytes > 限额 {}）",
+            json.len(),
+            max_bytes
+        ));
     }
     let export: ConnectionExport =
         serde_json::from_str(&json).map_err(|e| format!("解析失败: {}", e))?;
@@ -2089,8 +2159,7 @@ async fn csv_preview(
     delimiter: Option<String>,
     limit: Option<usize>,
 ) -> Result<db::csv_import::PreviewResult, String> {
-    let bytes = std::fs::read(&file_path)
-        .map_err(|e| format!("读取文件失败: {}", e))?;
+    let bytes = std::fs::read(&file_path).map_err(|e| format!("读取文件失败: {}", e))?;
     let delim = delimiter
         .map(|s| s.chars().next().unwrap_or(','))
         .unwrap_or(',');
@@ -2109,20 +2178,19 @@ async fn csv_import_execute(
     limit: Option<usize>,
     dry_run: Option<bool>,
 ) -> Result<db::csv_import::ImportResult, String> {
-    let bytes = std::fs::read(&file_path)
-        .map_err(|e| format!("读取文件失败: {}", e))?;
+    let bytes = std::fs::read(&file_path).map_err(|e| format!("读取文件失败: {}", e))?;
     let delim = delimiter
         .map(|s| s.chars().next().unwrap_or(','))
         .unwrap_or(',');
     let lim = limit.unwrap_or(1000);
     let dry = dry_run.unwrap_or(false);
-    
+
     let (headers, rows) = db::csv_import::parse_csv(&bytes, delim, lim)?;
-    
+
     if headers.is_empty() {
         return Err("CSV 文件没有列头".to_string());
     }
-    
+
     if dry {
         return Ok(db::csv_import::ImportResult {
             success: true,
@@ -2132,24 +2200,35 @@ async fn csv_import_execute(
             preview: rows,
         });
     }
-    
+
     // 构造 INSERT 语句（简化版：列名直接拼接）
-    let cols = headers.iter()
+    let cols = headers
+        .iter()
         .map(|h| format!("\"{}\"", h.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(", ");
-    
+
     let mut imported = 0u64;
     let mut errors = Vec::new();
-    
+
     for (idx, row) in rows.iter().enumerate() {
-        let values = row.iter()
-            .map(|v| if v.is_empty() || v == "NULL" { "NULL".to_string() } else { format!("'{}'", v.replace('\'', "''")) })
+        let values = row
+            .iter()
+            .map(|v| {
+                if v.is_empty() || v == "NULL" {
+                    "NULL".to_string()
+                } else {
+                    format!("'{}'", v.replace('\'', "''"))
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
-        
-        let sql = format!("INSERT INTO \"{}\" ({}) VALUES ({})", table_name, cols, values);
-        
+
+        let sql = format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({})",
+            table_name, cols, values
+        );
+
         match run_dispatch(&config, &sql).await {
             Ok(_) => imported += 1,
             Err(e) => {
@@ -2157,7 +2236,7 @@ async fn csv_import_execute(
             }
         }
     }
-    
+
     Ok(db::csv_import::ImportResult {
         success: errors.is_empty(),
         rows_imported: imported,
@@ -2178,10 +2257,8 @@ async fn save_connections(
     // CAS 校验：每个 id 的 expected_revision 必须等于磁盘上现有 revision
     if let Some(expected) = expected_revisions {
         let existing = queries::load_connections().await?;
-        let existing_by_id: std::collections::HashMap<String, u32> = existing
-            .into_iter()
-            .map(|c| (c.id, c.revision))
-            .collect();
+        let existing_by_id: std::collections::HashMap<String, u32> =
+            existing.into_iter().map(|c| (c.id, c.revision)).collect();
         for (id, exp_rev) in &expected {
             match existing_by_id.get(id) {
                 Some(cur) if *cur != *exp_rev => {
@@ -2266,9 +2343,7 @@ fn spawn_pool_lifecycle() {
         let ttl = std::time::Duration::from_secs(5 * 60);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let _ = crate::db::connection::pool_registry()
-                .idle_sweep(ttl)
-                .await;
+            let _ = crate::db::connection::pool_registry().idle_sweep(ttl).await;
         }
     });
 }
@@ -2308,7 +2383,7 @@ async fn keyset_query(
     let page_size = page_size.unwrap_or(200).min(500);
     // 每次取 pageSize+1 行来判断是否有下一页
     let fetch_size = (page_size + 1) as i64;
-    
+
     let sql = match dispatch_db_type(&config)? {
         "mysql" | "postgresql" => {
             if let Some(ref lv) = last_value {
@@ -2344,18 +2419,18 @@ async fn keyset_query(
         }
         _ => return Err("不支持的数据库类型".to_string()),
     };
-    
+
     let start = std::time::Instant::now();
     let (column_meta, rows, affected, is_query) = run_dispatch(&config, &sql).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let columns: Vec<String> = column_meta.iter().map(|m| m.name.clone()).collect();
-    
+
     let has_next = rows.len() as u32 > page_size;
     let mut display_rows = rows;
     if has_next {
         display_rows.truncate(page_size as usize);
     }
-    
+
     Ok(KeysetResult {
         columns,
         column_meta,
@@ -2455,28 +2530,16 @@ mod tests {
         c: DBConfig,
         access_mode: Option<String>,
     ) -> Result<QueryResult, String> {
-        execute_query(
-            sql.to_string(),
-            c,
-            access_mode,
-            None,
-            None,
-            None,
-        )
-        .await
+        execute_query(sql.to_string(), c, access_mode, None, None, None).await
     }
 
     #[tokio::test]
     async fn sqlite_select_only() {
         let c = cfg("sqlite", "", 0, ":memory:");
         test_connection(c.clone()).await.expect("sqlite 连接失败");
-        let r = exec_q(
-            "SELECT 1 AS one, 'x' AS s, NULL AS z",
-            c.clone(),
-            None,
-        )
-        .await
-        .expect("sqlite 查询失败");
+        let r = exec_q("SELECT 1 AS one, 'x' AS s, NULL AS z", c.clone(), None)
+            .await
+            .expect("sqlite 查询失败");
         // T-003：cell 改为 tagged 结构
         assert_eq!(
             r.rows[0][0],
@@ -2506,7 +2569,10 @@ mod tests {
             return;
         }
         // TLS：缺少驱动版本时不影响流程；仅验证 mode 解析
-        assert_eq!(TlsMode::from_str_opt(Some("verify_full")), TlsMode::VerifyFull);
+        assert_eq!(
+            TlsMode::from_str_opt(Some("verify_full")),
+            TlsMode::VerifyFull
+        );
         assert_eq!(TlsMode::from_str_opt(Some("prefer")), TlsMode::Prefer);
         assert_eq!(TlsMode::from_str_opt(Some("DISABLE")), TlsMode::Disable);
         assert_eq!(TlsMode::from_str_opt(None), TlsMode::VerifyFull);
@@ -2544,7 +2610,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn connections_persist_roundtrip() {
         let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!("zbiz-db-test-{}-{}-{}", std::process::id(), "connections_persist", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-db-test-{}-{}-{}",
+            std::process::id(),
+            "connections_persist",
+            uuid::Uuid::new_v4()
+        ));
         std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
         let records = vec![ConnectionRecord {
             id: "1".into(),
@@ -2569,7 +2640,7 @@ mod tests {
         assert!(loaded[0].password.is_empty(), "密码字段在落盘后应被清空");
     }
 
-/// T-053 兼容：旧 connection 配置无 env 字段时也能反序列化
+    /// T-053 兼容：旧 connection 配置无 env 字段时也能反序列化
     #[tokio::test(flavor = "current_thread")]
     async fn legacy_connection_without_env_field_loads() {
         let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
@@ -2589,12 +2660,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-        /// T-019 v2 IPC：metadata_list_v2 返回 DbObjectRefV2 列表
+    /// T-019 v2 IPC：metadata_list_v2 返回 DbObjectRefV2 列表
     #[tokio::test]
     async fn metadata_list_v2_ok_for_sqlite() {
         let c = cfg("sqlite", "", 0, ":memory:");
         let r = metadata_list_v2(c).await.expect("v2 元数据");
-        assert!(r.cache_version.starts_with("v"), "版本前缀 v: {}", r.cache_version);
+        assert!(
+            r.cache_version.starts_with("v"),
+            "版本前缀 v: {}",
+            r.cache_version
+        );
         // 空库：objects 应空，但 version 仍给出
         assert!(r.objects.is_empty(), "空库应无对象");
     }
@@ -2604,14 +2679,22 @@ mod tests {
     async fn query_status_v2_returns_skeleton() {
         let resp = query_status_v2("demo-q".into()).await.expect("status");
         assert_eq!(resp.query_id, "demo-q");
-        assert!(matches!(resp.state, crate::db::cancel::CancelState::Pending));
+        assert!(matches!(
+            resp.state,
+            crate::db::cancel::CancelState::Pending
+        ));
     }
 
     /// T-019 v2 IPC：query_cancel_v2 处理未知 id
     #[tokio::test]
     async fn query_cancel_v2_unknown_returns_not_found() {
-        let resp = query_cancel_v2("never-registered".into()).await.expect("cancel");
-        assert!(matches!(resp.state, crate::db::cancel::CancelState::NotFound));
+        let resp = query_cancel_v2("never-registered".into())
+            .await
+            .expect("cancel");
+        assert!(matches!(
+            resp.state,
+            crate::db::cancel::CancelState::NotFound
+        ));
     }
 
     /// T-040 验收：EXPLAIN 拒绝显式 ANALYZE 与显式 EXPLAIN 前缀
@@ -2640,7 +2723,10 @@ mod tests {
         let r = explain_query("SELECT 1".into(), c).await.unwrap();
         assert!(!r.rows.is_empty(), "EXPLAIN 应至少 1 行（plan id）");
         // SQLite EXPLAIN QUERY PLAN 输出列：id, parent, notused, detail
-        assert!(r.column_meta.len() >= 1, "SQLite EXPLAIN QUERY PLAN 至少 1 列");
+        assert!(
+            r.column_meta.len() >= 1,
+            "SQLite EXPLAIN QUERY PLAN 至少 1 列"
+        );
     }
 
     /// T-041 验收：分段耗时结构正确
@@ -2661,13 +2747,15 @@ mod tests {
         assert!(
             r.timings.connect_ms >= r.timings.execute_ms,
             "connect_ms({}) 应 >= execute_ms({})",
-            r.timings.connect_ms, r.timings.execute_ms
+            r.timings.connect_ms,
+            r.timings.execute_ms
         );
         // total_ms 包含 connect_ms 的时间范围
         assert!(
             r.timings.total_ms >= r.timings.connect_ms,
             "total_ms({}) 应 >= connect_ms({})",
-            r.timings.total_ms, r.timings.connect_ms
+            r.timings.total_ms,
+            r.timings.connect_ms
         );
     }
 
@@ -2718,8 +2806,11 @@ mod tests {
             "BEGIN 后事务状态应为 Active"
         );
 
-        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
-        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
+        if let Some(v) = old {
+            std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
+        } else {
+            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+        }
     }
 
     /// T-035 验收：execute_query 成功后自动写入历史
@@ -2749,11 +2840,18 @@ mod tests {
         let history = queries::load_history().await.unwrap();
         assert!(!history.is_empty(), "执行成功后应自动写入历史");
         let item = &history[0];
-        assert!(item.sql.contains("SELECT 42"), "历史 SQL 应包含原始语句，实际: {}", item.sql);
+        assert!(
+            item.sql.contains("SELECT 42"),
+            "历史 SQL 应包含原始语句，实际: {}",
+            item.sql
+        );
         assert!(item.success, "成功查询 success 应为 true");
         assert!(item.error.is_none(), "成功查询 error 应为 None");
-        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
-        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
+        if let Some(v) = old {
+            std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
+        } else {
+            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+        }
     }
 
     /// T-035 验收：execute_query 失败后也自动写入历史
@@ -2783,12 +2881,22 @@ mod tests {
         let history = queries::load_history().await.unwrap();
         assert!(!history.is_empty(), "执行失败后也应自动写入历史");
         let item = &history[0];
-        assert!(!item.success, "失败查询 success 应为 false，实际: {:?}", item.success);
+        assert!(
+            !item.success,
+            "失败查询 success 应为 false，实际: {:?}",
+            item.success
+        );
         assert!(item.error.is_some(), "失败查询应有 error 信息");
-        assert!(item.error.as_ref().unwrap().len() <= 200, "error 信息应被截断");
+        assert!(
+            item.error.as_ref().unwrap().len() <= 200,
+            "error 信息应被截断"
+        );
         let _ = err;
-        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
-        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
+        if let Some(v) = old {
+            std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
+        } else {
+            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+        }
     }
 
     /// T-006 验收：默认只读拒绝写入
@@ -2830,13 +2938,9 @@ mod tests {
     #[tokio::test]
     async fn classifier_rejects_comment_hack() {
         let c = cfg("sqlite", "", 0, ":memory:");
-        let err = exec_q(
-            "/* SELECT 1 */ UPDATE sqlite_master SET name='x'",
-            c,
-            None,
-        )
-        .await
-        .expect_err("readOnly 必须拒绝注释包装的 UPDATE");
+        let err = exec_q("/* SELECT 1 */ UPDATE sqlite_master SET name='x'", c, None)
+            .await
+            .expect_err("readOnly 必须拒绝注释包装的 UPDATE");
         assert!(err.contains("只读模式"), "只读拦截: {err}");
     }
 
@@ -2844,17 +2948,10 @@ mod tests {
     #[tokio::test]
     async fn approval_required_for_write() {
         let c = cfg("sqlite", "", 0, ":memory:");
-        let err = exec_q(
-            "UPDATE t SET x = 1",
-            c,
-            Some("writable".to_string()),
-        )
-        .await
-        .expect_err("写入需审批");
-        assert!(
-            err.contains("审批"),
-            "错误应指明审批缺失: {err}"
-        );
+        let err = exec_q("UPDATE t SET x = 1", c, Some("writable".to_string()))
+            .await
+            .expect_err("写入需审批");
+        assert!(err.contains("审批"), "错误应指明审批缺失: {err}");
     }
 
     /// T-024 验收：含合法 approval 的写入可执行
@@ -2903,7 +3000,7 @@ mod tests {
         let _ = grant; // suppress unused
     }
 
-/// T-015：迁移报告正反向测试
+    /// T-015：迁移报告正反向测试
     #[tokio::test(flavor = "current_thread")]
     async fn run_secret_migration_reports_reentry() {
         let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
@@ -2970,11 +3067,15 @@ mod tests {
         assert!(check_connection_revision("nope".into(), 0).await.is_err());
     }
 
-        /// T-053 验收：save_connections CAS 拒绝过期 revision
+    /// T-053 验收：save_connections CAS 拒绝过期 revision
     #[tokio::test(flavor = "current_thread")]
     async fn save_connections_cas_rejects_stale_revision() {
         let _guard = crate::tests::DATADIR_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!("zbiz-cas-test-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!(
+            "zbiz-cas-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", &tmp);
         // 初始保存 revision=1
         let records = vec![ConnectionRecord {
@@ -2999,7 +3100,11 @@ mod tests {
         let err = save_connections(records.clone(), Some(expected.clone()))
             .await
             .expect_err("CAS 应拒");
-        assert!(err.contains("REVISION_MISMATCH"), "应含 REVISION_MISMATCH: {}", err);
+        assert!(
+            err.contains("REVISION_MISMATCH"),
+            "应含 REVISION_MISMATCH: {}",
+            err
+        );
 
         // 期望 revision=1 通过
         let mut expected_ok = std::collections::HashMap::new();
@@ -3033,15 +3138,14 @@ mod tests {
     /// 直接把 entries 写在变量里，每条手工构造
     #[tokio::test]
     async fn import_connections_enforces_limit() {
-        let header = std::concat!(
-            "{",
-            "\"version\":1,\"exported_at\":1,\"connections\":["
-        );
+        let header = std::concat!("{", "\"version\":1,\"exported_at\":1,\"connections\":[");
         let footer = std::concat!("]", "}");
         let mut entries = String::from("");
         let mut count = 0;
         for i in 0..200 {
-            if i > 0 { entries.push(','); }
+            if i > 0 {
+                entries.push(',');
+            }
             entries.push_str(&format!(
                 "{{\"name\":\"n{}\",\"db_type\":\"sqlite\",\"host\":\"\",\"port\":0,\"username\":\"\",\"database\":\"d{}\"}}",
                 i, i
@@ -3072,8 +3176,16 @@ mod tests {
         let id1 = r1.id.split('|').next_back().unwrap_or(&r1.id);
         let id2 = r2.id.split('|').next_back().unwrap_or(&r2.id);
         assert_ne!(id1, id2, "两次连续请求 ID 必须不同");
-        assert!(uuid::Uuid::parse_str(id1).is_ok(), "id 必须可解析为 UUID: {}", id1);
-        assert!(uuid::Uuid::parse_str(id2).is_ok(), "id 必须可解析为 UUID: {}", id2);
+        assert!(
+            uuid::Uuid::parse_str(id1).is_ok(),
+            "id 必须可解析为 UUID: {}",
+            id1
+        );
+        assert!(
+            uuid::Uuid::parse_str(id2).is_ok(),
+            "id 必须可解析为 UUID: {}",
+            id2
+        );
     }
 
     /// T-034 验收：字符串字面量中的关键字不应被换行破坏
@@ -3087,7 +3199,11 @@ mod tests {
         assert!(out.contains("'FROM users'"), "字符串字面量应保留: {}", out);
         assert!(out.contains("'WHERE'"), "字符串应保留: {}", out);
         // 不应出现孤立的 'FROM' 被插入换行（词法剥离保证字符串外层换行）
-        assert!(!out.contains("\nFROM users'"), "字面量内的 FROM 不应被换行: {}", out);
+        assert!(
+            !out.contains("\nFROM users'"),
+            "字面量内的 FROM 不应被换行: {}",
+            out
+        );
     }
 
     /// T-034 验收：写入语句格式化时应有警告前缀
@@ -3240,7 +3356,10 @@ mod tests {
         assert_eq!(back.view.widgets.len(), 2);
         assert_eq!(back.question, "各月 GMV");
         assert_eq!(back.created_at, 50);
-        assert!(tmp.join("reports.json").exists(), "落盘文件名应为 reports.json");
+        assert!(
+            tmp.join("reports.json").exists(),
+            "落盘文件名应为 reports.json"
+        );
 
         // 改名再存：只应覆盖，不应追加；created_at 由后端留旧值
         let mut edited = back.clone();
@@ -3262,8 +3381,11 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, "r1", "删除只应移掉目标条目");
 
-        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
-        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
+        if let Some(v) = old {
+            std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
+        } else {
+            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+        }
     }
 
     /// 存进去就注定打不开的稿子要当场拒掉，并且一条都不能落盘
@@ -3285,7 +3407,10 @@ mod tests {
 
         // 组件挂了个不存在的数据集
         let mut dangling = rep_record("d", "悬空组件", 1, 1);
-        dangling.view.widgets.push(rep_widget("ghost", "no-such-ds"));
+        dangling
+            .view
+            .widgets
+            .push(rep_widget("ghost", "no-such-ds"));
         let e = queries::save_report(dangling).await.unwrap_err();
         assert!(e.contains("no-such-ds"), "应点出缺失的数据集 id: {e}");
 
@@ -3311,19 +3436,28 @@ mod tests {
         let mut empty = rep_record("e", "空报表", 1, 1);
         empty.datasets.clear();
         empty.view.widgets.clear();
-        assert!(queries::save_report(empty).await.unwrap_err().contains("数据集"));
+        assert!(queries::save_report(empty)
+            .await
+            .unwrap_err()
+            .contains("数据集"));
 
         // 无名
         let mut anon = rep_record("a", "月度报表", 1, 1);
         anon.name = "   ".into();
-        assert!(queries::save_report(anon).await.unwrap_err().contains("名称"));
+        assert!(queries::save_report(anon)
+            .await
+            .unwrap_err()
+            .contains("名称"));
 
         let all = queries::load_reports().await.unwrap();
         assert_eq!(all.len(), 1, "被拒的稿子不能留下任何一条");
         assert_eq!(all[0].id, "ok");
 
-        if let Some(v) = old { std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v); }
-        else { let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR"); }
+        if let Some(v) = old {
+            std::env::set_var("Z_BIZ_TOOL_DB_DATA_DIR", v);
+        } else {
+            let _ = std::env::remove_var("Z_BIZ_TOOL_DB_DATA_DIR");
+        }
     }
 
     /// 浏览器探针里 onSave 真实打给 save_report 的报文原文（一字未改）：
@@ -3503,7 +3637,9 @@ mod tests {
         assert!(!more3);
 
         // 没有上限时走原来的整批路径
-        let (whole, more4) = sqlite_run_capped(&pool, "SELECT id FROM t", None).await.unwrap();
+        let (whole, more4) = sqlite_run_capped(&pool, "SELECT id FROM t", None)
+            .await
+            .unwrap();
         assert_eq!(whole.1.len(), 10);
         assert!(!more4);
 
@@ -3543,9 +3679,9 @@ mod tests {
     #[tokio::test]
     async fn early_stop_streaming_saves_the_rest_of_the_fetch() {
         use futures_util::TryStreamExt;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
         use sqlx::Row;
         use std::str::FromStr;
-        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
         use std::time::Instant;
 
         let dir = std::env::temp_dir().join(format!("zdb-stream-{}", uuid::Uuid::new_v4()));
@@ -3599,7 +3735,10 @@ mod tests {
 
         // 归还连接后再取一次：提前丢掉没读完的流，不能把池化连接弄脏成下次拿不到结果
         drop(conn);
-        let again = sqlx::query("SELECT count(*) AS c FROM src").fetch_one(&pool).await.unwrap();
+        let again = sqlx::query("SELECT count(*) AS c FROM src")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let total: i64 = again.get(0);
         assert_eq!(total, ROWS as i64, "丢掉流之后这条连接查出来的行数不对");
         drop(pool);
@@ -3642,10 +3781,7 @@ mod tls_tests {
             MySqlSslMode::VerifyIdentity
         ));
         // PG：只有 VerifyFull 验主机名
-        assert!(matches!(
-            TlsMode::VerifyFull.to_pg(),
-            PgSslMode::VerifyFull
-        ));
+        assert!(matches!(TlsMode::VerifyFull.to_pg(), PgSslMode::VerifyFull));
     }
 
     #[test]
@@ -3658,7 +3794,10 @@ mod tls_tests {
 
     #[test]
     fn disable_turns_tls_off_entirely() {
-        assert!(matches!(TlsMode::Disable.to_mysql(), MySqlSslMode::Disabled));
+        assert!(matches!(
+            TlsMode::Disable.to_mysql(),
+            MySqlSslMode::Disabled
+        ));
         assert!(matches!(TlsMode::Disable.to_pg(), PgSslMode::Disable));
         assert!(TlsMode::Disable.skips_certificate_verification());
     }

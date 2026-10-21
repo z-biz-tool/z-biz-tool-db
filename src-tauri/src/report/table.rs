@@ -303,11 +303,7 @@ pub fn hash_join(
                     let rvals = key_values(rrow, &right_keys);
                     // 桶键已经等价于判等，这一层精判只挡一件事：
                     // 文本里出现分隔符 \u{1} 时，复合键的拼接会有歧义（["a\u{1}b", ""] 与 ["a", "\u{1}b"] 同串）
-                    if lvals
-                        .iter()
-                        .zip(rvals.iter())
-                        .all(|(a, b)| join_eq(a, b))
-                    {
+                    if lvals.iter().zip(rvals.iter()).all(|(a, b)| join_eq(a, b)) {
                         matched.push(rrow);
                     }
                 }
@@ -479,11 +475,7 @@ impl Acc {
 fn finish(func: AggFunc, acc: &Acc, has_column: bool) -> Value {
     match func {
         // COUNT(*) 数行；COUNT(col) 只数非 NULL
-        AggFunc::Count => Value::Int(if has_column {
-            acc.non_null
-        } else {
-            acc.n
-        }),
+        AggFunc::Count => Value::Int(if has_column { acc.non_null } else { acc.n }),
         AggFunc::CountDistinct => Value::Int(acc.distinct.len() as i64),
         AggFunc::Sum => {
             if acc.numeric == 0 {
@@ -519,11 +511,7 @@ struct Group {
 
 /// group by + 聚合。group_cols 为空时退化为全表单行聚合。
 /// 输出顺序 = 各分组首次出现的顺序，保证报表可复现。
-pub fn aggregate(
-    table: &Table,
-    group_cols: &[String],
-    aggs: &[AggSpec],
-) -> Result<Table, String> {
+pub fn aggregate(table: &Table, group_cols: &[String], aggs: &[AggSpec]) -> Result<Table, String> {
     let mut resolved_groups: Vec<String> = Vec::with_capacity(group_cols.len());
     for g in group_cols {
         resolved_groups.push(
@@ -560,15 +548,18 @@ pub fn aggregate(
     for row in &table.rows {
         let kv: Vec<Value> = resolved_groups.iter().map(|c| get_ci(row, c)).collect();
         let bk = key_buckets(&kv);
-        let hit = buckets.get(&bk).and_then(|list| {
-            list.iter().rev().find(|&&gi| {
-                groups[gi]
-                    .keys
-                    .iter()
-                    .zip(kv.iter())
-                    .all(|(a, b)| group_eq(a, b))
+        let hit = buckets
+            .get(&bk)
+            .and_then(|list| {
+                list.iter().rev().find(|&&gi| {
+                    groups[gi]
+                        .keys
+                        .iter()
+                        .zip(kv.iter())
+                        .all(|(a, b)| group_eq(a, b))
+                })
             })
-        }).copied();
+            .copied();
         let slot = match hit {
             Some(gi) => gi,
             None => {
@@ -606,7 +597,11 @@ pub fn aggregate(
         }
         return Ok(Table {
             columns: out_columns,
-            rows: if resolved_groups.is_empty() { vec![m] } else { Vec::new() },
+            rows: if resolved_groups.is_empty() {
+                vec![m]
+            } else {
+                Vec::new()
+            },
         });
     }
 
@@ -696,7 +691,12 @@ mod tests {
         Table::new(
             cols.iter().map(|c| c.to_string()).collect(),
             rows.iter()
-                .map(|r| r.iter().cloned().map(|(k, val)| (k.to_string(), val)).collect())
+                .map(|r| {
+                    r.iter()
+                        .cloned()
+                        .map(|(k, val)| (k.to_string(), val))
+                        .collect()
+                })
                 .collect(),
         )
     }
@@ -764,7 +764,9 @@ mod tests {
     #[test]
     fn project_filter_limit_compose() {
         let o = orders();
-        let f = o.filter(&expr("amount > 60", &["id", "user_id", "amount", "day"])).unwrap();
+        let f = o
+            .filter(&expr("amount > 60", &["id", "user_id", "amount", "day"]))
+            .unwrap();
         assert_eq!(f.len(), 3, "100 / 70 / 999 三行过阈");
         let p = f.project(&col_names(&["amount"])).unwrap();
         assert_eq!(p.columns, col_names(&["amount"]));
@@ -772,7 +774,9 @@ mod tests {
         assert_eq!(o.limit(3).len(), 3);
         assert_eq!(o.limit(99).len(), 4);
         // NULL 参与 WHERE 一律被过滤掉（三值逻辑）
-        let n = o.filter(&expr("user_id = 10", &["id", "user_id", "amount", "day"])).unwrap();
+        let n = o
+            .filter(&expr("user_id = 10", &["id", "user_id", "amount", "day"]))
+            .unwrap();
         assert_eq!(n.len(), 2);
     }
 
@@ -787,13 +791,21 @@ mod tests {
             .unwrap();
         assert_eq!(cell(&c, 0, "net"), Value::Int(90));
         assert!(c.columns.contains(&"net".to_string()));
-        assert!(o.add_computed("amount", &expr("1", &[])).is_err(), "重名必须报错");
+        assert!(
+            o.add_computed("amount", &expr("1", &[])).is_err(),
+            "重名必须报错"
+        );
     }
 
     #[test]
     fn inner_join_fans_out_and_renames_duplicates() {
-        let joined = hash_join(&orders(), &users(), &[JoinKey::new("user_id", "uid")], JoinType::Inner)
-            .unwrap();
+        let joined = hash_join(
+            &orders(),
+            &users(),
+            &[JoinKey::new("user_id", "uid")],
+            JoinType::Inner,
+        )
+        .unwrap();
         // amount 两边都有 → 右侧改名 amount_2，左列原样保留
         assert_eq!(
             joined.columns,
@@ -802,8 +814,16 @@ mod tests {
         // 订单 1/2 → ann，订单 3 → bob，订单 4 的 user_id 为 NULL 被丢弃
         assert_eq!(joined.len(), 3);
         assert_eq!(cell(&joined, 0, "name"), Value::Text("ann".into()));
-        assert_eq!(cell(&joined, 0, "amount"), Value::Int(100), "左侧 amount 不能被覆盖");
-        assert_eq!(cell(&joined, 0, "amount_2"), Value::Int(7), "右侧 amount 以 _2 呈现");
+        assert_eq!(
+            cell(&joined, 0, "amount"),
+            Value::Int(100),
+            "左侧 amount 不能被覆盖"
+        );
+        assert_eq!(
+            cell(&joined, 0, "amount_2"),
+            Value::Int(7),
+            "右侧 amount 以 _2 呈现"
+        );
         assert_eq!(cell(&joined, 2, "name"), Value::Text("bob".into()));
     }
 
@@ -813,7 +833,10 @@ mod tests {
         let j = hash_join(
             &orders(),
             &users(),
-            &[JoinKey::new("user_id", "uid"), JoinKey::new("day", "amount")],
+            &[
+                JoinKey::new("user_id", "uid"),
+                JoinKey::new("day", "amount"),
+            ],
             JoinType::Inner,
         )
         .unwrap();
@@ -823,15 +846,22 @@ mod tests {
         // 右表补一行让 (20,2) 命中
         let mut u = users();
         u.rows.push(
-            [("uid", Value::Int(20)), ("name", Value::Text("bob2".into())), ("amount", Value::Int(2))]
-                .into_iter()
-                .map(|(k, val)| (k.to_string(), val))
-                .collect(),
+            [
+                ("uid", Value::Int(20)),
+                ("name", Value::Text("bob2".into())),
+                ("amount", Value::Int(2)),
+            ]
+            .into_iter()
+            .map(|(k, val)| (k.to_string(), val))
+            .collect(),
         );
         let j2 = hash_join(
             &orders(),
             &u,
-            &[JoinKey::new("user_id", "uid"), JoinKey::new("day", "amount")],
+            &[
+                JoinKey::new("user_id", "uid"),
+                JoinKey::new("day", "amount"),
+            ],
             JoinType::Inner,
         )
         .unwrap();
@@ -842,8 +872,13 @@ mod tests {
 
     #[test]
     fn left_join_keeps_unmatched_rows_padded() {
-        let j = hash_join(&orders(), &users(), &[JoinKey::new("user_id", "uid")], JoinType::Left)
-            .unwrap();
+        let j = hash_join(
+            &orders(),
+            &users(),
+            &[JoinKey::new("user_id", "uid")],
+            JoinType::Left,
+        )
+        .unwrap();
         assert_eq!(j.len(), 4, "LEFT 必须保留孤儿订单");
         let orphan = j
             .rows
@@ -852,20 +887,30 @@ mod tests {
             .unwrap();
         assert_eq!(cell(&j, orphan, "name"), Value::Null);
         assert_eq!(cell(&j, orphan, "uid"), Value::Null);
-        assert_eq!(cell(&j, orphan, "amount"), Value::Int(999), "左列不受补 NULL 影响");
+        assert_eq!(
+            cell(&j, orphan, "amount"),
+            Value::Int(999),
+            "左列不受补 NULL 影响"
+        );
     }
 
     #[test]
     fn join_across_different_numeric_widths() {
         // MySQL 给 INT、SQLite 给 BIGINT、PG 给 NUMERIC：10 与 10.0 必须能配上
-        let left = v(&["k", "x"], &[
-            vec![("k", Value::Int(10)), ("x", Value::Int(1))],
-            vec![("k", Value::Float(20.0)), ("x", Value::Int(2))],
-        ]);
-        let right = v(&["k2", "y"], &[
-            vec![("k2", Value::Float(10.0)), ("y", Value::Text("a".into()))],
-            vec![("k2", Value::Int(20)), ("y", Value::Text("b".into()))],
-        ]);
+        let left = v(
+            &["k", "x"],
+            &[
+                vec![("k", Value::Int(10)), ("x", Value::Int(1))],
+                vec![("k", Value::Float(20.0)), ("x", Value::Int(2))],
+            ],
+        );
+        let right = v(
+            &["k2", "y"],
+            &[
+                vec![("k2", Value::Float(10.0)), ("y", Value::Text("a".into()))],
+                vec![("k2", Value::Int(20)), ("y", Value::Text("b".into()))],
+            ],
+        );
         let j = hash_join(&left, &right, &[JoinKey::new("k", "k2")], JoinType::Inner).unwrap();
         assert_eq!(j.len(), 2);
         assert_eq!(cell(&j, 0, "y"), Value::Text("a".into()));
@@ -874,7 +919,13 @@ mod tests {
         // 文本 "10" 与数值 10 现在必须配上：跨库时同一根键一边是 bigint、
         // 一边是 TEXT 亲和的 varchar，按旧口径拒绝会让跨库报表静默空表
         let left_txt = v(&["k"], &[vec![("k", Value::Text("10".into()))]]);
-        let j2 = hash_join(&left_txt, &right, &[JoinKey::new("k", "k2")], JoinType::Inner).unwrap();
+        let j2 = hash_join(
+            &left_txt,
+            &right,
+            &[JoinKey::new("k", "k2")],
+            JoinType::Inner,
+        )
+        .unwrap();
         assert_eq!(j2.len(), 1, "整数写法的文本键要能配上数值键");
         assert_eq!(cell(&j2, 0, "y"), Value::Text("a".into()));
     }
@@ -884,7 +935,8 @@ mod tests {
         let num = |vals: Vec<(Value, &str)>| {
             v(
                 &["k", "tag"],
-                &vals.into_iter()
+                &vals
+                    .into_iter()
                     .map(|(key, tag)| vec![("k", key), ("tag", Value::Text(tag.into()))])
                     .collect::<Vec<_>>(),
             )
@@ -940,20 +992,29 @@ mod tests {
         // 复合键里只要有一侧是 NULL / NaN，整行不参与
         let mut u = users();
         u.rows.push(
-            [("uid", Value::Null), ("name", Value::Text("ghost".into())), ("amount", Value::Int(1))]
-                .into_iter()
-                .map(|(k, val)| (k.to_string(), val))
-                .collect(),
+            [
+                ("uid", Value::Null),
+                ("name", Value::Text("ghost".into())),
+                ("amount", Value::Int(1)),
+            ]
+            .into_iter()
+            .map(|(k, val)| (k.to_string(), val))
+            .collect(),
         );
         let j = hash_join(
             &orders(),
             &u,
-            &[JoinKey::new("user_id", "uid"), JoinKey::new("day", "amount")],
+            &[
+                JoinKey::new("user_id", "uid"),
+                JoinKey::new("day", "amount"),
+            ],
             JoinType::Left,
         )
         .unwrap();
         assert!(
-            !j.rows.iter().any(|r| r.get("name") == Some(&Value::Text("ghost".into()))),
+            !j.rows
+                .iter()
+                .any(|r| r.get("name") == Some(&Value::Text("ghost".into()))),
             "NULL 键的行不该出现在任何一侧"
         );
     }
@@ -997,11 +1058,14 @@ mod tests {
     #[test]
     fn count_star_differs_from_count_column() {
         // 有一行 amount 为 NULL：COUNT(*) = 3，COUNT(amount) = 2
-        let t = v(&["g", "amount"], &[
-            vec![("g", Value::Int(1)), ("amount", Value::Int(5))],
-            vec![("g", Value::Int(1)), ("amount", Value::Null)],
-            vec![("g", Value::Int(1)), ("amount", Value::Int(7))],
-        ]);
+        let t = v(
+            &["g", "amount"],
+            &[
+                vec![("g", Value::Int(1)), ("amount", Value::Int(5))],
+                vec![("g", Value::Int(1)), ("amount", Value::Null)],
+                vec![("g", Value::Int(1)), ("amount", Value::Int(7))],
+            ],
+        );
         let a = aggregate(
             &t,
             &col_names(&["g"]),
@@ -1018,19 +1082,26 @@ mod tests {
         assert_eq!(cell(&a, 0, "all_rows"), Value::Int(3));
         assert_eq!(cell(&a, 0, "with_amount"), Value::Int(2));
         assert_eq!(cell(&a, 0, "total"), Value::Int(12));
-        assert_eq!(cell(&a, 0, "avg"), Value::Float(6.0), "AVG 按非 NULL 个数除");
+        assert_eq!(
+            cell(&a, 0, "avg"),
+            Value::Float(6.0),
+            "AVG 按非 NULL 个数除"
+        );
         assert_eq!(cell(&a, 0, "mx"), Value::Int(7));
         assert_eq!(cell(&a, 0, "mn"), Value::Int(5));
     }
 
     #[test]
     fn count_distinct_and_min_max_over_text() {
-        let t = v(&["city"], &[
-            vec![("city", Value::Text("hz".into()))],
-            vec![("city", Value::Text("hz".into()))],
-            vec![("city", Value::Text("nb".into()))],
-            vec![("city", Value::Null)],
-        ]);
+        let t = v(
+            &["city"],
+            &[
+                vec![("city", Value::Text("hz".into()))],
+                vec![("city", Value::Text("hz".into()))],
+                vec![("city", Value::Text("nb".into()))],
+                vec![("city", Value::Null)],
+            ],
+        );
         let a = aggregate(
             &t,
             &[],
@@ -1051,20 +1122,23 @@ mod tests {
     #[test]
     fn sum_promotes_instead_of_wrapping() {
         // 整数溢出必须转浮点，不能回绕成负数
-        let t = v(&["n"], &[
-            vec![("n", Value::Int(i64::MAX))],
-            vec![("n", Value::Int(1))],
-        ]);
+        let t = v(
+            &["n"],
+            &[
+                vec![("n", Value::Int(i64::MAX))],
+                vec![("n", Value::Int(1))],
+            ],
+        );
         let a = aggregate(&t, &[], &[AggSpec::new("s", AggFunc::Sum, Some("n"))]).unwrap();
         match cell(&a, 0, "s") {
             Value::Float(f) => assert_eq!(f, i64::MAX as f64 + 1.0),
             other => panic!("应提升为 Float，实际 {:?}", other),
         }
         // 混入 Float 也要提升
-        let t2 = v(&["n"], &[
-            vec![("n", Value::Int(2))],
-            vec![("n", Value::Float(0.5))],
-        ]);
+        let t2 = v(
+            &["n"],
+            &[vec![("n", Value::Int(2))], vec![("n", Value::Float(0.5))]],
+        );
         let a2 = aggregate(&t2, &[], &[AggSpec::new("s", AggFunc::Sum, Some("n"))]).unwrap();
         assert_eq!(cell(&a2, 0, "s"), Value::Float(2.5));
         // 纯整数保持整数
@@ -1093,7 +1167,12 @@ mod tests {
         assert_eq!(cell(&grand, 0, "n"), Value::Int(0));
         assert_eq!(cell(&grand, 0, "s"), Value::Null);
 
-        let grouped = aggregate(&empty, &col_names(&["a"]), &[AggSpec::new("n", AggFunc::Count, None)]).unwrap();
+        let grouped = aggregate(
+            &empty,
+            &col_names(&["a"]),
+            &[AggSpec::new("n", AggFunc::Count, None)],
+        )
+        .unwrap();
         assert!(grouped.is_empty(), "带 GROUP BY 时空表返回零行");
     }
 
@@ -1102,26 +1181,49 @@ mod tests {
         let o = orders();
         assert!(aggregate(&o, &col_names(&["ghost"]), &[]).is_err());
         assert!(aggregate(&o, &[], &[AggSpec::new("s", AggFunc::Sum, Some("ghost"))]).is_err());
-        assert!(aggregate(&o, &[], &[AggSpec::new("s", AggFunc::Sum, None)]).is_err(),
-                "SUM 不给列没有意义");
-        assert!(aggregate(
-            &o,
-            &[],
-            &[AggSpec::new("x", AggFunc::Count, None), AggSpec::new("x", AggFunc::Sum, Some("amount"))]
-        )
-        .is_err(),
-        "输出列重名必须报错");
+        assert!(
+            aggregate(&o, &[], &[AggSpec::new("s", AggFunc::Sum, None)]).is_err(),
+            "SUM 不给列没有意义"
+        );
+        assert!(
+            aggregate(
+                &o,
+                &[],
+                &[
+                    AggSpec::new("x", AggFunc::Count, None),
+                    AggSpec::new("x", AggFunc::Sum, Some("amount"))
+                ]
+            )
+            .is_err(),
+            "输出列重名必须报错"
+        );
     }
 
     #[test]
     fn sort_puts_null_last_and_honours_desc() {
-        let t = v(&["g", "amount"], &[
-            vec![("g", Value::Int(2)), ("amount", Value::Int(50))],
-            vec![("g", Value::Int(1)), ("amount", Value::Int(100))],
-            vec![("g", Value::Int(1)), ("amount", Value::Int(50))],
-            vec![("g", Value::Int(1)), ("amount", Value::Null)],
-        ]);
-        let s = sort_table(&t, &[SortSpec { column: "g".into(), desc: false }, SortSpec { column: "amount".into(), desc: true }]).unwrap();
+        let t = v(
+            &["g", "amount"],
+            &[
+                vec![("g", Value::Int(2)), ("amount", Value::Int(50))],
+                vec![("g", Value::Int(1)), ("amount", Value::Int(100))],
+                vec![("g", Value::Int(1)), ("amount", Value::Int(50))],
+                vec![("g", Value::Int(1)), ("amount", Value::Null)],
+            ],
+        );
+        let s = sort_table(
+            &t,
+            &[
+                SortSpec {
+                    column: "g".into(),
+                    desc: false,
+                },
+                SortSpec {
+                    column: "amount".into(),
+                    desc: true,
+                },
+            ],
+        )
+        .unwrap();
         assert_eq!(
             (cell(&s, 0, "g"), cell(&s, 0, "amount")),
             (Value::Int(1), Value::Int(100))
@@ -1132,7 +1234,14 @@ mod tests {
         );
         assert_eq!(cell(&s, 2, "amount"), Value::Null, "NULL 排最后");
         assert_eq!(cell(&s, 3, "g"), Value::Int(2));
-        assert!(sort_table(&t, &[SortSpec { column: "ghost".into(), desc: false }]).is_err());
+        assert!(sort_table(
+            &t,
+            &[SortSpec {
+                column: "ghost".into(),
+                desc: false
+            }]
+        )
+        .is_err());
     }
 
     #[test]
@@ -1147,9 +1256,10 @@ mod tests {
         // 驱动返回的行宽不一致时按 columns 归一：缺的补 NULL，多的丢掉
         let ragged = Table::new(
             col_names(&["a", "b"]),
-            vec![
-                [("a", Value::Int(1)), ("c", Value::Int(9))].into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
-            ],
+            vec![[("a", Value::Int(1)), ("c", Value::Int(9))]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect()],
         );
         assert_eq!(ragged.columns, col_names(&["a", "b"]));
         assert_eq!(cell(&ragged, 0, "a"), Value::Int(1));
@@ -1160,12 +1270,15 @@ mod tests {
     #[test]
     fn sum_and_avg_count_only_numeric_values() {
         // 修复点：纯文本列的 SUM 曾返回 Int(0)，把"没有可加的值"伪装成"和为 0"
-        let t = v(&["mix"], &[
-            vec![("mix", Value::Text("hz".into()))],
-            vec![("mix", Value::Text("7".into()))],
-            vec![("mix", Value::Bool(true))],
-            vec![("mix", Value::Null)],
-        ]);
+        let t = v(
+            &["mix"],
+            &[
+                vec![("mix", Value::Text("hz".into()))],
+                vec![("mix", Value::Text("7".into()))],
+                vec![("mix", Value::Bool(true))],
+                vec![("mix", Value::Null)],
+            ],
+        );
         let a = aggregate(
             &t,
             &[],
@@ -1178,8 +1291,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cell(&a, 0, "s"), Value::Float(7.0), "只有 '7' 可数值化");
-        assert_eq!(cell(&a, 0, "avg"), Value::Float(7.0), "AVG 除以可数值化个数，不是非 NULL 个数");
-        assert_eq!(cell(&a, 0, "cnt"), Value::Int(3), "COUNT(col) 数非 NULL：含 Bool 与文本");
+        assert_eq!(
+            cell(&a, 0, "avg"),
+            Value::Float(7.0),
+            "AVG 除以可数值化个数，不是非 NULL 个数"
+        );
+        assert_eq!(
+            cell(&a, 0, "cnt"),
+            Value::Int(3),
+            "COUNT(col) 数非 NULL：含 Bool 与文本"
+        );
         assert_eq!(cell(&a, 0, "all"), Value::Int(4));
 
         // 全文本 → SUM 必须是 NULL
@@ -1187,7 +1308,10 @@ mod tests {
         let a2 = aggregate(
             &t2,
             &[],
-            &[AggSpec::new("s", AggFunc::Sum, Some("c")), AggSpec::new("avg", AggFunc::Avg, Some("c"))],
+            &[
+                AggSpec::new("s", AggFunc::Sum, Some("c")),
+                AggSpec::new("avg", AggFunc::Avg, Some("c")),
+            ],
         )
         .unwrap();
         assert_eq!(cell(&a2, 0, "s"), Value::Null);

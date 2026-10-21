@@ -15,12 +15,8 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// 每次测试返回独立临时目录；并自动注入 Z_BIZ_TOOL_DB_DATA_DIR
 pub fn fresh_data_dir(label: &str) -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "zbiz-test-{}-{}-{}",
-        label,
-        std::process::id(),
-        n
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("zbiz-test-{}-{}-{}", label, std::process::id(), n));
     std::fs::create_dir_all(&dir).expect("create tmp dir");
     let path_str = dir.to_string_lossy().to_string();
     if path_str.contains(' ') {

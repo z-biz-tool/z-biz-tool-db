@@ -137,11 +137,16 @@ impl QueryRegistry {
     }
 
     pub fn insert(&self, job: QueryJobInternal) {
-        self.inner.lock().expect("registry lock").insert(job.query_id.clone(), job);
+        self.inner
+            .lock()
+            .expect("registry lock")
+            .insert(job.query_id.clone(), job);
     }
 
     pub fn get_state(&self, query_id: &str) -> Option<(QueryState, String)> {
-        self.inner.lock().expect("registry lock")
+        self.inner
+            .lock()
+            .expect("registry lock")
             .get(query_id)
             .map(|j| (j.state, j.state_msg.clone()))
     }
@@ -168,13 +173,19 @@ impl QueryRegistry {
     }
 
     pub fn pending_count(&self) -> usize {
-        self.inner.lock().expect("registry lock")
+        self.inner
+            .lock()
+            .expect("registry lock")
             .values()
-            .filter(|j| !matches!(
-                j.state,
-                QueryState::Succeeded | QueryState::Failed
-                    | QueryState::Cancelled | QueryState::Unknown
-            ))
+            .filter(|j| {
+                !matches!(
+                    j.state,
+                    QueryState::Succeeded
+                        | QueryState::Failed
+                        | QueryState::Cancelled
+                        | QueryState::Unknown
+                )
+            })
             .count()
     }
 
@@ -184,7 +195,9 @@ impl QueryRegistry {
 
     // T-043：获取事务状态
     pub fn get_transaction_state(&self, query_id: &str) -> Option<TransactionState> {
-        self.inner.lock().expect("registry lock")
+        self.inner
+            .lock()
+            .expect("registry lock")
             .get(query_id)
             .map(|j| j.transaction_state)
     }
@@ -192,7 +205,8 @@ impl QueryRegistry {
     // T-043：BEGIN 事务 - idle → active
     pub fn begin_transaction(&self, query_id: &str, generation: u32) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("registry lock");
-        let job = guard.get_mut(query_id)
+        let job = guard
+            .get_mut(query_id)
             .ok_or_else(|| format!("查询 {} 不存在", query_id))?;
         if job.generation != generation {
             return Err(format!(
@@ -200,7 +214,10 @@ impl QueryRegistry {
                 generation, job.generation
             ));
         }
-        if !job.transaction_state.can_transition(&TransactionState::Active) {
+        if !job
+            .transaction_state
+            .can_transition(&TransactionState::Active)
+        {
             return Err(format!(
                 "事务状态 {} 不允许 BEGIN",
                 job.transaction_state.as_str()
@@ -213,7 +230,8 @@ impl QueryRegistry {
     // T-043：COMMIT 事务 - active → committing → committed
     pub fn commit_transaction(&self, query_id: &str, generation: u32) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("registry lock");
-        let job = guard.get_mut(query_id)
+        let job = guard
+            .get_mut(query_id)
             .ok_or_else(|| format!("查询 {} 不存在", query_id))?;
         if job.generation != generation {
             return Err(format!(
@@ -221,7 +239,10 @@ impl QueryRegistry {
                 generation, job.generation
             ));
         }
-        if !job.transaction_state.can_transition(&TransactionState::Committing) {
+        if !job
+            .transaction_state
+            .can_transition(&TransactionState::Committing)
+        {
             return Err(format!(
                 "事务状态 {} 不允许 COMMIT",
                 job.transaction_state.as_str()
@@ -243,7 +264,8 @@ impl QueryRegistry {
     // T-043：ROLLBACK 事务 - active → rolling_back
     pub fn rollback_transaction(&self, query_id: &str, generation: u32) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("registry lock");
-        let job = guard.get_mut(query_id)
+        let job = guard
+            .get_mut(query_id)
             .ok_or_else(|| format!("查询 {} 不存在", query_id))?;
         if job.generation != generation {
             return Err(format!(
@@ -251,7 +273,10 @@ impl QueryRegistry {
                 generation, job.generation
             ));
         }
-        if !job.transaction_state.can_transition(&TransactionState::RollingBack) {
+        if !job
+            .transaction_state
+            .can_transition(&TransactionState::RollingBack)
+        {
             return Err(format!(
                 "事务状态 {} 不允许 ROLLBACK",
                 job.transaction_state.as_str()
@@ -282,8 +307,10 @@ impl QueryRegistry {
         if let Some(job) = self.inner.lock().expect("registry lock").get_mut(query_id) {
             if matches!(
                 job.transaction_state,
-                TransactionState::Failed | TransactionState::RolledBack
-                    | TransactionState::Committed | TransactionState::Unknown
+                TransactionState::Failed
+                    | TransactionState::RolledBack
+                    | TransactionState::Committed
+                    | TransactionState::Unknown
             ) {
                 job.transaction_state = TransactionState::Idle;
             }
@@ -302,7 +329,9 @@ impl QueryRegistry {
 
     // T-046：检查是否有冲突
     pub fn has_conflict(&self, query_id: &str) -> bool {
-        self.inner.lock().expect("registry lock")
+        self.inner
+            .lock()
+            .expect("registry lock")
             .get(query_id)
             .map(|j| j.conflict_detected)
             .unwrap_or(false)
@@ -320,7 +349,9 @@ impl QueryRegistry {
 
     // T-046：检查事务是否处于 unknown 状态（不能自动重试）
     pub fn is_transaction_unknown(&self, query_id: &str) -> bool {
-        self.inner.lock().expect("registry lock")
+        self.inner
+            .lock()
+            .expect("registry lock")
             .get(query_id)
             .map(|j| j.transaction_state == TransactionState::Unknown)
             .unwrap_or(false)
@@ -464,19 +495,31 @@ mod tests {
 
         // BEGIN
         assert!(reg.begin_transaction("tx1", 1).is_ok());
-        assert_eq!(reg.get_transaction_state("tx1"), Some(TransactionState::Active));
+        assert_eq!(
+            reg.get_transaction_state("tx1"),
+            Some(TransactionState::Active)
+        );
 
         // COMMIT
         assert!(reg.commit_transaction("tx1", 1).is_ok());
-        assert_eq!(reg.get_transaction_state("tx1"), Some(TransactionState::Committing));
+        assert_eq!(
+            reg.get_transaction_state("tx1"),
+            Some(TransactionState::Committing)
+        );
 
         // COMMIT 完成
         reg.mark_committed("tx1");
-        assert_eq!(reg.get_transaction_state("tx1"), Some(TransactionState::Committed));
+        assert_eq!(
+            reg.get_transaction_state("tx1"),
+            Some(TransactionState::Committed)
+        );
 
         // 重置到 idle
         reg.reset_transaction_to_idle("tx1");
-        assert_eq!(reg.get_transaction_state("tx1"), Some(TransactionState::Idle));
+        assert_eq!(
+            reg.get_transaction_state("tx1"),
+            Some(TransactionState::Idle)
+        );
     }
 
     #[test]
@@ -521,11 +564,20 @@ mod tests {
 
         assert!(reg.begin_transaction("rb1", 1).is_ok());
         assert!(reg.rollback_transaction("rb1", 1).is_ok());
-        assert_eq!(reg.get_transaction_state("rb1"), Some(TransactionState::RollingBack));
+        assert_eq!(
+            reg.get_transaction_state("rb1"),
+            Some(TransactionState::RollingBack)
+        );
         reg.mark_rolled_back("rb1");
-        assert_eq!(reg.get_transaction_state("rb1"), Some(TransactionState::RolledBack));
+        assert_eq!(
+            reg.get_transaction_state("rb1"),
+            Some(TransactionState::RolledBack)
+        );
         reg.reset_transaction_to_idle("rb1");
-        assert_eq!(reg.get_transaction_state("rb1"), Some(TransactionState::Idle));
+        assert_eq!(
+            reg.get_transaction_state("rb1"),
+            Some(TransactionState::Idle)
+        );
     }
 
     #[test]
@@ -546,7 +598,10 @@ mod tests {
         };
         reg.insert(job);
         reg.mark_transaction_unknown("unk1");
-        assert_eq!(reg.get_transaction_state("unk1"), Some(TransactionState::Unknown));
+        assert_eq!(
+            reg.get_transaction_state("unk1"),
+            Some(TransactionState::Unknown)
+        );
     }
 
     #[test]
@@ -616,6 +671,9 @@ mod tests {
         // Mark commit response lost
         reg.mark_commit_response_lost("lost1");
         assert!(reg.is_transaction_unknown("lost1"));
-        assert_eq!(reg.get_transaction_state("lost1"), Some(TransactionState::Unknown));
+        assert_eq!(
+            reg.get_transaction_state("lost1"),
+            Some(TransactionState::Unknown)
+        );
     }
 }

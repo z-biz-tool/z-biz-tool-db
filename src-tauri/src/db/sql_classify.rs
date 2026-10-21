@@ -219,8 +219,8 @@ fn classify_keyword(kw: &str, statement: &str) -> StatementKind {
         "SELECT" | "WITH" | "SHOW" | "DESC" | "DESCRIBE" | "PRAGMA" => StatementKind::Query,
         "EXPLAIN" => StatementKind::Query,
         "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "MERGE" => StatementKind::Dml,
-        "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "RENAME" | "GRANT" | "REVOKE"
-        | "COMMENT" | "ANALYZE" | "VACUUM" | "REINDEX" => StatementKind::Ddl,
+        "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "RENAME" | "GRANT" | "REVOKE" | "COMMENT"
+        | "ANALYZE" | "VACUUM" | "REINDEX" => StatementKind::Ddl,
         "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "START" | "END" => {
             StatementKind::TxControl
         }
@@ -255,8 +255,10 @@ pub fn classify(sql: &str) -> Classification {
     let safety = match kind {
         StatementKind::Query => {
             let u = stripped.to_ascii_uppercase();
-            if u.contains("EXPLAIN ANALYZE") || u.contains("FOR UPDATE")
-                || u.contains("FOR SHARE") || u.contains("SELECT INTO")
+            if u.contains("EXPLAIN ANALYZE")
+                || u.contains("FOR UPDATE")
+                || u.contains("FOR SHARE")
+                || u.contains("SELECT INTO")
             {
                 SafetyClass::ReadOnlyUnsafe
             } else {

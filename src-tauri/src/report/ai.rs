@@ -77,7 +77,10 @@ pub struct DraftReject {
 impl DraftReject {
     /// 还没见到模型输出就被拒（空问题、请求发不出去）：没有底稿可带
     fn of(error: impl Into<String>) -> Self {
-        DraftReject { error: error.into(), draft: None }
+        DraftReject {
+            error: error.into(),
+            draft: None,
+        }
     }
 }
 
@@ -211,7 +214,10 @@ fn render_catalog(catalog: &[CatalogTable]) -> String {
             } else {
                 t.connection_name.as_str()
             };
-            lines.push(format!("- 连接 {}（connection_id={}，方言 {}）", name, t.connection_id, t.database_type));
+            lines.push(format!(
+                "- 连接 {}（connection_id={}，方言 {}）",
+                name, t.connection_id, t.database_type
+            ));
         }
         let named = if t.schema.trim().is_empty() {
             t.table.clone()
@@ -281,8 +287,7 @@ pub fn prompt(
         } else {
             format!("（当时需求：{}）", p.question.trim())
         };
-        let json = serde_json::to_string_pretty(&p.draft)
-            .unwrap_or_else(|_| "{}".into());
+        let json = serde_json::to_string_pretty(&p.draft).unwrap_or_else(|_| "{}".into());
         s.push_str(&format!(
             "\n\n上一版报表是这么设计的{asked}：\n{json}\n\
              请在它基础上按新需求改：新需求没提到的数据集与组件保持原样，\n\
@@ -302,10 +307,7 @@ pub fn prompt(
 
 /// 在目录里定位一张表。connection_id 必须精确命中；表名允许在 schema
 /// 限定的情况下消歧，命中多张同名表时报错而不是随便挑一张。
-fn lookup<'a>(
-    catalog: &'a [CatalogTable],
-    source: &SourceRef,
-) -> Result<&'a CatalogTable, String> {
+fn lookup<'a>(catalog: &'a [CatalogTable], source: &SourceRef) -> Result<&'a CatalogTable, String> {
     let conns: Vec<&CatalogTable> = catalog
         .iter()
         .filter(|c| same(&c.connection_id, &source.connection_id))
@@ -318,7 +320,11 @@ fn lookup<'a>(
             "源 {} 引用的连接 {} 不在本会话目录里（可用连接：{}）",
             source.alias,
             source.connection_id,
-            if ids.is_empty() { "无".into() } else { ids.join(", ") }
+            if ids.is_empty() {
+                "无".into()
+            } else {
+                ids.join(", ")
+            }
         ));
     }
     let exact: Vec<&&CatalogTable> = conns
@@ -326,7 +332,10 @@ fn lookup<'a>(
         .filter(|c| same(&c.table, &source.table) && same(&c.schema, &source.schema))
         .collect();
     let hits: Vec<&&CatalogTable> = if exact.is_empty() {
-        conns.iter().filter(|c| same(&c.table, &source.table)).collect()
+        conns
+            .iter()
+            .filter(|c| same(&c.table, &source.table))
+            .collect()
     } else {
         exact
     };
@@ -423,16 +432,17 @@ fn type_head(ty: &str) -> String {
 /// 数据库自报类型 → 值族。
 fn family_of(ty: &str) -> Family {
     match type_head(ty).as_str() {
-        "int" | "integer" | "tinyint" | "smallint" | "mediumint" | "bigint" | "int2"
-        | "int4" | "int8" | "serial" | "bigserial" | "smallserial" | "float" | "double"
-        | "real" | "decimal" | "dec" | "numeric" | "fixed" | "money" | "smallmoney"
-        | "bool" | "boolean" => Family::Numeric,
+        "int" | "integer" | "tinyint" | "smallint" | "mediumint" | "bigint" | "int2" | "int4"
+        | "int8" | "serial" | "bigserial" | "smallserial" | "float" | "double" | "real"
+        | "decimal" | "dec" | "numeric" | "fixed" | "money" | "smallmoney" | "bool" | "boolean" => {
+            Family::Numeric
+        }
         "char" | "varchar" | "nchar" | "nvarchar" | "text" | "tinytext" | "mediumtext"
-        | "longtext" | "character" | "citext" | "string" | "name" | "clob" | "uuid"
-        | "json" | "jsonb" | "enum" | "set" | "date" | "datetime" | "smalldatetime"
-        | "time" | "timestamp" | "timestamptz" | "year" => Family::Text,
-        "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob"
-        | "bytea" | "geometry" | "geography" | "image" | "vector" => Family::Binary,
+        | "longtext" | "character" | "citext" | "string" | "name" | "clob" | "uuid" | "json"
+        | "jsonb" | "enum" | "set" | "date" | "datetime" | "smalldatetime" | "time"
+        | "timestamp" | "timestamptz" | "year" => Family::Text,
+        "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "bytea"
+        | "geometry" | "geography" | "image" | "vector" => Family::Binary,
         _ => Family::Unknown,
     }
 }
@@ -467,8 +477,15 @@ fn show_ty(ty: &str) -> String {
 fn text_never_integer(ty: &str) -> bool {
     matches!(
         type_head(ty).as_str(),
-        "date" | "datetime" | "smalldatetime" | "time" | "timestamp" | "timestamptz" | "uuid"
-            | "json" | "jsonb"
+        "date"
+            | "datetime"
+            | "smalldatetime"
+            | "time"
+            | "timestamp"
+            | "timestamptz"
+            | "uuid"
+            | "json"
+            | "jsonb"
     )
 }
 
@@ -643,14 +660,17 @@ fn plan_draft_dataset(
     let (sources, cache, types) = normalize_sources(&ds, catalog)?;
     let ds = DatasetSpec { sources, ..ds };
     let label = label_of(&ds);
-    let plan =
-        super::dataset::plan_dataset(&ds, &cache).map_err(|e| format!("数据集 {}：{}", label, e))?;
+    let plan = super::dataset::plan_dataset(&ds, &cache)
+        .map_err(|e| format!("数据集 {}：{}", label, e))?;
     Ok((ds, plan, types))
 }
 
 /// 计划阶段就没过的数据集，挂在它上面的组件先摘掉：留着只会让清单上多出一串
 /// "组件 x 绑定的数据集 y 不存在"，而 y 其实存在，只是这次没计划通。
-fn strip_dead_widgets(view: &super::view::ViewSpec, dead: &HashSet<String>) -> super::view::ViewSpec {
+fn strip_dead_widgets(
+    view: &super::view::ViewSpec,
+    dead: &HashSet<String>,
+) -> super::view::ViewSpec {
     if dead.is_empty() {
         return view.clone();
     }
@@ -725,7 +745,10 @@ pub async fn chat(cfg: &AIConfig, prompt: &str) -> Result<String, String> {
 
 /// 一次补全。测试用脚本化实现替身，不必真联网。
 pub trait Model: Send + Sync {
-    fn complete(&self, prompt: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
+    fn complete(
+        &self,
+        prompt: String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
 
 pub struct HttpModel {
@@ -742,7 +765,10 @@ impl HttpModel {
 }
 
 impl Model for HttpModel {
-    fn complete(&self, prompt: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+    fn complete(
+        &self,
+        prompt: String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
         Box::pin(async move { chat(&self.cfg, &prompt).await })
     }
 }
@@ -764,8 +790,7 @@ pub async fn draft(
         return Err(DraftReject::of("请先描述你想要什么报表"));
     }
     // 空白的上一版只会往提示词里塞噪音，当作没带
-    let prior =
-        prior.filter(|p| !p.draft.datasets.is_empty() || !p.draft.view.widgets.is_empty());
+    let prior = prior.filter(|p| !p.draft.datasets.is_empty() || !p.draft.view.widgets.is_empty());
     let rounds = repairs.min(MAX_REPAIRS);
     // 空白错误单和没带一样
     let mut feedback = feedback
@@ -868,7 +893,10 @@ pub struct PickReject {
 
 impl PickReject {
     fn of(error: impl Into<String>) -> Self {
-        PickReject { error: error.into(), answer: None }
+        PickReject {
+            error: error.into(),
+            answer: None,
+        }
     }
 }
 
@@ -884,8 +912,9 @@ fn pick_prompt(
     feedback: Option<&str>,
     prior_answer: Option<&str>,
 ) -> String {
-    let mut s =
-        String::from("你在为桌面数据库工具挑表：用户想要一张报表，先决定这次要用到哪几张表。\n需求：\n");
+    let mut s = String::from(
+        "你在为桌面数据库工具挑表：用户想要一张报表，先决定这次要用到哪几张表。\n需求：\n",
+    );
     s.push_str(question.trim());
     s.push_str("\n\n本机各连接里的表（连接 / 方言 / schema.表名，这次不给列清单）：\n");
     for c in cands {
@@ -929,7 +958,10 @@ fn pick_prompt(
 /// 把模型交回的答案对着候选清单核对：认不出的连接、表、同名歧义一次列全（与
 /// check_sql / check_draft 同口径，一轮只说一处等于放任模型改一处就交回来）。
 /// 命中的那些原样从 candidates 里取出来——连接名、方言本机知道，模型说了不算。
-pub fn check_pick(answer: &PickAnswer, cands: &[TableCandidate]) -> Result<(Vec<TableCandidate>, String), String> {
+pub fn check_pick(
+    answer: &PickAnswer,
+    cands: &[TableCandidate],
+) -> Result<(Vec<TableCandidate>, String), String> {
     if answer.tables.is_empty() {
         return Err("模型一张表都没挑出来：换个说法，或者手工勾选".into());
     }
@@ -945,8 +977,10 @@ pub fn check_pick(answer: &PickAnswer, cands: &[TableCandidate]) -> Result<(Vec<
     let mut unknown_conn: Vec<String> = Vec::new();
     let mut ambiguous: Vec<String> = Vec::new();
     for t in &answer.tables {
-        let in_conn: Vec<&TableCandidate> =
-            cands.iter().filter(|c| same(&c.connection_id, &t.connection_id)).collect();
+        let in_conn: Vec<&TableCandidate> = cands
+            .iter()
+            .filter(|c| same(&c.connection_id, &t.connection_id))
+            .collect();
         if in_conn.is_empty() {
             if !unknown_conn.iter().any(|x| same(x, &t.connection_id)) {
                 unknown_conn.push(t.connection_id.clone());
@@ -959,7 +993,11 @@ pub fn check_pick(answer: &PickAnswer, cands: &[TableCandidate]) -> Result<(Vec<
             .cloned()
             .collect();
         let hits: Vec<&TableCandidate> = if exact.is_empty() {
-            in_conn.iter().filter(|c| same(&c.table, &t.table)).cloned().collect()
+            in_conn
+                .iter()
+                .filter(|c| same(&c.table, &t.table))
+                .cloned()
+                .collect()
         } else {
             exact
         };
@@ -1029,17 +1067,28 @@ pub async fn pick(
         return Err(PickReject::of("先描述你想要什么报表，才知道要挑哪些表"));
     }
     if candidates.is_empty() {
-        return Err(PickReject::of("本机一张表都没读到：先连上数据库，或在报表目录里手工勾选"));
+        return Err(PickReject::of(
+            "本机一张表都没读到：先连上数据库，或在报表目录里手工勾选",
+        ));
     }
     let rounds = repairs.min(MAX_REPAIRS);
     let sent: Vec<TableCandidate> = candidates.iter().take(MAX_CANDIDATES).cloned().collect();
     let truncated = candidates.len().saturating_sub(sent.len());
-    let mut feedback = feedback.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let mut prior = prior_answer.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut feedback = feedback
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut prior = prior_answer
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let mut last = String::new();
     for round in 0..=rounds {
         let raw = model
-            .complete(pick_prompt(question, &sent, feedback.as_deref(), prior.as_deref()))
+            .complete(pick_prompt(
+                question,
+                &sent,
+                feedback.as_deref(),
+                prior.as_deref(),
+            ))
             .await
             .map_err(PickReject::of)?;
         let json = match extract_json(&raw) {
@@ -1183,7 +1232,11 @@ pub fn explain_prompt(b: &ReportBrief) -> Result<String, String> {
         s.push_str(&format!(
             "\n数据集 {}（{}）：取回 {} 行，输出列 [{}]\n",
             d.id,
-            if d.name.trim().is_empty() { "（没名字）" } else { d.name.trim() },
+            if d.name.trim().is_empty() {
+                "（没名字）"
+            } else {
+                d.name.trim()
+            },
             d.rows,
             d.columns.join(", ")
         ));
@@ -1197,8 +1250,16 @@ pub fn explain_prompt(b: &ReportBrief) -> Result<String, String> {
             s.push_str(&format!(
                 "  源 {} @ {}（{}）下推：{}\n",
                 q.alias,
-                if q.connection.trim().is_empty() { "连接名未知" } else { q.connection.trim() },
-                if q.database_type.trim().is_empty() { "方言未知" } else { q.database_type.trim() },
+                if q.connection.trim().is_empty() {
+                    "连接名未知"
+                } else {
+                    q.connection.trim()
+                },
+                if q.database_type.trim().is_empty() {
+                    "方言未知"
+                } else {
+                    q.database_type.trim()
+                },
                 q.sql.trim()
             ));
         }
@@ -1206,7 +1267,11 @@ pub fn explain_prompt(b: &ReportBrief) -> Result<String, String> {
     for f in &b.failed {
         s.push_str(&format!(
             "\n没取到数的数据集 {}：{}{}\n",
-            if f.name.trim().is_empty() { "（没名字）" } else { f.name.trim() },
+            if f.name.trim().is_empty() {
+                "（没名字）"
+            } else {
+                f.name.trim()
+            },
             f.error.trim(),
             if f.widgets.is_empty() {
                 String::new()
@@ -1226,10 +1291,7 @@ pub fn explain_prompt(b: &ReportBrief) -> Result<String, String> {
 
 /// 把这张报表讲一遍。只读材料、不碰库，所以模型再怎么发挥也变不出一次取数。
 #[tauri::command]
-pub async fn ai_report_explain(
-    brief: ReportBrief,
-    config: AIConfig,
-) -> Result<String, String> {
+pub async fn ai_report_explain(brief: ReportBrief, config: AIConfig) -> Result<String, String> {
     let prompt = explain_prompt(&brief)?;
     let model = HttpModel::new(config)?;
     model.complete(prompt).await.map(|t| t.trim().to_string())
@@ -1309,7 +1371,12 @@ mod tests {
                 database_type: "sqlite".into(),
                 schema: String::new(),
                 table: "orders".into(),
-                columns: vec!["id".into(), "user_id".into(), "amount".into(), "status".into()],
+                columns: vec![
+                    "id".into(),
+                    "user_id".into(),
+                    "amount".into(),
+                    "status".into(),
+                ],
                 column_types: types(&[
                     ("id", "INTEGER"),
                     ("user_id", "INTEGER"),
@@ -1334,7 +1401,11 @@ mod tests {
                 schema: "crm".into(),
                 table: "visits".into(),
                 columns: vec!["user_id".into(), "day".into(), "pv".into()],
-                column_types: types(&[("user_id", "bigint(20)"), ("day", "date"), ("pv", "int(11)")]),
+                column_types: types(&[
+                    ("user_id", "bigint(20)"),
+                    ("day", "date"),
+                    ("pv", "int(11)"),
+                ]),
             },
         ]
     }
@@ -1460,7 +1531,11 @@ mod tests {
     fn prompt_states_the_join_key_rule_the_engine_actually_applies() {
         let p = prompt("q", &catalog(), None, None);
         assert!(p.contains("只能写列名"), "表达式仍不接受：{}", p);
-        assert!(p.contains("配得上 varchar「1001」"), "要承认整数写法能跨族配：{}", p);
+        assert!(
+            p.contains("配得上 varchar「1001」"),
+            "要承认整数写法能跨族配：{}",
+            p
+        );
         assert!(p.contains("「007」配不上 7"), "要说清前导零仍不配：{}", p);
         assert!(p.contains("配不上数值"), "日期/uuid 这类仍配不上：{}", p);
         assert!(!p.contains("必须同族"), "旧措辞已被引擎推翻：{}", p);
@@ -1477,7 +1552,10 @@ mod tests {
         .unwrap();
         assert_eq!(ds.aggregates[0].func, AggFunc::Sum);
         assert_eq!(ds.aggregates[1].func, AggFunc::CountDistinct);
-        assert_eq!(ds.sources[0].database_type, "ORACLE", "反序列化能收，规范化会覆盖");
+        assert_eq!(
+            ds.sources[0].database_type, "ORACLE",
+            "反序列化能收，规范化会覆盖"
+        );
 
         let j: JoinSpec = serde_json::from_str(
             r#"{"source":"u","on":[{"left":"user_id","right":"id"}],"kind":"left outer"}"#,
@@ -1643,7 +1721,7 @@ mod tests {
 
     #[test]
     fn check_warns_about_a_dataset_nothing_renders() {
-            let visits = spec(
+        let visits = spec(
             "d2",
             "v",
             r#"[{"alias":"v","connection_id":"crm","table":"visits"}]"#,
@@ -1771,9 +1849,11 @@ mod tests {
                 r#"[{"alias":"o","connection_id":"shop","table":"orders"},{"alias":"a","connection_id":"crm","table":"att"}]"#,
                 &join_one("order_no", "a", right_col),
             );
-            let out =
-                check_draft(parse_draft(&draft_of(&[raw], &[widget("d1", "BAR")])).unwrap(), &c)
-                    .unwrap();
+            let out = check_draft(
+                parse_draft(&draft_of(&[raw], &[widget("d1", "BAR")])).unwrap(),
+                &c,
+            )
+            .unwrap();
             assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
             out.warnings[0].clone()
         };
@@ -1807,9 +1887,11 @@ mod tests {
             r#"[{"alias":"o","connection_id":"shop","table":"orders"},{"alias":"x","connection_id":"crm","table":"ext"}]"#,
             &join_one("order_no", "x", "order_no"),
         );
-        let out3 =
-            check_draft(parse_draft(&draft_of(&[good], &[widget("d1", "BAR")])).unwrap(), &c)
-                .unwrap();
+        let out3 = check_draft(
+            parse_draft(&draft_of(&[good], &[widget("d1", "BAR")])).unwrap(),
+            &c,
+        )
+        .unwrap();
         assert!(out3.warnings.is_empty(), "{:?}", out3.warnings);
     }
 
@@ -1888,7 +1970,10 @@ mod tests {
     }
 
     impl Model for Scripted {
-        fn complete(&self, prompt: String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        fn complete(
+            &self,
+            prompt: String,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
             self.prompts.lock().unwrap().push(prompt);
             let n = self.prompts.lock().unwrap().len();
             let answer = self
@@ -1901,7 +1986,10 @@ mod tests {
     }
 
     fn scripted(answers: Vec<String>) -> Scripted {
-        Scripted { answers, prompts: std::sync::Mutex::new(Vec::new()) }
+        Scripted {
+            answers,
+            prompts: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     #[tokio::test]
@@ -1917,7 +2005,10 @@ mod tests {
                 )],
                 &[widget("d1", "BAR")],
             ),
-            format!("```json\n{}\n```", draft_of(&[city_gmv()], &[widget("d1", "BAR")])),
+            format!(
+                "```json\n{}\n```",
+                draft_of(&[city_gmv()], &[widget("d1", "BAR")])
+            ),
         ]);
         let out = draft(&model, "各城市成交额", &catalog(), 3, None, None)
             .await
@@ -1955,7 +2046,10 @@ mod tests {
     // ==================== 追问式改稿 ====================
 
     fn prior(question: &str, raw: &str) -> PriorReport {
-        PriorReport { question: question.into(), draft: parse_draft(raw).unwrap() }
+        PriorReport {
+            question: question.into(),
+            draft: parse_draft(raw).unwrap(),
+        }
     }
 
     #[test]
@@ -1965,7 +2059,10 @@ mod tests {
             &draft_of(&[city_gmv()], &[widget("d1", "BAR")]),
         );
         let text = prompt("再加一个按月的折线图", &catalog(), Some(&p), None);
-        assert!(text.contains("上一版报表是这么设计的（当时需求：各城市成交额）"), "{text}");
+        assert!(
+            text.contains("上一版报表是这么设计的（当时需求：各城市成交额）"),
+            "{text}"
+        );
         // 这两串只可能来自上一版设计：基础提示词的结构示例里既没有 d1 也没有 SUM/amount
         assert!(text.contains("\"id\": \"d1\""), "{text}");
         assert!(text.contains("\"output\": \"gmv\""), "{text}");
@@ -2010,7 +2107,10 @@ mod tests {
             )],
             &[widget("d1", "BAR")],
         );
-        let model = scripted(vec![bad.clone(), draft_of(&[city_gmv()], &[widget("d1", "BAR")])]);
+        let model = scripted(vec![
+            bad.clone(),
+            draft_of(&[city_gmv()], &[widget("d1", "BAR")]),
+        ]);
         let p = prior("各城市成交额", &bad);
         let out = draft(&model, "把金额换成税前的", &catalog(), 3, Some(&p), None)
             .await
@@ -2103,10 +2203,20 @@ mod tests {
             .await
             .unwrap_err();
         let rejected = e.draft.clone().unwrap();
-        let p = PriorReport { question: "各城市成交额".into(), draft: rejected.clone() };
-        let out = draft(&model, "各城市成交额", &catalog(), 1, Some(&p), Some(&e.error))
-            .await
-            .unwrap();
+        let p = PriorReport {
+            question: "各城市成交额".into(),
+            draft: rejected.clone(),
+        };
+        let out = draft(
+            &model,
+            "各城市成交额",
+            &catalog(),
+            1,
+            Some(&p),
+            Some(&e.error),
+        )
+        .await
+        .unwrap();
         // 改好了就是 repairs 0：这是新一轮的第一稿，不是上一轮的第三稿
         assert_eq!(out.repairs, 0);
         let ps = model.prompts.lock().unwrap();
@@ -2147,7 +2257,11 @@ mod tests {
     }
 
     fn cfg(base_url: &str, key: &str, model: &str) -> AIConfig {
-        AIConfig { base_url: base_url.into(), api_key: key.into(), model: model.into() }
+        AIConfig {
+            base_url: base_url.into(),
+            api_key: key.into(),
+            model: model.into(),
+        }
     }
 
     /// 一个只讲 HTTP/1.1 的假 OpenAI 端点：把 chat() 的真请求跑起来。
@@ -2171,7 +2285,13 @@ mod tests {
             let mut byte = [0u8; 1];
             let head_end = loop {
                 match stream.read(&mut byte) {
-                    Ok(0) => return if buf.is_empty() { None } else { Some(String::from_utf8_lossy(&buf).to_string()) },
+                    Ok(0) => {
+                        return if buf.is_empty() {
+                            None
+                        } else {
+                            Some(String::from_utf8_lossy(&buf).to_string())
+                        }
+                    }
                     Ok(_) => {
                         buf.push(byte[0]);
                         if buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -2210,7 +2330,9 @@ mod tests {
                         Ok(pair) => pair,
                         Err(_) => return,
                     };
-                    let Some(req) = read_request(&mut stream) else { return };
+                    let Some(req) = read_request(&mut stream) else {
+                        return;
+                    };
                     sink.lock().unwrap().push(req);
                     let (status_line, payload) = body.split_once('\t').unwrap_or(("200 OK", ""));
                     let head = format!(
@@ -2243,7 +2365,11 @@ mod tests {
         let req = seen.first().expect("假服务端要收到一次请求");
         // 头名大小写不作数（hyper 一律发小写；不同平台/版本的 reqwest 写法不该进断言）
         let lowered = req.to_lowercase();
-        assert!(lowered.starts_with("post /v1/chat/completions http/1.1"), "{}", req);
+        assert!(
+            lowered.starts_with("post /v1/chat/completions http/1.1"),
+            "{}",
+            req
+        );
         assert!(
             lowered.contains("authorization: bearer sk-test-key"),
             "鉴权头没发出去：{}",
@@ -2261,8 +2387,16 @@ mod tests {
         let cfg = cfg(&full, "k", "m");
         assert_eq!(chat(&cfg, "hi").await.unwrap(), "ok");
         let req = ai.seen.lock().unwrap()[0].clone();
-        assert!(req.starts_with("POST /v1/chat/completions HTTP/1.1"), "{}", req);
-        assert!(!req.contains("chat/completions/chat"), "路径被拼了两次：{}", req);
+        assert!(
+            req.starts_with("POST /v1/chat/completions HTTP/1.1"),
+            "{}",
+            req
+        );
+        assert!(
+            !req.contains("chat/completions/chat"),
+            "路径被拼了两次：{}",
+            req
+        );
     }
 
     #[tokio::test]
@@ -2289,7 +2423,10 @@ mod tests {
         let answer = r#"{"tables":[{"connection_id":"shop","table":"orders"},{"connection_id":"erp","table":"stock"}],"reason":"先看订单"}"#;
         let ai = fake_ai::spawn(vec![
             ("200 OK\t".to_string()) + &content_of(&format!("好的：\n```json\n{answer}\n```")),
-            ("200 OK\t".to_string()) + &content_of(r#"{"tables":[{"connection_id":"shop","table":"orders"}],"reason":"去掉编的那张"}"#),
+            ("200 OK\t".to_string())
+                + &content_of(
+                    r#"{"tables":[{"connection_id":"shop","table":"orders"}],"reason":"去掉编的那张"}"#,
+                ),
         ]);
         let model = HttpModel::new(cfg(&ai.base_url, "k", "m")).unwrap();
         let out = pick(&model, "各城市成交额", &candidates(), 2, None, None)
@@ -2308,7 +2445,10 @@ mod tests {
     #[tokio::test]
     async fn chat_needs_url_key_and_model_before_any_request() {
         // 不传密钥就不该发出任何请求；错误文案要能指到设置页
-        assert!(chat(&cfg("", "k", "m"), "hi").await.unwrap_err().contains("设置"));
+        assert!(chat(&cfg("", "k", "m"), "hi")
+            .await
+            .unwrap_err()
+            .contains("设置"));
         let e = match HttpModel::new(cfg("https://x/", "k", "  ")) {
             Ok(_) => panic!("空模型名不该被接受"),
             Err(e) => e,
@@ -2377,7 +2517,10 @@ mod tests {
         .unwrap();
         let e = check_pick(&a, &candidates()).unwrap_err();
         assert!(e.contains("共 3 处问题"), "{e}");
-        assert!(e.contains("清单里没有连接 erp（可用连接：crm, shop）"), "{e}");
+        assert!(
+            e.contains("清单里没有连接 erp（可用连接：crm, shop）"),
+            "{e}"
+        );
         assert!(e.contains("连接 shop 里没有表 invoicez"), "{e}");
         // 可用表要一起给：只说"没有这张表"等于让模型下一轮接着猜
         assert!(e.contains("该连接的可用表：orders, payments"), "{e}");
@@ -2393,16 +2536,36 @@ mod tests {
             r#"{"connection_id":"crm","table":"users"}"#,
         ]);
         let model = scripted(vec![first.clone(), second.clone()]);
-        let out = pick(&model, "各城市成交额和下单用户", &candidates(), 2, None, None)
-            .await
-            .unwrap();
+        let out = pick(
+            &model,
+            "各城市成交额和下单用户",
+            &candidates(),
+            2,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.repairs, 1);
         assert_eq!(out.picked.len(), 2);
         let prompts = model.prompts.lock().unwrap();
-        assert!(prompts[1].contains("连接 shop 里没有表 invoicez"), "{}", prompts[1]);
-        assert!(prompts[1].contains("上一份挑选结果没通过本机核对"), "{}", prompts[1]);
+        assert!(
+            prompts[1].contains("连接 shop 里没有表 invoicez"),
+            "{}",
+            prompts[1]
+        );
+        assert!(
+            prompts[1].contains("上一份挑选结果没通过本机核对"),
+            "{}",
+            prompts[1]
+        );
         assert!(prompts[1].contains("invoicez"), "{}", prompts[1]);
-        assert_eq!(prompts[1].matches("\"tables\"").count(), 2, "{}", prompts[1]);
+        assert_eq!(
+            prompts[1].matches("\"tables\"").count(),
+            2,
+            "{}",
+            prompts[1]
+        );
     }
 
     #[tokio::test]
@@ -2410,8 +2573,14 @@ mod tests {
         // 改稿那一键要两半都有：只把错误原文带回去，用户自己重述一遍才算改
         let bad = answer(&[r#"{"connection_id":"shop","table":"invoicez"}"#]);
         let model = scripted(vec![bad.clone(), bad.clone()]);
-        let e = pick(&model, "看发票", &candidates(), 1, None, None).await.unwrap_err();
-        assert!(e.error.contains("重试 2 次后仍未通过本机核对"), "{}", e.error);
+        let e = pick(&model, "看发票", &candidates(), 1, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            e.error.contains("重试 2 次后仍未通过本机核对"),
+            "{}",
+            e.error
+        );
         assert!(e.error.contains("invoicez"), "{}", e.error);
         assert_eq!(e.answer.as_deref().unwrap(), bad);
     }
@@ -2420,7 +2589,9 @@ mod tests {
     async fn pick_rejects_an_answer_with_no_tables_at_all() {
         let empty = pick_of("[]", "没想好");
         let model = scripted(vec![empty.clone(), empty]);
-        let e = pick(&model, "随便看看", &candidates(), 1, None, None).await.unwrap_err();
+        let e = pick(&model, "随便看看", &candidates(), 1, None, None)
+            .await
+            .unwrap_err();
         assert!(e.error.contains("一张表都没挑出来"), "{}", e.error);
     }
 
@@ -2428,8 +2599,12 @@ mod tests {
     async fn pick_stops_before_any_request_without_question_or_tables() {
         // 空白需求 / 本机一张表都没读到：不该发出任何一次请求
         let model = scripted(vec![]);
-        assert!(pick(&model, "  ", &candidates(), 2, None, None).await.is_err());
-        assert!(pick(&model, "各城市成交额", &[], 2, None, None).await.is_err());
+        assert!(pick(&model, "  ", &candidates(), 2, None, None)
+            .await
+            .is_err());
+        assert!(pick(&model, "各城市成交额", &[], 2, None, None)
+            .await
+            .is_err());
         assert!(model.prompts.lock().unwrap().is_empty());
     }
 
@@ -2440,12 +2615,23 @@ mod tests {
             .collect();
         many.push(cand("crm", "客户库", "sqlite", "", "late_one"));
         let model = scripted(vec![answer(&[r#"{"connection_id":"shop","table":"t7"}"#])]);
-        let out = pick(&model, "看第七张表", &many, 2, None, None).await.unwrap();
+        let out = pick(&model, "看第七张表", &many, 2, None, None)
+            .await
+            .unwrap();
         let prompts = model.prompts.lock().unwrap();
-        assert_eq!(prompts[0].matches("- connection_id=").count(), MAX_CANDIDATES);
+        assert_eq!(
+            prompts[0].matches("- connection_id=").count(),
+            MAX_CANDIDATES
+        );
         assert!(!prompts[0].contains("late_one"), "超出上限的表不该进提示词");
         assert_eq!(out.truncated, 51);
-        assert!(out.warnings.iter().any(|w| w.contains("只把前 200 张给了模型")), "{:?}", out.warnings);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("只把前 200 张给了模型")),
+            "{:?}",
+            out.warnings
+        );
     }
 
     #[tokio::test]
@@ -2454,17 +2640,33 @@ mod tests {
         for i in 0..4 {
             many.push(cand("crm", "客户库", "sqlite", "", &format!("extra{i}")));
         }
-        let seven: Vec<String> = ["shop|orders", "shop|payments", "crm|users", "crm|tickets", "crm|extra0", "crm|extra1", "crm|extra2"]
-            .iter()
-            .map(|x| {
-                let (c, t) = x.split_once('|').unwrap();
-                format!(r#"{{"connection_id":"{c}","table":"{t}"}}"#)
-            })
-            .collect();
-        let model = scripted(vec![answer(&seven.iter().map(|s| s.as_str()).collect::<Vec<_>>())]);
-        let out = pick(&model, "全部都要", &many, 2, None, None).await.unwrap();
+        let seven: Vec<String> = [
+            "shop|orders",
+            "shop|payments",
+            "crm|users",
+            "crm|tickets",
+            "crm|extra0",
+            "crm|extra1",
+            "crm|extra2",
+        ]
+        .iter()
+        .map(|x| {
+            let (c, t) = x.split_once('|').unwrap();
+            format!(r#"{{"connection_id":"{c}","table":"{t}"}}"#)
+        })
+        .collect();
+        let model = scripted(vec![answer(
+            &seven.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        )]);
+        let out = pick(&model, "全部都要", &many, 2, None, None)
+            .await
+            .unwrap();
         assert_eq!(out.picked.len(), MAX_PICKED);
-        assert!(out.warnings.iter().any(|w| w.contains("只留前 6 张")), "{:?}", out.warnings);
+        assert!(
+            out.warnings.iter().any(|w| w.contains("只留前 6 张")),
+            "{:?}",
+            out.warnings
+        );
     }
 
     fn brief() -> ReportBrief {
@@ -2538,8 +2740,12 @@ mod tests {
     #[tokio::test]
     async fn pick_uses_the_schema_prefix_the_prompt_offered() {
         // 同名表要靠 schema 分开；schema 是提示词里 "archive.orders" 那种写法给的
-        let model = scripted(vec![answer(&[r#"{"connection_id":"shop","schema":"archive","table":"orders"}"#])]);
-        let out = pick(&model, "看历史订单", &candidates(), 2, None, None).await.unwrap();
+        let model = scripted(vec![answer(&[
+            r#"{"connection_id":"shop","schema":"archive","table":"orders"}"#,
+        ])]);
+        let out = pick(&model, "看历史订单", &candidates(), 2, None, None)
+            .await
+            .unwrap();
         assert_eq!(out.picked.len(), 1);
         assert_eq!(out.picked[0].schema, "archive");
     }
@@ -2547,8 +2753,8 @@ mod tests {
 
 #[cfg(test)]
 mod minimax_live_tests {
-    use crate::AIConfig;
     use super::chat;
+    use crate::AIConfig;
 
     /// **真实 API 实测**：用真的 MiniMax 端点跑一遍本仓自己的 `chat`。
     ///
@@ -2571,9 +2777,14 @@ mod minimax_live_tests {
             model: std::env::var("MINIMAX_MODEL")
                 .unwrap_or_else(|_| "MiniMax-M3.1-Flash".to_string()),
         };
-        let out = chat(&cfg, "只回两个字：收到").await.expect("真实调用应成功");
+        let out = chat(&cfg, "只回两个字：收到")
+            .await
+            .expect("真实调用应成功");
         assert!(!out.trim().is_empty(), "返回内容为空");
-        eprintln!("[LIVE] db chat 真实调用成功：{}", out.chars().take(40).collect::<String>());
+        eprintln!(
+            "[LIVE] db chat 真实调用成功：{}",
+            out.chars().take(40).collect::<String>()
+        );
     }
 
     /// 假 key 必须被服务端拒 —— 反向钉。
@@ -2589,6 +2800,9 @@ mod minimax_live_tests {
             model: "MiniMax-M3.1-Flash".to_string(),
         };
         let err = chat(&cfg, "hi").await.expect_err("假 key 必须被拒");
-        assert!(err.contains("401") || err.contains("403"), "期望 401/403，实际：{err}");
+        assert!(
+            err.contains("401") || err.contains("403"),
+            "期望 401/403，实际：{err}"
+        );
     }
 }

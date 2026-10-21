@@ -62,7 +62,10 @@ impl ChartType {
 
     /// 是否需要分类轴
     pub fn needs_category(self) -> bool {
-        matches!(self, ChartType::Line | ChartType::Bar | ChartType::Pie | ChartType::Kpi)
+        matches!(
+            self,
+            ChartType::Line | ChartType::Bar | ChartType::Pie | ChartType::Kpi
+        )
     }
 }
 
@@ -268,7 +271,11 @@ fn need_col(cols: &[String], name: Option<&str>, what: &str) -> Result<String, S
                 "{} 列 {} 不在数据集输出里（可用列：{}）",
                 what,
                 raw,
-                if cols.is_empty() { "-".to_string() } else { cols.join(", ") }
+                if cols.is_empty() {
+                    "-".to_string()
+                } else {
+                    cols.join(", ")
+                }
             )
         })
 }
@@ -277,7 +284,11 @@ fn need_col(cols: &[String], name: Option<&str>, what: &str) -> Result<String, S
 /// 不越界、不重叠。AI 生成布局最容易在这三处出错，报出来比画歪了强。
 pub fn resolve_layout(view: &ViewSpec) -> Result<Vec<WidgetLayout>, String> {
     if view.widgets.len() > MAX_WIDGETS {
-        return Err(format!("组件数 {} 超过上限 {}", view.widgets.len(), MAX_WIDGETS));
+        return Err(format!(
+            "组件数 {} 超过上限 {}",
+            view.widgets.len(),
+            MAX_WIDGETS
+        ));
     }
     if view.layout.is_empty() {
         return Ok(view
@@ -321,10 +332,7 @@ pub fn resolve_layout(view: &ViewSpec) -> Result<Vec<WidgetLayout>, String> {
             }
             let overlap = a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
             if overlap {
-                return Err(format!(
-                    "组件 {} 与 {} 在栅格上重叠",
-                    a.widget, b.widget
-                ));
+                return Err(format!("组件 {} 与 {} 在栅格上重叠", a.widget, b.widget));
             }
         }
     }
@@ -565,13 +573,19 @@ fn numericize(vals: &[Value], warnings: &mut Vec<String>, col: &str) -> Vec<Valu
     out
 }
 
-
 /// 把 (分类, 系列, 度量) 三元组摊成 categories + 多条 series。
 /// 同一格出现多次时后写的覆盖前写的，并明确告警——静默平均或静默丢弃都会骗人。
 /// `no_series_label` 是"没有系列列"时那条系列的显示名。
 /// 内部仍然用 "-" 占一个系列桶，但系列名是给 tooltip / 图例看的，
 /// 写 "-" 等于把 "SUM(gmv)" 这个口径信息丢掉。
-fn pivot(rows: &Table, x: &str, series: Option<&str>, measure: &str, no_series_label: &str, out: &mut ChartData) {
+fn pivot(
+    rows: &Table,
+    x: &str,
+    series: Option<&str>,
+    measure: &str,
+    no_series_label: &str,
+    out: &mut ChartData,
+) {
     let xs: Vec<String> = rows.column_values(x).iter().map(label).collect();
     let sy: Vec<String> = match series {
         Some(s) => rows.column_values(s).iter().map(label).collect(),
@@ -669,9 +683,10 @@ pub fn render_widget(w: &WidgetSpec, table: &Table) -> Result<ChartData, String>
             return Ok(out);
         }
         ChartType::Kpi => {
-            let measure = w.encode.measure_col().and_then(|m| {
-                cols.iter().find(|c| c.eq_ignore_ascii_case(m)).cloned()
-            });
+            let measure = w
+                .encode
+                .measure_col()
+                .and_then(|m| cols.iter().find(|c| c.eq_ignore_ascii_case(m)).cloned());
             let func = match agg.func() {
                 Some(f) => f,
                 None => AggFunc::Sum,
@@ -679,12 +694,18 @@ pub fn render_widget(w: &WidgetSpec, table: &Table) -> Result<ChartData, String>
             if func != AggFunc::Count && measure.is_none() {
                 return Err(format!("KPI {} 没有度量列，无法算 {}", w.id, agg_name(agg)));
             }
-            let one = aggregate(&filtered, &[], &[AggSpec::new("_k", func, measure.as_deref())])?;
+            let one = aggregate(
+                &filtered,
+                &[],
+                &[AggSpec::new("_k", func, measure.as_deref())],
+            )?;
             out.value = one.column_values("_k").first().cloned();
             out.row_count = filtered.len();
             if let Some(c) = w.encode.category_col() {
                 let real = need_col(&cols, Some(c), "标签")?;
-                out.categories = vec![label(one.column_values(&real).first().unwrap_or(&Value::Null))];
+                out.categories = vec![label(
+                    one.column_values(&real).first().unwrap_or(&Value::Null),
+                )];
             }
             return Ok(out);
         }
@@ -709,7 +730,11 @@ pub fn render_widget(w: &WidgetSpec, table: &Table) -> Result<ChartData, String>
                     }
                 }
             }
-            aggregate(&filtered, &group, &[AggSpec::new("_m", func, Some(&measure))])?
+            aggregate(
+                &filtered,
+                &group,
+                &[AggSpec::new("_m", func, Some(&measure))],
+            )?
         }
         None => filtered,
     };
@@ -726,7 +751,11 @@ pub fn render_widget(w: &WidgetSpec, table: &Table) -> Result<ChartData, String>
     };
     if w.kind == ChartType::Pie {
         out.categories = rows.column_values(&x).iter().map(label).collect();
-        let vals = numericize(&rows.column_values(&measure_col), &mut out.warnings, &measure);
+        let vals = numericize(
+            &rows.column_values(&measure_col),
+            &mut out.warnings,
+            &measure,
+        );
         out.series = vec![Series {
             name: measure_label.clone(),
             values: vals,
@@ -783,10 +812,26 @@ mod tests {
         tbl(
             &["month", "channel", "gmv"],
             &[
-                vec![(0, Value::Text("1月".into())), (1, Value::Text("直营".into())), (2, Value::Float(100.0))],
-                vec![(0, Value::Text("1月".into())), (1, Value::Text("加盟".into())), (2, Value::Float(30.0))],
-                vec![(0, Value::Text("2月".into())), (1, Value::Text("直营".into())), (2, Value::Float(120.0))],
-                vec![(0, Value::Text("2月".into())), (1, Value::Text("加盟".into())), (2, Value::Float(40.0))],
+                vec![
+                    (0, Value::Text("1月".into())),
+                    (1, Value::Text("直营".into())),
+                    (2, Value::Float(100.0)),
+                ],
+                vec![
+                    (0, Value::Text("1月".into())),
+                    (1, Value::Text("加盟".into())),
+                    (2, Value::Float(30.0)),
+                ],
+                vec![
+                    (0, Value::Text("2月".into())),
+                    (1, Value::Text("直营".into())),
+                    (2, Value::Float(120.0)),
+                ],
+                vec![
+                    (0, Value::Text("2月".into())),
+                    (1, Value::Text("加盟".into())),
+                    (2, Value::Float(40.0)),
+                ],
             ],
         )
     }
@@ -812,7 +857,11 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(
             "m".to_string(),
-            vec!["month".to_string(), "channel".to_string(), "gmv".to_string()],
+            vec![
+                "month".to_string(),
+                "channel".to_string(),
+                "gmv".to_string(),
+            ],
         );
         m
     }
@@ -832,18 +881,33 @@ mod tests {
         // 前端与 AI 提示词都按大写字面量写，serde 改名会静默打断这条链路
         let j = serde_json::to_string(&ChartType::Kpi).unwrap();
         assert_eq!(j, "\"KPI\"");
-        assert_eq!(serde_json::to_string(&AggType::CountDistinct).unwrap(), "\"COUNT_DISTINCT\"");
+        assert_eq!(
+            serde_json::to_string(&AggType::CountDistinct).unwrap(),
+            "\"COUNT_DISTINCT\""
+        );
         for spell in ["\"COUNT_DISTINCT\"", "\"COUNTDISTINCT\"", "\"COUNTD\""] {
-            assert_eq!(serde_json::from_str::<AggType>(spell).unwrap(), AggType::CountDistinct, "{}", spell);
+            assert_eq!(
+                serde_json::from_str::<AggType>(spell).unwrap(),
+                AggType::CountDistinct,
+                "{}",
+                spell
+            );
         }
-        assert_eq!(serde_json::from_str::<AggType>("\"MEAN\"").unwrap(), AggType::Avg);
+        assert_eq!(
+            serde_json::from_str::<AggType>("\"MEAN\"").unwrap(),
+            AggType::Avg
+        );
         let w: WidgetSpec = serde_json::from_str(
             r#"{"id":"a","type":"PIE","dataset":"m","encode":{"category":"month","value":"gmv"}}"#,
         )
         .unwrap();
         assert_eq!(w.encode.category_col(), Some("month"));
         assert_eq!(w.encode.measure_col(), Some("gmv"));
-        assert_eq!(w.agg, AggType::Raw, "缺省必须是 Raw，由 effective() 按图型推");
+        assert_eq!(
+            w.agg,
+            AggType::Raw,
+            "缺省必须是 Raw，由 effective() 按图型推"
+        );
     }
 
     #[test]
@@ -873,7 +937,9 @@ mod tests {
             .contains("ghost"));
         assert!(validate_view(&view_of(vec![]), &schemas()).is_err());
         let dup = view_of(vec![widget(ChartType::Bar), widget(ChartType::Bar)]);
-        assert!(validate_view(&dup, &schemas()).unwrap_err().contains("重复"));
+        assert!(validate_view(&dup, &schemas())
+            .unwrap_err()
+            .contains("重复"));
     }
 
     /// 撞到第一处就停的校验，等于让模型用两轮自修复预算去撞三个错，手改 JSON 的人
@@ -888,11 +954,8 @@ mod tests {
         let mut bad_filter = widget(ChartType::Line);
         bad_filter.id = "w3".into();
         bad_filter.filters = vec!["nope > 1".into()];
-        let err = validate_view(
-            &view_of(vec![bad_col, ghost, bad_filter]),
-            &schemas(),
-        )
-        .unwrap_err();
+        let err =
+            validate_view(&view_of(vec![bad_col, ghost, bad_filter]), &schemas()).unwrap_err();
         assert!(err.contains("共 3 处问题"), "{}", err);
         // 三处各自说清是什么：列不在数据集、数据集不存在、过滤条件里的列不存在
         assert!(err.contains("total_fee"), "{}", err);
@@ -939,9 +1002,7 @@ mod tests {
             layout: bad_layout,
             ..view_of(vec![widget(ChartType::Bar)])
         };
-        assert!(validate_view(&ok, &schemas())
-            .unwrap_err()
-            .contains("布局"));
+        assert!(validate_view(&ok, &schemas()).unwrap_err().contains("布局"));
     }
 
     #[test]
@@ -955,15 +1016,33 @@ mod tests {
 
         let v = ViewSpec {
             layout: vec![
-                WidgetLayout { widget: "w1".into(), x: 0, y: 0, w: 8, h: 6 },
-                WidgetLayout { widget: "w2".into(), x: 6, y: 0, w: 6, h: 6 },
+                WidgetLayout {
+                    widget: "w1".into(),
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 6,
+                },
+                WidgetLayout {
+                    widget: "w2".into(),
+                    x: 6,
+                    y: 0,
+                    w: 6,
+                    h: 6,
+                },
             ],
             widgets: vec![a.clone(), b.clone()],
             ..view_of(vec![a, b])
         };
         assert!(resolve_layout(&v).unwrap_err().contains("重叠"));
         let over = ViewSpec {
-            layout: vec![WidgetLayout { widget: "w1".into(), x: 6, y: 0, w: 8, h: 6 }],
+            layout: vec![WidgetLayout {
+                widget: "w1".into(),
+                x: 6,
+                y: 0,
+                w: 8,
+                h: 6,
+            }],
             ..v
         };
         assert!(resolve_layout(&over).unwrap_err().contains("越过"));
@@ -975,7 +1054,13 @@ mod tests {
         let mut b = widget(ChartType::Kpi);
         b.id = "w2".into();
         let v = ViewSpec {
-            layout: vec![WidgetLayout { widget: "w1".into(), x: 0, y: 0, w: 6, h: 4 }],
+            layout: vec![WidgetLayout {
+                widget: "w1".into(),
+                x: 0,
+                y: 0,
+                w: 6,
+                h: 4,
+            }],
             widgets: vec![a, b],
             ..view_of(vec![])
         };
@@ -1016,9 +1101,15 @@ mod tests {
         assert_eq!(c.categories, vec!["1月", "2月"]);
         assert_eq!(c.series.len(), 2);
         let direct = c.series.iter().find(|s| s.name == "直营").unwrap();
-        assert_eq!(direct.values, vec![Value::Float(100.0), Value::Float(120.0)]);
+        assert_eq!(
+            direct.values,
+            vec![Value::Float(100.0), Value::Float(120.0)]
+        );
         let franchise = c.series.iter().find(|s| s.name == "加盟").unwrap();
-        assert_eq!(franchise.values, vec![Value::Float(30.0), Value::Float(40.0)]);
+        assert_eq!(
+            franchise.values,
+            vec![Value::Float(30.0), Value::Float(40.0)]
+        );
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);
     }
 
@@ -1033,11 +1124,18 @@ mod tests {
         );
         let c = render_widget(&widget(ChartType::Line), &t).unwrap();
         assert_eq!(c.categories, vec!["1月"]);
-        assert_eq!(c.series[0].values, vec![Value::Float(20.0)], "后写覆盖，且不静默求和");
-        assert!(c
-            .warnings
-            .iter()
-            .any(|w| w.contains("重复") && w.contains("请先在数据集里聚合")), "{:?}", c.warnings);
+        assert_eq!(
+            c.series[0].values,
+            vec![Value::Float(20.0)],
+            "后写覆盖，且不静默求和"
+        );
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("重复") && w.contains("请先在数据集里聚合")),
+            "{:?}",
+            c.warnings
+        );
     }
 
     #[test]
@@ -1050,7 +1148,10 @@ mod tests {
         };
         let c = render_widget(&w, &monthly()).unwrap();
         assert_eq!(c.categories, vec!["1月", "2月"]);
-        assert_eq!(c.series[0].values, vec![Value::Float(130.0), Value::Float(160.0)]);
+        assert_eq!(
+            c.series[0].values,
+            vec![Value::Float(130.0), Value::Float(160.0)]
+        );
     }
 
     #[test]
@@ -1092,7 +1193,10 @@ mod tests {
         let c = render_widget(&w, &monthly()).unwrap();
         assert_eq!(c.categories, vec!["1月", "2月"]);
         assert_eq!(c.series.len(), 2);
-        assert_eq!(c.series[0].values, vec![Value::Float(100.0), Value::Float(120.0)]);
+        assert_eq!(
+            c.series[0].values,
+            vec![Value::Float(100.0), Value::Float(120.0)]
+        );
     }
 
     #[test]
@@ -1106,7 +1210,9 @@ mod tests {
         assert_eq!(c.value, Some(Value::Int(4)));
         let mut bad = widget(ChartType::Kpi);
         bad.encode = WidgetEncode::default();
-        assert!(render_widget(&bad, &monthly()).unwrap_err().contains("没有度量列"));
+        assert!(render_widget(&bad, &monthly())
+            .unwrap_err()
+            .contains("没有度量列"));
     }
 
     #[test]
@@ -1115,12 +1221,19 @@ mod tests {
             &["month", "gmv"],
             &[
                 vec![(0, Value::Text("1月".into())), (1, Value::Float(10.0))],
-                vec![(0, Value::Text("2月".into())), (1, Value::Text("待定".into()))],
+                vec![
+                    (0, Value::Text("2月".into())),
+                    (1, Value::Text("待定".into())),
+                ],
             ],
         );
         let c = render_widget(&widget(ChartType::Bar), &t).unwrap();
         assert_eq!(c.series[0].values, vec![Value::Float(10.0), Value::Null]);
-        assert!(c.warnings.iter().any(|w| w.contains("不是数值")), "{:?}", c.warnings);
+        assert!(
+            c.warnings.iter().any(|w| w.contains("不是数值")),
+            "{:?}",
+            c.warnings
+        );
     }
 
     #[test]
@@ -1157,11 +1270,22 @@ mod tests {
 
     #[test]
     fn validate_then_render_is_consistent_for_every_chart() {
-        let kinds = [ChartType::Line, ChartType::Bar, ChartType::Pie, ChartType::Table, ChartType::Kpi];
+        let kinds = [
+            ChartType::Line,
+            ChartType::Bar,
+            ChartType::Pie,
+            ChartType::Table,
+            ChartType::Kpi,
+        ];
         for k in kinds {
             let w = widget(k);
             let steps = validate_view(&view_of(vec![w.clone()]), &schemas()).unwrap();
-            assert!(steps.iter().any(|s| s.starts_with("WIDGET w1 ")), "{:?} {:?}", k, steps);
+            assert!(
+                steps.iter().any(|s| s.starts_with("WIDGET w1 ")),
+                "{:?} {:?}",
+                k,
+                steps
+            );
             let c = render_widget(&w, &monthly()).unwrap();
             assert_eq!(c.kind, k);
         }

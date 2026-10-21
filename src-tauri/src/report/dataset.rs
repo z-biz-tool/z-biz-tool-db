@@ -154,7 +154,9 @@ impl DatasetSpec {
     }
 
     pub fn row_cap(&self) -> usize {
-        self.max_rows.unwrap_or(DEFAULT_MAX_ROWS).clamp(1, HARD_MAX_ROWS)
+        self.max_rows
+            .unwrap_or(DEFAULT_MAX_ROWS)
+            .clamp(1, HARD_MAX_ROWS)
     }
 
     pub fn source(&self, alias: &str) -> Option<&SourceRef> {
@@ -209,7 +211,10 @@ pub fn quote_ident(dialect: &str, raw: &str, what: &str) -> Result<String, Strin
 /// 多取的 1 行只用来判定"是否被截断"，不会进入结果。
 pub fn source_sql(src: &SourceRef, cap: usize) -> Result<String, String> {
     if !DIALECTS.contains(&src.database_type.as_str()) {
-        return Err(format!("源 {} 方言不受支持: {}", src.alias, src.database_type));
+        return Err(format!(
+            "源 {} 方言不受支持: {}",
+            src.alias, src.database_type
+        ));
     }
     let mut tbl = quote_ident(&src.database_type, &src.table, "表")?;
     if !src.schema.trim().is_empty() {
@@ -351,8 +356,7 @@ pub fn plan_dataset(spec: &DatasetSpec, schemas: &SchemaCache) -> Result<Dataset
         if pick(&cols, &c.name).is_some() {
             return Err(format!("计算列 {} 与已有列重名", c.name));
         }
-        parse_expr(&c.expr, &allowed(&cols))
-            .map_err(|e| format!("计算列 [{}]: {}", c.name, e))?;
+        parse_expr(&c.expr, &allowed(&cols)).map_err(|e| format!("计算列 [{}]: {}", c.name, e))?;
         cols.push(c.name.clone());
         steps.push(format!("COMPUTE {} = {}", c.name, c.expr));
     }
@@ -390,7 +394,11 @@ pub fn plan_dataset(spec: &DatasetSpec, schemas: &SchemaCache) -> Result<Dataset
         cols.extend(spec.aggregates.iter().map(|a| a.output.clone()));
         steps.push(format!(
             "GROUP BY [{}] AGG [{}]",
-            if spec.group_by.is_empty() { "-".to_string() } else { spec.group_by.join(", ") },
+            if spec.group_by.is_empty() {
+                "-".to_string()
+            } else {
+                spec.group_by.join(", ")
+            },
             spec.aggregates
                 .iter()
                 .map(|a| format!("{}={:?}", a.output, a.func))
@@ -460,7 +468,10 @@ fn source_columns(
     }
     match schemas.get(alias) {
         Some(c) if !c.is_empty() => Ok(c.clone()),
-        _ => Err(format!("源 {} 未声明列清单，也无法从 schema 缓存取到", alias)),
+        _ => Err(format!(
+            "源 {} 未声明列清单，也无法从 schema 缓存取到",
+            alias
+        )),
     }
 }
 
@@ -548,18 +559,16 @@ pub async fn execute_dataset(
         let right = cache
             .get(&j.source)
             .ok_or_else(|| format!("源 {} 取数失败", j.source))?;
-        let keys: Vec<JoinKey> = j
-            .on
-            .iter()
-            .map(|p| JoinKey::new(&p.left, &p.right))
-            .collect();
+        let keys: Vec<JoinKey> =
+            j.on.iter()
+                .map(|p| JoinKey::new(&p.left, &p.right))
+                .collect();
         cur = hash_join(&cur, right, &keys, DatasetSpec::join_type(j.kind))?;
     }
 
     for f in &spec.filters {
-        let e = parse_expr(f, &allowed(&cur.columns)).map_err(|err| {
-            format!("过滤条件 [{}]: {}", f, err)
-        })?;
+        let e = parse_expr(f, &allowed(&cur.columns))
+            .map_err(|err| format!("过滤条件 [{}]: {}", f, err))?;
         cur = cur.filter(&e)?;
     }
     for c in &spec.computed {
@@ -671,7 +680,10 @@ pub fn table_from_tagged(columns: &[String], rows: &[Vec<serde_json::Value>]) ->
     for r in rows {
         let mut m = HashMap::with_capacity(columns.len());
         for (i, c) in columns.iter().enumerate() {
-            m.insert(c.clone(), r.get(i).map(tagged_to_value).unwrap_or(Value::Null));
+            m.insert(
+                c.clone(),
+                r.get(i).map(tagged_to_value).unwrap_or(Value::Null),
+            );
         }
         out.push(m);
     }
@@ -745,12 +757,20 @@ mod tests {
     fn cross_spec() -> DatasetSpec {
         let mut spec = DatasetSpec::new("ds-1", "每日净额", "orders");
         spec.sources = vec![
-            src("orders", "mysql", "t_order", &["id", "day", "amount", "cur"]),
+            src(
+                "orders",
+                "mysql",
+                "t_order",
+                &["id", "day", "amount", "cur"],
+            ),
             src("rates", "sqlite", "fx_rate", &["cur", "rate"]),
         ];
         spec.joins = vec![JoinSpec {
             source: "rates".into(),
-            on: vec![JoinPair { left: "cur".into(), right: "cur".into() }],
+            on: vec![JoinPair {
+                left: "cur".into(),
+                right: "cur".into(),
+            }],
             kind: JoinKind::Left,
         }];
         spec.filters = vec!["amount > 0".into()];
@@ -767,7 +787,10 @@ mod tests {
             name: "per_order".into(),
             expr: "total / n".into(),
         }];
-        spec.sort = vec![SortDir { column: "total".into(), desc: true }];
+        spec.sort = vec![SortDir {
+            column: "total".into(),
+            desc: true,
+        }];
         spec
     }
 
@@ -804,7 +827,10 @@ mod tests {
             "SELECT * FROM \"public\".\"orders\" LIMIT 51"
         );
         let q = src("o", "sqlite", "fx_rate", &["cur"]);
-        assert_eq!(source_sql(&q, 10).unwrap(), "SELECT \"cur\" FROM \"fx_rate\" LIMIT 11");
+        assert_eq!(
+            source_sql(&q, 10).unwrap(),
+            "SELECT \"cur\" FROM \"fx_rate\" LIMIT 11"
+        );
         // 方言不认识就直接拒绝，绝不退化成"原样拼进去"
         let bad = src("o", "oracle", "t", &[]);
         assert!(source_sql(&bad, 10).is_err());
@@ -838,11 +864,21 @@ mod tests {
         assert!(e.contains("missing_col"), "实际: {}", e);
 
         let mut fn_hallu = spec.clone();
-        fn_hallu.computed = vec![ComputedSpec { name: "x".into(), expr: "PG_SLEEP(30)".into() }];
-        assert!(validate_dataset(&fn_hallu, &cache).is_err(), "非白名单函数必须挡下");
+        fn_hallu.computed = vec![ComputedSpec {
+            name: "x".into(),
+            expr: "PG_SLEEP(30)".into(),
+        }];
+        assert!(
+            validate_dataset(&fn_hallu, &cache).is_err(),
+            "非白名单函数必须挡下"
+        );
 
         let mut no_join = spec.clone();
-        no_join.joins = vec![JoinSpec { source: "rates".into(), on: vec![], kind: JoinKind::Inner }];
+        no_join.joins = vec![JoinSpec {
+            source: "rates".into(),
+            on: vec![],
+            kind: JoinKind::Inner,
+        }];
         assert!(validate_dataset(&no_join, &cache).is_err());
 
         let mut unknown_src = spec.clone();
@@ -853,8 +889,14 @@ mod tests {
         let mut naked = spec.clone();
         naked.sources[0].columns.clear();
         assert!(validate_dataset(&naked, &schemas(&[("rates", &["cur", "rate"])])).is_err());
-        assert!(validate_dataset(&naked, &cache).is_ok(), "orders 的列应从缓存补齐");
-        assert!(naked.filters[0].contains("amount"), "过滤引用的是缓存里的列");
+        assert!(
+            validate_dataset(&naked, &cache).is_ok(),
+            "orders 的列应从缓存补齐"
+        );
+        assert!(
+            naked.filters[0].contains("amount"),
+            "过滤引用的是缓存里的列"
+        );
     }
 
     #[test]
@@ -865,7 +907,9 @@ mod tests {
         assert!(validate_dataset(&spec, &cache).is_ok());
 
         spec.sources.push(src("o", "sqlite", "r", &["b"]));
-        assert!(validate_dataset(&spec, &cache).unwrap_err().contains("重复"));
+        assert!(validate_dataset(&spec, &cache)
+            .unwrap_err()
+            .contains("重复"));
 
         let mut d = DatasetSpec::new("d", "n", "o");
         d.sources = vec![src("o", "sqlserver", "o", &["a"])];
@@ -875,7 +919,10 @@ mod tests {
         let mut s0 = src("o", "mysql", "o", &["a"]);
         s0.connection_id = "  ".into();
         cid.sources = vec![s0];
-        assert!(validate_dataset(&cid, &cache).is_err(), "没有连接信息就没法拉数");
+        assert!(
+            validate_dataset(&cid, &cache).is_err(),
+            "没有连接信息就没法拉数"
+        );
     }
 
     #[test]
@@ -888,7 +935,10 @@ mod tests {
         ];
         spec.joins = vec![JoinSpec {
             source: "r".into(),
-            on: vec![JoinPair { left: "id".into(), right: "id".into() }],
+            on: vec![JoinPair {
+                left: "id".into(),
+                right: "id".into(),
+            }],
             kind: JoinKind::Inner,
         }];
         spec.filters = vec!["amount_2 > 1".into()];
@@ -897,7 +947,10 @@ mod tests {
 
         let mut wrong = spec.clone();
         wrong.fields = vec!["amount_r".into()];
-        assert!(validate_dataset(&wrong, &cache).is_err(), "臆造的改名规则要报错");
+        assert!(
+            validate_dataset(&wrong, &cache).is_err(),
+            "臆造的改名规则要报错"
+        );
     }
 
     #[test]
@@ -906,7 +959,10 @@ mod tests {
         let mut spec = DatasetSpec::new("d", "n", "o");
         spec.sources = vec![src("o", "mysql", "o", &["a", "b"])];
         spec.aggregates = vec![AggSpec::new("s", AggFunc::Sum, None)];
-        assert!(validate_dataset(&spec, &cache).is_err(), "SUM 不给列没有意义");
+        assert!(
+            validate_dataset(&spec, &cache).is_err(),
+            "SUM 不给列没有意义"
+        );
 
         spec.aggregates = vec![AggSpec::new("s", AggFunc::Sum, Some("ghost"))];
         assert!(validate_dataset(&spec, &cache).is_err());
@@ -920,13 +976,22 @@ mod tests {
 
         spec.aggregates = vec![AggSpec::new("s", AggFunc::Sum, Some("b"))];
         spec.group_by = vec!["s".into()];
-        assert!(validate_dataset(&spec, &cache).is_err(), "分组列撞上聚合输出名");
+        assert!(
+            validate_dataset(&spec, &cache).is_err(),
+            "分组列撞上聚合输出名"
+        );
 
         spec.group_by = vec![];
-        spec.post_computed = vec![ComputedSpec { name: "p".into(), expr: "s + 1".into() }];
+        spec.post_computed = vec![ComputedSpec {
+            name: "p".into(),
+            expr: "s + 1".into(),
+        }];
         assert!(validate_dataset(&spec, &cache).is_ok());
         spec.aggregates = vec![];
-        assert!(validate_dataset(&spec, &cache).is_err(), "无聚合时 post_computed 无意义");
+        assert!(
+            validate_dataset(&spec, &cache).is_err(),
+            "无聚合时 post_computed 无意义"
+        );
     }
 
     #[test]
@@ -943,19 +1008,56 @@ mod tests {
 
     #[tokio::test]
     async fn cross_database_dataset_runs_end_to_end() {
-        let orders = tbl(&["id", "day", "amount", "cur"], &[
-            vec![("id", Value::Int(1)), ("day", Value::Text("01".into())), ("amount", Value::Int(100)), ("cur", Value::Text("usd".into()))],
-            vec![("id", Value::Int(2)), ("day", Value::Text("01".into())), ("amount", Value::Int(50)), ("cur", Value::Text("usd".into()))],
-            vec![("id", Value::Int(3)), ("day", Value::Text("02".into())), ("amount", Value::Int(70)), ("cur", Value::Text("eur".into()))],
-            // 汇率缺失的币种：LEFT 保留、net 变 NULL、SUM 忽略
-            vec![("id", Value::Int(4)), ("day", Value::Text("02".into())), ("amount", Value::Int(9)), ("cur", Value::Text("xxx".into()))],
-            // 被 WHERE 挡掉
-            vec![("id", Value::Int(5)), ("day", Value::Text("03".into())), ("amount", Value::Int(0)), ("cur", Value::Text("usd".into()))],
-        ]);
-        let rates = tbl(&["cur", "rate"], &[
-            vec![("cur", Value::Text("usd".into())), ("rate", Value::Float(7.2))],
-            vec![("cur", Value::Text("eur".into())), ("rate", Value::Float(7.8))],
-        ]);
+        let orders = tbl(
+            &["id", "day", "amount", "cur"],
+            &[
+                vec![
+                    ("id", Value::Int(1)),
+                    ("day", Value::Text("01".into())),
+                    ("amount", Value::Int(100)),
+                    ("cur", Value::Text("usd".into())),
+                ],
+                vec![
+                    ("id", Value::Int(2)),
+                    ("day", Value::Text("01".into())),
+                    ("amount", Value::Int(50)),
+                    ("cur", Value::Text("usd".into())),
+                ],
+                vec![
+                    ("id", Value::Int(3)),
+                    ("day", Value::Text("02".into())),
+                    ("amount", Value::Int(70)),
+                    ("cur", Value::Text("eur".into())),
+                ],
+                // 汇率缺失的币种：LEFT 保留、net 变 NULL、SUM 忽略
+                vec![
+                    ("id", Value::Int(4)),
+                    ("day", Value::Text("02".into())),
+                    ("amount", Value::Int(9)),
+                    ("cur", Value::Text("xxx".into())),
+                ],
+                // 被 WHERE 挡掉
+                vec![
+                    ("id", Value::Int(5)),
+                    ("day", Value::Text("03".into())),
+                    ("amount", Value::Int(0)),
+                    ("cur", Value::Text("usd".into())),
+                ],
+            ],
+        );
+        let rates = tbl(
+            &["cur", "rate"],
+            &[
+                vec![
+                    ("cur", Value::Text("usd".into())),
+                    ("rate", Value::Float(7.2)),
+                ],
+                vec![
+                    ("cur", Value::Text("eur".into())),
+                    ("rate", Value::Float(7.8)),
+                ],
+            ],
+        );
         let source = Mock::new(vec![("orders", orders), ("rates", rates)]);
         let spec = cross_spec();
         let r = execute_dataset(&spec, &source).await.unwrap();
@@ -966,7 +1068,11 @@ mod tests {
         assert_eq!(cell(&r.table, 0, "day"), Value::Text("01".into()));
         assert_eq!(cell(&r.table, 0, "n"), Value::Int(2));
         assert_eq!(cell(&r.table, 1, "day"), Value::Text("02".into()));
-        assert_eq!(cell(&r.table, 1, "n"), Value::Int(2), "LEFT 未匹配的订单也计数");
+        assert_eq!(
+            cell(&r.table, 1, "n"),
+            Value::Int(2),
+            "LEFT 未匹配的订单也计数"
+        );
         match cell(&r.table, 1, "total") {
             Value::Float(f) => assert!((f - 546.0).abs() < 1e-6, "只有 eur 那单可加，实际 {}", f),
             other => panic!("应为 Float，实际 {:?}", other),
@@ -977,8 +1083,14 @@ mod tests {
             other => panic!("应为 Float，实际 {:?}", other),
         }
         assert_eq!(r.generated_sql.len(), 2);
-        assert_eq!(r.generated_sql[0].1, "SELECT `id`, `day`, `amount`, `cur` FROM `t_order` LIMIT 50001");
-        assert_eq!(r.generated_sql[1].1, "SELECT \"cur\", \"rate\" FROM \"fx_rate\" LIMIT 50001");
+        assert_eq!(
+            r.generated_sql[0].1,
+            "SELECT `id`, `day`, `amount`, `cur` FROM `t_order` LIMIT 50001"
+        );
+        assert_eq!(
+            r.generated_sql[1].1,
+            "SELECT \"cur\", \"rate\" FROM \"fx_rate\" LIMIT 50001"
+        );
         assert!(!r.is_partial());
     }
 
@@ -987,15 +1099,17 @@ mod tests {
         let mut spec = DatasetSpec::new("d", "n", "o");
         spec.sources = vec![src("o", "mysql", "big", &["k"])];
         spec.max_rows = Some(3);
-        let rows: Vec<Vec<(&str, Value)>> = (0..10)
-            .map(|i| vec![("k", Value::Int(i))])
-            .collect();
+        let rows: Vec<Vec<(&str, Value)>> = (0..10).map(|i| vec![("k", Value::Int(i))]).collect();
         let source = Mock::new(vec![("o", tbl(&["k"], &rows))]);
         let r = execute_dataset(&spec, &source).await.unwrap();
         assert_eq!(r.table.len(), 3, "超过 cap 必须硬截断");
         assert_eq!(r.truncated, vec!["o".to_string()]);
         assert!(r.is_partial());
-        assert_eq!(r.source_rows[0], ("o".to_string(), 10), "回报真实拉回数，不藏起来");
+        assert_eq!(
+            r.source_rows[0],
+            ("o".to_string(), 10),
+            "回报真实拉回数，不藏起来"
+        );
         assert!(r.generated_sql[0].1.ends_with("LIMIT 4"));
     }
 
@@ -1003,11 +1117,20 @@ mod tests {
     async fn where_runs_after_the_join_so_left_padded_rows_drop_out() {
         // 若先过滤再 join，order 4（cur=xxx）会被留在结果里并带 NULL rate；
         // 先 join 再过滤才是 SQL 的语义
-        let orders = tbl(&["id", "cur"], &[
-            vec![("id", Value::Int(1)), ("cur", Value::Text("usd".into()))],
-            vec![("id", Value::Int(2)), ("cur", Value::Text("xxx".into()))],
-        ]);
-        let rates = tbl(&["cur", "rate"], &[vec![("cur", Value::Text("usd".into())), ("rate", Value::Float(7.0))]]);
+        let orders = tbl(
+            &["id", "cur"],
+            &[
+                vec![("id", Value::Int(1)), ("cur", Value::Text("usd".into()))],
+                vec![("id", Value::Int(2)), ("cur", Value::Text("xxx".into()))],
+            ],
+        );
+        let rates = tbl(
+            &["cur", "rate"],
+            &[vec![
+                ("cur", Value::Text("usd".into())),
+                ("rate", Value::Float(7.0)),
+            ]],
+        );
         let mut spec = DatasetSpec::new("d", "n", "o");
         spec.sources = vec![
             src("o", "mysql", "t_order", &["id", "cur"]),
@@ -1015,7 +1138,10 @@ mod tests {
         ];
         spec.joins = vec![JoinSpec {
             source: "r".into(),
-            on: vec![JoinPair { left: "cur".into(), right: "cur".into() }],
+            on: vec![JoinPair {
+                left: "cur".into(),
+                right: "cur".into(),
+            }],
             kind: JoinKind::Left,
         }];
         spec.filters = vec!["rate > 0".into()];
@@ -1031,14 +1157,20 @@ mod tests {
         let mut spec = DatasetSpec::new("d", "n", "o");
         spec.sources = vec![src("o", "mysql", "t", &["a"])];
         let source = Mock::new(vec![]);
-        assert!(execute_dataset(&spec, &source).await.unwrap_err().contains("mock"));
+        assert!(execute_dataset(&spec, &source)
+            .await
+            .unwrap_err()
+            .contains("mock"));
 
         // 基表能取到数，但 join 目标不在 sources 里 → 计划期就定位到那个别名
         let ok = Mock::new(vec![("o", tbl(&["a"], &[vec![("a", Value::Int(1))]]))]);
         spec.sources.push(src("r", "sqlite", "u", &["b"]));
         spec.joins = vec![JoinSpec {
             source: "nope".into(),
-            on: vec![JoinPair { left: "a".into(), right: "b".into() }],
+            on: vec![JoinPair {
+                left: "a".into(),
+                right: "b".into(),
+            }],
             kind: JoinKind::Inner,
         }];
         let e = execute_dataset(&spec, &ok).await.unwrap_err();
@@ -1052,7 +1184,10 @@ mod tests {
             .collect();
         let mut spec = DatasetSpec::new("d", "n", "o");
         spec.sources = vec![src("o", "mysql", "t", &["k", "v"])];
-        spec.sort = vec![SortDir { column: "k".into(), desc: true }];
+        spec.sort = vec![SortDir {
+            column: "k".into(),
+            desc: true,
+        }];
         spec.fields = vec!["k".into()];
         spec.limit = Some(2);
         let r = execute_dataset(&spec, &Mock::new(vec![("o", tbl(&["k", "v"], &rows))]))
@@ -1072,9 +1207,18 @@ mod tests {
         // 这些字面值就是 lib.rs::kind_to_str 的产物（小写）。之前这里按 PascalCase
         // 写测试并且通过了，真接上驱动后整列静默变 NULL —— 测试记了个错的契约，
         // 比没测试更糟。改大小写敏感的匹配前请先改这份字面量。
-        assert_eq!(tagged_to_value(&mk("null", serde_json::Value::Null)), Value::Null);
-        assert_eq!(tagged_to_value(&mk("integer", serde_json::json!(42))), Value::Int(42));
-        assert_eq!(tagged_to_value(&mk("float", serde_json::json!(1.5))), Value::Float(1.5));
+        assert_eq!(
+            tagged_to_value(&mk("null", serde_json::Value::Null)),
+            Value::Null
+        );
+        assert_eq!(
+            tagged_to_value(&mk("integer", serde_json::json!(42))),
+            Value::Int(42)
+        );
+        assert_eq!(
+            tagged_to_value(&mk("float", serde_json::json!(1.5))),
+            Value::Float(1.5)
+        );
         // T-038：超过 2^53 的整数以字符串下发，必须还原成数字而不是 NULL
         assert_eq!(
             tagged_to_value(&mk("integer", serde_json::json!("9007199254740993"))),
@@ -1086,13 +1230,28 @@ mod tests {
             Value::Float(1.8446744073709552e19)
         );
         // Decimal 常以字符串下发，必须还原成数值而不是文本
-        assert_eq!(tagged_to_value(&mk("decimal", serde_json::json!("12.500"))), Value::Float(12.5));
-        assert_eq!(tagged_to_value(&mk("datetime", serde_json::json!("2026-01-01"))), Value::Text("2026-01-01".into()));
+        assert_eq!(
+            tagged_to_value(&mk("decimal", serde_json::json!("12.500"))),
+            Value::Float(12.5)
+        );
+        assert_eq!(
+            tagged_to_value(&mk("datetime", serde_json::json!("2026-01-01"))),
+            Value::Text("2026-01-01".into())
+        );
         // 解码失败与二进制不参与求值
-        assert_eq!(tagged_to_value(&mk("decode_error", serde_json::json!("boom"))), Value::Null);
-        assert_eq!(tagged_to_value(&mk("binary", serde_json::json!("AA=="))), Value::Null);
+        assert_eq!(
+            tagged_to_value(&mk("decode_error", serde_json::json!("boom"))),
+            Value::Null
+        );
+        assert_eq!(
+            tagged_to_value(&mk("binary", serde_json::json!("AA=="))),
+            Value::Null
+        );
         // 大小写不敏感，容得下别的调用方沿用 serde 的 PascalCase
-        assert_eq!(tagged_to_value(&mk("Integer", serde_json::json!(7))), Value::Int(7));
+        assert_eq!(
+            tagged_to_value(&mk("Integer", serde_json::json!(7))),
+            Value::Int(7)
+        );
         // 裸值（v1 兼容路径）
         assert_eq!(tagged_to_value(&serde_json::json!(7)), Value::Int(7));
         assert_eq!(tagged_to_value(&serde_json::json!(true)), Value::Bool(true));
@@ -1133,20 +1292,39 @@ mod tests {
         let orders = tbl(
             &["id", "day", "amount", "cur"],
             &[
-                vec![("id", Value::Int(1)), ("day", Value::Text("01".into())), ("amount", Value::Int(100)), ("cur", Value::Text("usd".into()))],
-                vec![("id", Value::Int(2)), ("day", Value::Text("02".into())), ("amount", Value::Int(70)), ("cur", Value::Text("eur".into()))],
+                vec![
+                    ("id", Value::Int(1)),
+                    ("day", Value::Text("01".into())),
+                    ("amount", Value::Int(100)),
+                    ("cur", Value::Text("usd".into())),
+                ],
+                vec![
+                    ("id", Value::Int(2)),
+                    ("day", Value::Text("02".into())),
+                    ("amount", Value::Int(70)),
+                    ("cur", Value::Text("eur".into())),
+                ],
             ],
         );
         let rates = tbl(
             &["cur", "rate"],
             &[
-                vec![("cur", Value::Text("usd".into())), ("rate", Value::Float(7.2))],
-                vec![("cur", Value::Text("eur".into())), ("rate", Value::Float(7.8))],
+                vec![
+                    ("cur", Value::Text("usd".into())),
+                    ("rate", Value::Float(7.2)),
+                ],
+                vec![
+                    ("cur", Value::Text("eur".into())),
+                    ("rate", Value::Float(7.8)),
+                ],
             ],
         );
-        let r = execute_dataset(&spec, &Mock::new(vec![("orders", orders), ("rates", rates)]))
-            .await
-            .unwrap();
+        let r = execute_dataset(
+            &spec,
+            &Mock::new(vec![("orders", orders), ("rates", rates)]),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.table.columns, plan.columns);
 
         // fields 决定最终顺序，而不是"声明顺序"
@@ -1157,8 +1335,28 @@ mod tests {
         let r2 = execute_dataset(
             &proj,
             &Mock::new(vec![
-                ("orders", tbl(&["id", "day", "amount", "cur"], &[vec![("id", Value::Int(1)), ("day", Value::Text("01".into())), ("amount", Value::Int(100)), ("cur", Value::Text("usd".into()))]])),
-                ("rates", tbl(&["cur", "rate"], &[vec![("cur", Value::Text("usd".into())), ("rate", Value::Float(7.2))]])),
+                (
+                    "orders",
+                    tbl(
+                        &["id", "day", "amount", "cur"],
+                        &[vec![
+                            ("id", Value::Int(1)),
+                            ("day", Value::Text("01".into())),
+                            ("amount", Value::Int(100)),
+                            ("cur", Value::Text("usd".into())),
+                        ]],
+                    ),
+                ),
+                (
+                    "rates",
+                    tbl(
+                        &["cur", "rate"],
+                        &[vec![
+                            ("cur", Value::Text("usd".into())),
+                            ("rate", Value::Float(7.2)),
+                        ]],
+                    ),
+                ),
             ]),
         )
         .await

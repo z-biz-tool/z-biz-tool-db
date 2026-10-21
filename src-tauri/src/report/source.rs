@@ -21,9 +21,9 @@ use crate::{dispatch_db_type, run_dispatch, DBConfig};
 use super::dataset::{
     self, assert_ident, source_sql, DatasetSpec, RowSource, SchemaCache, SourceRef,
 };
-use super::view::{self, ViewSpec};
 use super::expr::Value;
 use super::table::Table;
+use super::view::{self, ViewSpec};
 
 /// connection_id → 连接配置。一个数据集可以同时引用多个连接，这就是跨库。
 #[derive(Clone, Default)]
@@ -34,10 +34,7 @@ pub struct DbSource {
 impl DbSource {
     pub fn new(configs: &[DBConfig]) -> Self {
         DbSource {
-            configs: configs
-                .iter()
-                .map(|c| (c.id.clone(), c.clone()))
-                .collect(),
+            configs: configs.iter().map(|c| (c.id.clone(), c.clone())).collect(),
         }
     }
 
@@ -74,7 +71,10 @@ impl DbSource {
 /// 的反引号写法带进了 SQLite 连接，静默改掉反而会让人查不出列为什么不存在。
 pub fn aligned(src: &SourceRef, real: &str) -> SourceRef {
     if src.database_type.trim().is_empty() {
-        SourceRef { database_type: real.to_string(), ..src.clone() }
+        SourceRef {
+            database_type: real.to_string(),
+            ..src.clone()
+        }
     } else {
         src.clone()
     }
@@ -91,7 +91,10 @@ pub fn align_dialects(spec: &DatasetSpec, source: &DbSource) -> Result<DatasetSp
             src.database_type = real.to_string();
         }
     }
-    Ok(DatasetSpec { sources, ..spec.clone() })
+    Ok(DatasetSpec {
+        sources,
+        ..spec.clone()
+    })
 }
 
 impl RowSource for DbSource {
@@ -162,11 +165,20 @@ pub struct ColumnInfo {
 }
 
 /// 探查列清单的 SQL。三种方言都保证"第一列列名、第二列类型"，便于上层统一取值。
-pub fn describe_sql(dialect: &str, schema: &str, table: &str, database: &str) -> Result<String, String> {
+pub fn describe_sql(
+    dialect: &str,
+    schema: &str,
+    table: &str,
+    database: &str,
+) -> Result<String, String> {
     let tbl = assert_ident(table, "表")?;
     match dialect {
         "mysql" => {
-            let db = if schema.trim().is_empty() { database } else { schema };
+            let db = if schema.trim().is_empty() {
+                database
+            } else {
+                schema
+            };
             if db.trim().is_empty() {
                 return Err("MySQL 探查列需要库名（连接配置里的数据库名）".to_string());
             }
@@ -178,7 +190,11 @@ pub fn describe_sql(dialect: &str, schema: &str, table: &str, database: &str) ->
             ))
         }
         "postgresql" => {
-            let sch = if schema.trim().is_empty() { "public" } else { schema.trim() };
+            let sch = if schema.trim().is_empty() {
+                "public"
+            } else {
+                schema.trim()
+            };
             Ok(format!(
                 "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
                 text_lit(sch)?,
@@ -335,7 +351,10 @@ pub fn previews(spec: &DatasetSpec, source: &DbSource) -> Result<Vec<SqlPreview>
     let cap = spec.row_cap();
     let mut out = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    let push = &mut |alias: &str, seen: &mut Vec<String>, out: &mut Vec<SqlPreview>| -> Result<(), String> {
+    let push = &mut |alias: &str,
+                     seen: &mut Vec<String>,
+                     out: &mut Vec<SqlPreview>|
+     -> Result<(), String> {
         if seen.iter().any(|a| a.eq_ignore_ascii_case(alias)) {
             return Ok(());
         }
@@ -508,13 +527,21 @@ async fn plan_datasets(
     datasets: &[DatasetSpec],
     source: &DbSource,
     provided: Option<&HashMap<String, SchemaCache>>,
-) -> Result<(HashMap<String, Vec<String>>, Vec<SqlPreview>, Vec<DatasetSpec>), String> {
+) -> Result<
+    (
+        HashMap<String, Vec<String>>,
+        Vec<SqlPreview>,
+        Vec<DatasetSpec>,
+    ),
+    String,
+> {
     let mut cols: HashMap<String, Vec<String>> = HashMap::new();
     let mut sqls: Vec<SqlPreview> = Vec::new();
     let mut aligned: Vec<DatasetSpec> = Vec::new();
     for ds in datasets {
         check_spec_ids(&cols, ds)?;
-        let (ds, plan_cols, ds_sqls) = plan_one(ds, source, provided.and_then(|p| p.get(&ds.id))).await?;
+        let (ds, plan_cols, ds_sqls) =
+            plan_one(ds, source, provided.and_then(|p| p.get(&ds.id))).await?;
         sqls.extend(ds_sqls);
         cols.insert(ds.id.clone(), plan_cols);
         aligned.push(ds);
@@ -795,7 +822,9 @@ mod tests {
     #[tokio::test]
     async fn in_memory_sqlite_skips_path_check_but_shares_nothing() {
         let cfg = sqlite_cfg("mem", ":memory:");
-        run_dispatch(&cfg, "CREATE TABLE t (id INTEGER)").await.unwrap();
+        run_dispatch(&cfg, "CREATE TABLE t (id INTEGER)")
+            .await
+            .unwrap();
         let err = describe_columns(&cfg, "", "t").await.unwrap_err();
         assert!(err.contains("没有可读取的列"), "{}", err);
         assert!(!err.contains("文件不存在"), "{}", err);
@@ -807,7 +836,11 @@ mod tests {
         let cfg = sqlite_cfg("ghost", "/tmp/definitely-not-here-zdb-42/case.sqlite");
         let err = run_dispatch(&cfg, "SELECT 1").await.unwrap_err();
         assert!(err.contains("SQLite 文件不存在"), "{}", err);
-        assert!(err.contains("/tmp/definitely-not-here-zdb-42/case.sqlite"), "{}", err);
+        assert!(
+            err.contains("/tmp/definitely-not-here-zdb-42/case.sqlite"),
+            "{}",
+            err
+        );
     }
 
     #[test]
@@ -852,7 +885,9 @@ mod tests {
     async fn unknown_connection_is_named_in_the_error() {
         let db = temp_db();
         let cfg = sqlite_cfg("known", &path_in(&db, "known.sqlite"));
-        run_dispatch(&cfg, "CREATE TABLE t (id INTEGER)").await.unwrap();
+        run_dispatch(&cfg, "CREATE TABLE t (id INTEGER)")
+            .await
+            .unwrap();
         let source = DbSource::new(&[cfg]);
         let spec = DatasetSpec {
             id: "d".into(),
@@ -861,9 +896,7 @@ mod tests {
             sources: vec![src("t", "missing-one", "t")],
             ..DatasetSpec::new("d", "d", "t")
         };
-        let err = dataset::execute_dataset(&spec, &source)
-            .await
-            .unwrap_err();
+        let err = dataset::execute_dataset(&spec, &source).await.unwrap_err();
         assert!(err.contains("missing-one"), "{}", err);
         assert!(err.contains("不在本会话"), "{}", err);
     }
@@ -872,7 +905,9 @@ mod tests {
     async fn dialect_mismatch_is_rejected_before_connecting() {
         let db = temp_db();
         let cfg = sqlite_cfg("lite", &path_in(&db, "lite.sqlite"));
-        run_dispatch(&cfg, "CREATE TABLE t (id INTEGER)").await.unwrap();
+        run_dispatch(&cfg, "CREATE TABLE t (id INTEGER)")
+            .await
+            .unwrap();
         let source = DbSource::new(&[cfg]);
         let mut s = src("t", "lite", "t");
         s.database_type = "mysql".into();
@@ -916,9 +951,12 @@ mod tests {
     async fn seed_shop_crm(db: &TempDb) -> (DBConfig, DBConfig) {
         let shop = sqlite_cfg("shop", &path_in(db, "shop.sqlite"));
         let crm = sqlite_cfg("crm", &path_in(db, "crm.sqlite"));
-        run_dispatch(&shop, "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount REAL, status TEXT)")
-            .await
-            .unwrap();
+        run_dispatch(
+            &shop,
+            "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount REAL, status TEXT)",
+        )
+        .await
+        .unwrap();
         for (id, uid, amt, st) in [
             (1, 1, 100.0, "paid"),
             (2, 1, 50.0, "paid"),
@@ -928,7 +966,10 @@ mod tests {
         ] {
             run_dispatch(
                 &shop,
-                &format!("INSERT INTO orders VALUES ({}, {}, {}, '{}')", id, uid, amt, st),
+                &format!(
+                    "INSERT INTO orders VALUES ({}, {}, {}, '{}')",
+                    id, uid, amt, st
+                ),
             )
             .await
             .unwrap();
@@ -937,9 +978,12 @@ mod tests {
             .await
             .unwrap();
         for (id, city) in [(1, "SH"), (2, "BJ"), (3, "SZ")] {
-            run_dispatch(&crm, &format!("INSERT INTO users VALUES ({}, '{}')", id, city))
-                .await
-                .unwrap();
+            run_dispatch(
+                &crm,
+                &format!("INSERT INTO users VALUES ({}, '{}')", id, city),
+            )
+            .await
+            .unwrap();
         }
         (shop, crm)
     }
@@ -984,10 +1028,19 @@ mod tests {
         let cache = build_schemas(&spec, &source, None).await.unwrap();
         assert_eq!(
             cache.get("o").unwrap(),
-            &vec!["id".to_string(), "user_id".into(), "amount".into(), "status".into()]
+            &vec![
+                "id".to_string(),
+                "user_id".into(),
+                "amount".into(),
+                "status".into()
+            ]
         );
         let steps = dataset::validate_dataset(&spec, &cache).unwrap();
-        assert!(steps.iter().any(|s| s.starts_with("INNER JOIN u")), "{:?}", steps);
+        assert!(
+            steps.iter().any(|s| s.starts_with("INNER JOIN u")),
+            "{:?}",
+            steps
+        );
 
         let payload = report_dataset_execute(spec, vec![shop, crm], None)
             .await
@@ -1004,14 +1057,18 @@ mod tests {
         // 每条源 SQL 都可在"查看生成的 SQL"里回显
         assert_eq!(payload.generated_sql.len(), 2);
         assert_eq!(payload.generated_sql[0].connection_name, "shop");
-        assert!(payload.generated_sql[1].sql.starts_with("SELECT * FROM \"users\" LIMIT"));
+        assert!(payload.generated_sql[1]
+            .sql
+            .starts_with("SELECT * FROM \"users\" LIMIT"));
     }
 
     #[tokio::test]
     async fn execute_surfaces_row_cap_as_partial() {
         let db = temp_db();
         let cfg = sqlite_cfg("bulk", &path_in(&db, "bulk.sqlite"));
-        run_dispatch(&cfg, "CREATE TABLE t (id INTEGER)").await.unwrap();
+        run_dispatch(&cfg, "CREATE TABLE t (id INTEGER)")
+            .await
+            .unwrap();
         for i in 0..12 {
             run_dispatch(&cfg, &format!("INSERT INTO t VALUES ({})", i))
                 .await
@@ -1026,7 +1083,10 @@ mod tests {
             ..DatasetSpec::new("cap", "cap", "t")
         };
         let payload = report_dataset_execute(spec, vec![cfg], None).await.unwrap();
-        assert!(payload.partial, "截断必须被显式标记，否则 UI 会把半份数据当真");
+        assert!(
+            payload.partial,
+            "截断必须被显式标记，否则 UI 会把半份数据当真"
+        );
         assert_eq!(payload.truncated, vec!["t"]);
         assert_eq!(payload.source_rows[0].rows, 6, "多取 1 行用来判定截断");
         assert_eq!(payload.row_count, 5);
@@ -1256,7 +1316,12 @@ mod tests {
         let mut broken = paid_orders_spec();
         // 自带列清单 → 计划阶段不探库，直接过（清单得含 status，否则过滤器先在计划阶段被打回）；
         // 真取数时才发现表根本不在
-        broken.sources[0].columns = vec!["id".into(), "user_id".into(), "amount".into(), "status".into()];
+        broken.sources[0].columns = vec![
+            "id".into(),
+            "user_id".into(),
+            "amount".into(),
+            "status".into(),
+        ];
         broken.sources[0].table = "orders_archive".into();
         let payload = report_view_render(
             shop_board(),
@@ -1294,8 +1359,16 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("全部没取到数"), "{}", err);
-        assert!(err.contains("city-gmv") && err.contains("paid-orders"), "{}", err);
-        assert!(err.contains("城市成交额") && err.contains("已支付订单明细"), "{}", err);
+        assert!(
+            err.contains("city-gmv") && err.contains("paid-orders"),
+            "{}",
+            err
+        );
+        assert!(
+            err.contains("城市成交额") && err.contains("已支付订单明细"),
+            "{}",
+            err
+        );
     }
 
     /// id 空或重复是整份规格的错，不许被"按数据集降级"糊过去
@@ -1324,7 +1397,9 @@ mod tests {
         run_dispatch(&cfg, "CREATE TABLE t (id INTEGER, amount REAL)")
             .await
             .unwrap();
-        run_dispatch(&cfg, "INSERT INTO t VALUES (1, 12.5)").await.unwrap();
+        run_dispatch(&cfg, "INSERT INTO t VALUES (1, 12.5)")
+            .await
+            .unwrap();
         let mut s = src("t", "lite", "t");
         s.database_type = String::new();
         let spec = DatasetSpec {
@@ -1335,13 +1410,24 @@ mod tests {
             ..DatasetSpec::new("d", "d", "t")
         };
         let source = DbSource::new(&[cfg]);
-        let payload = report_dataset_execute(spec.clone(), vec![sqlite_cfg("lite", &path_in(&db, "lite.sqlite"))], None)
-            .await
-            .unwrap();
+        let payload = report_dataset_execute(
+            spec.clone(),
+            vec![sqlite_cfg("lite", &path_in(&db, "lite.sqlite"))],
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(payload.row_count, 1);
         let sqls = previews(&spec, &source).unwrap();
-        assert_eq!(sqls[0].database_type, "sqlite", "回显的方言必须是连接真实方言");
-        assert!(sqls[0].sql.starts_with("SELECT * FROM \"t\" LIMIT"), "{}", sqls[0].sql);
+        assert_eq!(
+            sqls[0].database_type, "sqlite",
+            "回显的方言必须是连接真实方言"
+        );
+        assert!(
+            sqls[0].sql.starts_with("SELECT * FROM \"t\" LIMIT"),
+            "{}",
+            sqls[0].sql
+        );
     }
 
     /// 全链路收口：模型只写 alias/connection_id/table（不带方言、不带列清单），
@@ -1358,8 +1444,18 @@ mod tests {
                 database_type: "sqlite".into(),
                 schema: String::new(),
                 table: "orders".into(),
-                columns: vec!["id".into(), "user_id".into(), "amount".into(), "status".into()],
-                column_types: col_types(&[("id", "INTEGER"), ("user_id", "INTEGER"), ("amount", "REAL"), ("status", "TEXT")]),
+                columns: vec![
+                    "id".into(),
+                    "user_id".into(),
+                    "amount".into(),
+                    "status".into(),
+                ],
+                column_types: col_types(&[
+                    ("id", "INTEGER"),
+                    ("user_id", "INTEGER"),
+                    ("amount", "REAL"),
+                    ("status", "TEXT"),
+                ]),
             },
             CatalogTable {
                 connection_id: "crm".into(),
@@ -1392,14 +1488,9 @@ mod tests {
         assert_eq!(draft.datasets[0].sources[1].database_type, "sqlite");
         assert_eq!(draft.columns["city-gmv"], vec!["city", "gmv"]);
 
-        let payload = report_view_render(
-            draft.view,
-            draft.datasets,
-            vec![shop, crm],
-            None,
-        )
-        .await
-        .unwrap();
+        let payload = report_view_render(draft.view, draft.datasets, vec![shop, crm], None)
+            .await
+            .unwrap();
         assert!(!payload.partial);
         assert_eq!(payload.charts[0].value, Some(Value::Float(300.0)));
         assert_eq!(
@@ -1484,8 +1575,15 @@ mod tests {
         let mut catalog: Vec<CatalogTable> = Vec::new();
         for c in &picked.picked {
             let cfg = cfgs.iter().find(|x| x.id == c.connection_id).unwrap();
-            let cols = describe_columns_typed(cfg, &c.schema, &c.table).await.unwrap();
-            assert!(!cols.is_empty(), "{}.{} 的列清单是空的", c.connection_name, c.table);
+            let cols = describe_columns_typed(cfg, &c.schema, &c.table)
+                .await
+                .unwrap();
+            assert!(
+                !cols.is_empty(),
+                "{}.{} 的列清单是空的",
+                c.connection_name,
+                c.table
+            );
             let mut types = HashMap::new();
             for col in &cols {
                 types.insert(col.name.clone(), col.data_type.clone());
@@ -1529,9 +1627,12 @@ mod tests {
         let (shop, crm) = seed_shop_crm(&db).await;
         // 网页端的 uid 是文本列：两张表只差写法（'01' 与 '1'）
         for (table, prefix) in [("web_padded", "0"), ("web_plain", "")] {
-            run_dispatch(&crm, &format!("CREATE TABLE {} (uid TEXT, city TEXT)", table))
-                .await
-                .unwrap();
+            run_dispatch(
+                &crm,
+                &format!("CREATE TABLE {} (uid TEXT, city TEXT)", table),
+            )
+            .await
+            .unwrap();
             for (n, city) in [("1", "SH"), ("2", "BJ"), ("3", "SZ")] {
                 run_dispatch(
                     &crm,
@@ -1550,7 +1651,12 @@ mod tests {
             database_type: "sqlite".into(),
             schema: String::new(),
             table: "orders".into(),
-            columns: vec!["id".into(), "user_id".into(), "amount".into(), "status".into()],
+            columns: vec![
+                "id".into(),
+                "user_id".into(),
+                "amount".into(),
+                "status".into(),
+            ],
             column_types: col_types(&[
                 ("id", "INTEGER"),
                 ("user_id", "INTEGER"),
@@ -1592,12 +1698,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(padded.warnings.len(), 1, "{:?}", padded.warnings);
-        assert!(padded.warnings[0].contains("INTEGER"), "{}", padded.warnings[0]);
-        assert!(padded.warnings[0].contains("TEXT"), "{}", padded.warnings[0]);
-        let padded_payload =
-            report_view_render(padded.view, padded.datasets, vec![shop.clone(), crm.clone()], None)
-                .await
-                .unwrap();
+        assert!(
+            padded.warnings[0].contains("INTEGER"),
+            "{}",
+            padded.warnings[0]
+        );
+        assert!(
+            padded.warnings[0].contains("TEXT"),
+            "{}",
+            padded.warnings[0]
+        );
+        let padded_payload = report_view_render(
+            padded.view,
+            padded.datasets,
+            vec![shop.clone(), crm.clone()],
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             padded_payload.charts[0].categories.is_empty(),
             "告警说这种写法配不上，结果它画出了图——告警在瞎报"
@@ -1615,10 +1733,14 @@ mod tests {
             "既然下面就要出行，告警不能再断言一行都配不上：{}",
             plain.warnings[0]
         );
-        let plain_payload =
-            report_view_render(plain.view, plain.datasets, vec![shop.clone(), crm.clone()], None)
-                .await
-                .unwrap();
+        let plain_payload = report_view_render(
+            plain.view,
+            plain.datasets,
+            vec![shop.clone(), crm.clone()],
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             plain_payload.charts[0].categories.len(),
             3,
@@ -1629,7 +1751,10 @@ mod tests {
         // 同族连接键：既不告警，也必须真的出三行
         let good = ai::check_draft(
             ai::parse_draft(&raw("users", "id")).unwrap(),
-            &[orders, right("users", &[("id", "INTEGER"), ("city", "TEXT")])],
+            &[
+                orders,
+                right("users", &[("id", "INTEGER"), ("city", "TEXT")]),
+            ],
         )
         .unwrap();
         assert!(good.warnings.is_empty(), "{:?}", good.warnings);

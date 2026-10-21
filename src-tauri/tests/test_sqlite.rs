@@ -54,19 +54,23 @@ async fn sqlite_smoke_crud_tagged_cells() {
     .expect("create table");
 
     // 插入测试数据
-    sqlx::query(
-        "INSERT INTO smoke VALUES (1, 42, 12.34, 'hello', NULL, X'DEADBEEF')",
-    )
-    .execute(&pool)
-    .await
-    .expect("insert");
+    sqlx::query("INSERT INTO smoke VALUES (1, 42, 12.34, 'hello', NULL, X'DEADBEEF')")
+        .execute(&pool)
+        .await
+        .expect("insert");
 
     // 查询并验证 tagged cell 格式
-    let rows: Vec<(i64, Option<i64>, Option<f64>, Option<String>, Option<String>, Option<Vec<u8>>)> =
-        sqlx::query_as("SELECT id, int_val, real_val, text_val, null_val, blob_val FROM smoke")
-            .fetch_all(&pool)
-            .await
-            .expect("query smoke");
+    let rows: Vec<(
+        i64,
+        Option<i64>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+    )> = sqlx::query_as("SELECT id, int_val, real_val, text_val, null_val, blob_val FROM smoke")
+        .fetch_all(&pool)
+        .await
+        .expect("query smoke");
 
     assert_eq!(rows.len(), 1, "应有 1 行");
     let (id, int_val, real_val, text_val, null_val, blob_val) = &rows[0];

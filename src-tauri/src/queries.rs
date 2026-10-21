@@ -4,8 +4,8 @@
 // `{ schemaVersion, revision, updatedAt, payload, checksum }`，
 // 加载时校验 schemaVersion 与 checksum；不匹配则返回 Err，
 // 防止加载到损坏数据后误存空数组（A12 / DB-09）。
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 use crate::{ConnectionRecord, QueryHistoryItem, SavedQuery, SavedReport};
 
@@ -18,8 +18,9 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
             .map_err(|e| format!("创建自定义数据目录失败: {} ({})", d.display(), e))?;
         return Ok(d);
     }
-    let mut dir = dirs::data_local_dir()
-        .ok_or_else(|| "无法解析本地数据目录；请设置 Z_BIZ_TOOL_DB_DATA_DIR 环境变量".to_string())?;
+    let mut dir = dirs::data_local_dir().ok_or_else(|| {
+        "无法解析本地数据目录；请设置 Z_BIZ_TOOL_DB_DATA_DIR 环境变量".to_string()
+    })?;
     dir.push("z-biz-tool-db");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("创建默认数据目录失败: {} ({})", dir.display(), e))?;
@@ -82,13 +83,10 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| format!("目标路径无父目录: {}", path.display()))?;
-    std::fs::create_dir_all(dir)
-        .map_err(|e| format!("创建目录失败: {} ({})", dir.display(), e))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {} ({})", dir.display(), e))?;
     let tmp = dir.join(format!(
         ".{}.swap.{}",
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file"),
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
         std::process::id()
     ));
     {
@@ -98,8 +96,14 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
             let _ = f.sync_all();
         }
     }
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("原子替换失败: {} -> {} ({})", tmp.display(), path.display(), e))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        format!(
+            "原子替换失败: {} -> {} ({})",
+            tmp.display(),
+            path.display(),
+            e
+        )
+    })?;
     Ok(())
 }
 
@@ -126,14 +130,17 @@ fn backup_previous_version(path: &Path) -> Result<(), String> {
     }
     let backup_path = path.with_extension(format!(
         "{}.bak.v{}",
-        path.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("json"),
+        path.extension().and_then(|s| s.to_str()).unwrap_or("json"),
         prev
     ));
     if !backup_path.exists() {
         std::fs::copy(path, &backup_path).map_err(|e| {
-            format!("升级前备份失败: {} -> {} ({})", path.display(), backup_path.display(), e)
+            format!(
+                "升级前备份失败: {} -> {} ({})",
+                path.display(),
+                backup_path.display(),
+                e
+            )
         })?;
     }
     Ok(())
@@ -190,9 +197,9 @@ where
             ));
         }
         // 反序列化 payload 为 T
-        return serde_json::from_value::<T>(env.payload).map(Some).map_err(|e| {
-            format!("envelope payload 反序列化为目标类型失败: {}", e)
-        });
+        return serde_json::from_value::<T>(env.payload)
+            .map(Some)
+            .map_err(|e| format!("envelope payload 反序列化为目标类型失败: {}", e));
     }
 
     // 2) 兼容 v1：裸数组/T，按迁移分支迁移到 v2 envelope
@@ -233,7 +240,6 @@ fn next_revision_for(path: &Path) -> Result<u64, String> {
     std::fs::write(&rev_path, next.to_string()).map_err(|e| e.to_string())?;
     Ok(next)
 }
-
 
 /// S0：写入前剥离敏感字段（DB-08 / A10）
 fn strip_secrets_from_connections(records: &mut Vec<ConnectionRecord>) {
@@ -410,7 +416,12 @@ mod tests {
     #[test]
     fn checksum_mismatch_is_rejected() {
         let path = fresh_path("env-corrupt.json");
-        save_envelope(&path, &vec!["a".to_string(), "b".to_string()], CURRENT_SCHEMA_VERSION).unwrap();
+        save_envelope(
+            &path,
+            &vec!["a".to_string(), "b".to_string()],
+            CURRENT_SCHEMA_VERSION,
+        )
+        .unwrap();
         // 手工注入坏 checksum
         let raw = std::fs::read_to_string(&path).unwrap();
         let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -471,10 +482,14 @@ mod tests {
         let path = fresh_path("env-legacy.json");
         // 直接写入 v1 格式（裸数组）
         std::fs::write(&path, "[1,2,3,4]").unwrap();
-        let payload = load_envelope::<Vec<i32>>(&path, CURRENT_SCHEMA_VERSION).unwrap().unwrap();
+        let payload = load_envelope::<Vec<i32>>(&path, CURRENT_SCHEMA_VERSION)
+            .unwrap()
+            .unwrap();
         assert_eq!(payload, vec![1, 2, 3, 4]);
         // 二次加载应命中 envelope
-        let payload2 = load_envelope::<Vec<i32>>(&path, CURRENT_SCHEMA_VERSION).unwrap().unwrap();
+        let payload2 = load_envelope::<Vec<i32>>(&path, CURRENT_SCHEMA_VERSION)
+            .unwrap()
+            .unwrap();
         assert_eq!(payload2, vec![1, 2, 3, 4]);
         let _ = std::fs::remove_file(&path);
     }
@@ -491,7 +506,8 @@ mod tests {
     #[test]
     fn revision_increments_on_save() {
         let path = fresh_path("env-rev.json");
-        save_envelope::<HashMap<String, i32>>(&path, &HashMap::new(), CURRENT_SCHEMA_VERSION).unwrap();
+        save_envelope::<HashMap<String, i32>>(&path, &HashMap::new(), CURRENT_SCHEMA_VERSION)
+            .unwrap();
         let r1 = next_revision_for(&path).unwrap();
         let r2 = next_revision_for(&path).unwrap();
         assert!(r2 > r1, "revision 应单调递增: {} {}", r1, r2);

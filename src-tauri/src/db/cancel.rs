@@ -10,8 +10,8 @@
 // - 不允许前端伪造 queryId 触发任意取消：queryId 必须能匹配到本进程缓存中的 in-flight 单子。
 
 use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CancelState {
