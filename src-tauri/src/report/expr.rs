@@ -1228,7 +1228,10 @@ mod tests {
         let r = row(&[
             ("a", Value::Null),
             ("b", Value::Int(5)),
-            ("f", Value::Float(1.61803)),
+            // 用标准库常量而不是手写的近似值：手写 `1.61803` 会被 clippy 的
+            // `approx_constant` 判成 GOLDEN_RATIO 的近似值（CI 的 clippy 1.99 才认，
+            // 本机 0.1.98 认不出来 ⇒ 只能靠 CI 咬住）。常量写法从根上消掉这个近似。
+            ("f", Value::Float(std::f64::consts::GOLDEN_RATIO)),
         ]);
         assert_eq!(ev("COALESCE(a, b, 0)", &["a", "b", "f"], &r), Value::Int(5));
         assert_eq!(ev("NULLIF(b, 5)", &["a", "b", "f"], &r), Value::Null);
