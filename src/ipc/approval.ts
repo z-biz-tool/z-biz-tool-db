@@ -30,10 +30,18 @@ export function extractParameterNames(sql: string): string[] {
 }
 
 export interface PendingApproval {
+  /**
+   * **要被摘要绑定的那段文本**。
+   *
+   * 多数时候是一条 SQL 全文；CSV 导入是「表 + 行数」的规范串
+   * （由后端 csv_import_plan 给出，前端不自己拼）。
+   */
   sql: string;
   environment: string;
   issuedAt: number;
   ttlSec: number;
+  /** 给人看的说明（标题 + 细节）；**不参与摘要**，可空 */
+  display?: { title: string; detail: string };
 }
 
 export function buildGrant(p: PendingApproval): ApprovalGrant {

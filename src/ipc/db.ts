@@ -38,10 +38,22 @@ export interface ApprovalGrant {
   consumed: boolean;
 }
 
-/** 简单的 sql 摘要，与后端 `security::digest_sql` 保持一致 */
+/**
+ * 简单的 sql 摘要，与后端 `security::digest_sql` 保持一致。
+ *
+ * ⚠ **长度口径必须是「字符数（Unicode 码点）」**。
+ *
+ * 2026-10-22 实测修复：这里原来用 `sql.length`（**UTF-16 单元**），
+ * 而后端用 `sql.len()`（**字节数**）⇒ 含中文的 SQL 两端摘要**必然不一样**
+ * ⇒ 用户明明批过了，后端却以 `SqlMismatch` 拒掉（"审批 sql_digest 与请求不匹配"）。
+ *
+ * 现在两端统一成码点数：TS `Array.from(sql).length` ↔ Rust `sql.chars().count()`。
+ * 黄金向量在 `tests/digestContract.test.ts`（TS）与
+ * `src-tauri/src/security.rs`（Rust）各钉一份**同样的字面量** ⇒ 改一边必有一边红。
+ */
 export function digestSql(sql: string): string {
-  const head = Array.from(sql).slice(0, 64).join("");
-  return `len=${sql.length}|head=${head}`;
+  const chars = Array.from(sql);
+  return `len=${chars.length}|head=${chars.slice(0, 64).join("")}`;
 }
 
 /** 检查审批是否仍可用 */

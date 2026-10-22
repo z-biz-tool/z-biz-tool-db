@@ -1179,11 +1179,23 @@ async fn sqlite_run(pool: &SqlitePool, sql: &str) -> Result<RunOutput, String> {
 
 // 统一分发执行
 async fn run_dispatch(cfg: &DBConfig, sql: &str) -> Result<RunOutput, String> {
-    match dispatch_db_type(cfg)? {
-        "mysql" => mysql_run(&mysql_pool(cfg).await?, sql).await,
-        "postgresql" => pg_run(&pg_pool(cfg).await?, sql).await,
-        "sqlite" => sqlite_run(&sqlite_pool(cfg).await?, sql).await,
-        _ => Err("不支持的数据库类型".to_string()),
+    run_dispatch_mode(cfg, sql, "readOnly").await
+}
+
+/// 按访问模式选池执行。
+///
+/// 为什么要带 mode：池的缓存键含 access_mode（只读池与可写池是两个池）。
+/// **写入必须走可写池** —— 走只读池对 SQLite/PG 照样能写（连接本身没有只读属性），
+/// 但那等于把写操作挂在一个名为「只读」的池上，后面对账时口径就乱了。
+async fn run_dispatch_mode(
+    cfg: &DBConfig,
+    sql: &str,
+    access_mode: &str,
+) -> Result<RunOutput, String> {
+    match pooled(cfg, access_mode).await? {
+        crate::db::connection::AnyPool::MySql(p) => mysql_run(&p, sql).await,
+        crate::db::connection::AnyPool::Pg(p) => pg_run(&p, sql).await,
+        crate::db::connection::AnyPool::Sqlite(p) => sqlite_run(&p, sql).await,
     }
 }
 
@@ -2061,7 +2073,7 @@ async fn query_cancel_v2(
 /// 背压：批次队列容量是 `MAX_QUEUE_BATCHES`，`send().await` 在队列满时**等待**
 /// ⇒ 前端不取，生产者就停在这儿（内存不会一路涨）。
 macro_rules! stream_rows {
-    ($pool:expr, $sql:expr, $max_rows:expr, $tx:expr, $shared:expr, $cell_fn:path) => {{
+    ($pool:expr, $sql:expr, $max_rows:expr, $tx:expr, $shared:expr, $cell_fn:path, $query_id:expr) => {{
         use futures_util::TryStreamExt;
         let mut conn = match $pool.acquire().await {
             Ok(c) => c,
@@ -2081,6 +2093,18 @@ macro_rules! stream_rows {
         let mut total = 0u64;
         let mut truncated = false;
         loop {
+            // 取消检查：每批问一次「要不要停」。
+            // 少了这一句，界面上的「取消」按钮对流式查询完全无效 ——
+            // 因为流式这一路**不经过** execute_query 的那条在途表生命周期，
+            // 取消请求没人理会，生产者会一路把库读到底。
+            if crate::db::cancel::in_flight().is_cancel_requested($query_id) {
+                let mut sh = $shared.lock().unwrap_or_else(|p| p.into_inner());
+                sh.state = db::session::QueryState::Cancelled;
+                sh.done = true;
+                // 被取消 ⇒ 缓冲里那半批**不推**了（用户已经不要这份结果了）
+                rows.clear();
+                break;
+            }
             let row = match stream.try_next().await {
                 Ok(Some(r)) => r,
                 Ok(None) => break,
@@ -2153,7 +2177,13 @@ macro_rules! stream_rows {
         sh.truncated = truncated || sh.truncated;
         sh.pushed_rows += sent;
         sh.columns = meta;
-        sh.state = db::session::QueryState::Succeeded;
+        // 被取消时**不能**改写成 Succeeded —— 消费者据此知道这流是"被叫停"的，
+        // 而不是"跑完了"。写错了界面就会把一次取消报成一次成功。
+        sh.state = if sh.state == db::session::QueryState::Cancelled {
+            db::session::QueryState::Cancelled
+        } else {
+            db::session::QueryState::Succeeded
+        };
     }};
 }
 
@@ -2197,6 +2227,15 @@ async fn query_start(
     let stream_id = db::session::next_query_id();
     gate_execution(&sql, &mode, approval.as_ref(), classification, &stream_id)?;
 
+    // 取消协议：流式查询**也必须**登记到在途表 ——
+    // `query_cancel_v2` 查的就是这张表。不登记 ⇒ 取消永远「查无此单」，
+    // 界面上的「取消」按钮对流式查询**完全无效**（2026-10-22 实测）。
+    crate::db::cancel::in_flight().register(
+        &config.id,
+        stream_id.clone(),
+        security::digest_sql(&sql),
+    );
+
     let max_rows = max_rows.map(|m| m as usize);
     let (tx, rx) = tokio::sync::mpsc::channel(db::session::MAX_QUEUE_BATCHES);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(db::session::StreamShared::default()));
@@ -2235,18 +2274,52 @@ async fn query_start(
     })?;
     let shared_task = shared.clone();
     let sql_task = sql.clone();
+    // 生产者要用同一个 id 去问「要不要停」，结束时要用同一个 id 把它从在途表摘掉
+    let cancel_id = stream_id.clone();
     tokio::spawn(async move {
-        match pool {
-            crate::db::connection::AnyPool::MySql(p) => {
-                stream_rows!(p, &sql_task, max_rows, tx_task, shared_task, mysql_cell)
+        // 包一层内层 async 块：宏里的 `return` 只退出这一层，
+        // 外层的「从在途表摘掉」才不会被跳过。
+        let run = async {
+            match pool {
+                crate::db::connection::AnyPool::MySql(p) => {
+                    stream_rows!(
+                        p,
+                        &sql_task,
+                        max_rows,
+                        tx_task,
+                        shared_task,
+                        mysql_cell,
+                        &cancel_id
+                    )
+                }
+                crate::db::connection::AnyPool::Pg(p) => {
+                    stream_rows!(
+                        p,
+                        &sql_task,
+                        max_rows,
+                        tx_task,
+                        shared_task,
+                        pg_cell,
+                        &cancel_id
+                    )
+                }
+                crate::db::connection::AnyPool::Sqlite(p) => {
+                    stream_rows!(
+                        p,
+                        &sql_task,
+                        max_rows,
+                        tx_task,
+                        shared_task,
+                        sqlite_cell,
+                        &cancel_id
+                    )
+                }
             }
-            crate::db::connection::AnyPool::Pg(p) => {
-                stream_rows!(p, &sql_task, max_rows, tx_task, shared_task, pg_cell)
-            }
-            crate::db::connection::AnyPool::Sqlite(p) => {
-                stream_rows!(p, &sql_task, max_rows, tx_task, shared_task, sqlite_cell)
-            }
-        }
+        };
+        run.await;
+        // 流结束（正常跑完 / 出错 / 被取消）⇒ 从在途表摘掉。
+        // 这一单若曾请求过取消，finish() 返回 Confirmed（取消已生效）。
+        let _ = crate::db::cancel::in_flight().finish(&cancel_id);
     });
 
     // 等第一批：拿到它才知道列长什么样
@@ -2520,10 +2593,22 @@ async fn execute_batch(
     approval: Option<security::ApprovalGrant>,
 ) -> Result<Vec<QueryResult>, String> {
     let mode = access_mode.unwrap_or_else(|| "readOnly".to_string());
-    if mode == "readOnly" {
-        return Err(
-            "批量接口当前为只读模式；写入请使用 execute_query 并显式开启可写授权".to_string(),
-        );
+    // 批量接口**只做只读**。
+    //
+    // 为什么：审批摘要是一对一的 —— `security::evaluate` 会核对
+    // `grant.sql_digest == digest_sql(sql)`，一条 grant 只对一个语句。
+    // 原来这里把**同一个** grant 传给每条语句 ⇒ 第二条必然报 SqlMismatch；
+    // 而只读模式又被这里直接拒掉 ⇒ 这个接口从来没能真正用起来
+    // （报错文案写的是「批量接口当前为只读模式」，代码却拒的是 readOnly，**自相矛盾**）。
+    //
+    // 现在口径明确：**批量 = 一批只读语句**。写语句请用 execute_query 逐条执行
+    // （每条各自审批）。每条语句仍然过 `gate_execution` 的只读判据，
+    // 所以混进来的写语句会被当场挡下，不会因为"批量"而绕过门禁。
+    //
+    // ⚠ 错误**必须带机器可读码**（READONLY_BLOCKED）：前端按码分类，
+    // 不带码的话界面只能显示"未知错误"，用户不知道自己该切只读还是该逐条执行。
+    if mode != "readOnly" {
+        return Err(db::ipc::ApiError::readonly_blocked("Batch", "Writable").to_wire());
     }
     let mut out = Vec::new();
     for q in queries {
@@ -2886,24 +2971,57 @@ async fn import_connections(
     Ok(export.connections)
 }
 
-// T-047：CSV 预览
-// 返回前 N 行预览数据，包括编码检测、列头、行数据
+// T-047：CSV 导入计划（预览 + 审批摘要的规范串）
+//
+// 这个命令存在的理由不是"给界面看几行"，而是**把审批摘要要绑的那份文本交出去**：
+// 导入的 INSERT 是按文件内容动态拼的，前端自己拼摘要输入必然和后端对不上。
+// ⇒ canonical 由后端算，前端原样拿去算 digest。
 #[command]
-async fn csv_preview(
+async fn csv_import_plan(
     file_path: String,
     delimiter: Option<String>,
-    limit: Option<usize>,
-) -> Result<db::csv_import::PreviewResult, String> {
+    sample_limit: Option<usize>,
+    import_limit: Option<usize>,
+    table_name: String,
+) -> Result<db::csv_import::ImportPlan, String> {
     let bytes = std::fs::read(&file_path).map_err(|e| format!("读取文件失败: {}", e))?;
     let delim = delimiter
         .map(|s| s.chars().next().unwrap_or(','))
         .unwrap_or(',');
-    let lim = limit.unwrap_or(10);
-    db::csv_import::preview_csv(&bytes, delim, lim)
+    let sl = sample_limit.unwrap_or(db::csv_import::DEFAULT_SAMPLE_LIMIT);
+    let il = import_limit.unwrap_or(db::csv_import::DEFAULT_IMPORT_LIMIT);
+    db::csv_import::plan_import(&bytes, delim, sl, il, &table_name)
 }
 
-// T-047：CSV 导入（预览确认后调用）
-// 返回导入结果：成功行数、失败行数、错误信息
+/// CSV 导入的**写门禁**参数（access_mode + 审批 + 期望行数）。
+///
+/// 为什么要打包成一个结构：
+/// - `csv_import_execute` 本来就有 5 个参数，再加三个门禁参数就超过
+///   clippy 的阈值（8/7）⇒ 一条 warning 挂在 CI 的 `-D warnings` 硬门上；
+/// - 打包之后语义更清楚：**这三个是一个整体，要么都给，要么都不给**
+///   （漏给 access_mode 就退化成只读 ⇒ 被拒，这是安全的方向）。
+///
+/// ⚠ 字段是 **snake_case**：这是 serde 结构体字段，不是 Tauri 的顶层命令参数
+/// （顶层参数在 JS 侧要写 camelCase，嵌套字段按 serde 原样）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ImportGate {
+    /// "writable" 才放行；别的值（含缺省）一律按只读拒
+    pub access_mode: Option<String>,
+    /// 写入审批（摘要绑定「表 + 真正会写入的行数」）
+    pub approval: Option<security::ApprovalGrant>,
+    /// 预览时看到的行数；与实际解析出的行数不一致 ⇒ 拒
+    pub expected_rows: Option<u64>,
+}
+
+// T-047：CSV 导入（预览确认 + 审批通过后调用）
+//
+// 门禁与 `execute_query` 同源，但**摘要绑的不是 SQL 全文**：
+// 导入的 INSERT 是按文件内容动态拼的，一条 grant 绑不住 N 条 INSERT
+// ⇒ 审批摘要绑「表 + 真正会写入的行数」（canonical 由 csv_import_plan 给出）。
+// 三道门：
+// 1) 只读通道直接拒（导入永远是写）；
+// 2) 行数与审批时对不上 ⇒ 拒（文件在预览之后被改过）；
+// 3) 摘要对不上 ⇒ 拒（换表 / 换文件 / 伪造 grant）。
 #[command]
 async fn csv_import_execute(
     config: DBConfig,
@@ -2911,14 +3029,32 @@ async fn csv_import_execute(
     table_name: String,
     delimiter: Option<String>,
     limit: Option<usize>,
-    dry_run: Option<bool>,
+    gate: Option<ImportGate>,
 ) -> Result<db::csv_import::ImportResult, String> {
+    let query_id = uuid::Uuid::new_v4().to_string();
+    let gate = gate.unwrap_or(ImportGate {
+        access_mode: None,
+        approval: None,
+        expected_rows: None,
+    });
+    let mode = gate.access_mode.unwrap_or_else(|| "readOnly".to_string());
+
+    // 导入**永远是写**。只读通道直接拒，不留"预览通道顺手写进去"的口子。
+    if mode != "writable" {
+        return Err(db::ipc::ApiError::new(
+            db::ipc::CODE_READONLY_BLOCKED,
+            "csv_import_execute",
+            "只读模式拒绝 CSV 导入（导入会写数据）",
+        )
+        .with_query_id(&query_id)
+        .to_wire());
+    }
+
     let bytes = std::fs::read(&file_path).map_err(|e| format!("读取文件失败: {}", e))?;
     let delim = delimiter
         .map(|s| s.chars().next().unwrap_or(','))
         .unwrap_or(',');
-    let lim = limit.unwrap_or(1000);
-    let dry = dry_run.unwrap_or(false);
+    let lim = limit.unwrap_or(db::csv_import::DEFAULT_IMPORT_LIMIT);
 
     let (headers, rows) = db::csv_import::parse_csv(&bytes, delim, lim)?;
 
@@ -2926,15 +3062,50 @@ async fn csv_import_execute(
         return Err("CSV 文件没有列头".to_string());
     }
 
-    if dry {
-        return Ok(db::csv_import::ImportResult {
-            success: true,
-            rows_imported: 0,
-            rows_failed: 0,
-            errors: vec!["预览模式，未实际导入".to_string()],
-            preview: rows,
-        });
+    // 真正会写入的行数：必须与 csv_import_plan 给出的 import_rows 同口径。
+    let import_rows = rows.len() as u64;
+
+    // 行数与审批时对不上 ⇒ 用户在审批弹窗里看到的"写多少行"已经不算数了。
+    // （摘要也会对不上，这里先查是为了给用户一句能看懂的话。）
+    if let Some(expected) = gate.expected_rows {
+        if expected != import_rows {
+            return Err(db::ipc::ApiError::new(
+                db::ipc::CODE_APPROVAL_DENIED,
+                "csv_import_execute",
+                &format!(
+                    "CSV 行数与审批时不一致（审批 {} 行，实际解析出 {} 行）⇒ 文件在预览之后变了，重新预览再导入",
+                    expected, import_rows
+                ),
+            )
+            .with_query_id(&query_id)
+            .to_wire());
+        }
     }
+
+    // 审批：摘要绑「表 + 行数」
+    let canonical = db::csv_import::import_canonical(&table_name, import_rows);
+    let env = gate
+        .approval
+        .as_ref()
+        .map(|g| g.environment.as_str())
+        .unwrap_or("unknown");
+    security::evaluate(
+        gate.approval.as_ref(),
+        db::sql_classify::StatementKind::Dml,
+        db::sql_classify::SafetyClass::Write,
+        &canonical,
+        chrono::Utc::now().timestamp(),
+        env,
+    )
+    .map_err(|e| {
+        db::ipc::ApiError::new(
+            db::ipc::CODE_APPROVAL_DENIED,
+            "csv_import_execute",
+            &format!("审批校验失败: {}", e.message()),
+        )
+        .with_query_id(&query_id)
+        .to_wire()
+    })?;
 
     // 构造 INSERT 语句（简化版：列名直接拼接）
     let cols = headers
@@ -2964,7 +3135,7 @@ async fn csv_import_execute(
             table_name, cols, values
         );
 
-        match run_dispatch(&config, &sql).await {
+        match run_dispatch_mode(&config, &sql, "writable").await {
             Ok(_) => imported += 1,
             Err(e) => {
                 errors.push(format!("第 {} 行: {}", idx + 2, e));
@@ -2977,7 +3148,6 @@ async fn csv_import_execute(
         rows_imported: imported,
         rows_failed: errors.len() as u64,
         errors,
-        preview: vec![],
     })
 }
 
@@ -3339,7 +3509,7 @@ pub fn run() {
             ai_explain_sql,
             ai_diagnose_error,
             close_pool,
-            csv_preview,
+            csv_import_plan,
             csv_import_execute,
             keyset_query,
             report::source::report_dataset_validate,
@@ -4855,6 +5025,126 @@ mod tests {
         assert!(!truncated, "没设 max_rows，不该报截断");
     }
 
+    /// 流式查询**也必须**登记到在途表 ——
+    /// `query_cancel_v2` 查的就是这张表；不登记 ⇒ 取消永远「查无此单」，
+    /// 界面上的「取消」按钮对流式查询**完全无效**（2026-10-22 实测并修复）。
+    #[tokio::test]
+    async fn streaming_query_is_registered_for_cancel() {
+        let (c, _dir) = cfg_isolated("stream-cancel-reg");
+        exec_w(
+            "CREATE TABLE stream_c (id INTEGER PRIMARY KEY, v TEXT)",
+            c.clone(),
+        )
+        .await
+        .expect("建表");
+        // 插够多的行，让生产者**卡在队列上**（队列只有 MAX_QUEUE_BATCHES 格）——
+        // 只有生产者还活着，在途表里的那一单才在；否则查询早跑完了，
+        // 「查无此单」是**正确**的（已经结束的东西不用取消）。
+        let mut vals = String::new();
+        for i in 0..3000 {
+            if i > 0 {
+                vals.push(',');
+            }
+            vals.push_str(&format!("({},'x')", i));
+        }
+        exec_w(
+            &format!("INSERT INTO stream_c (id, v) VALUES {}", vals),
+            c.clone(),
+        )
+        .await
+        .expect("插入");
+
+        let start = query_start(
+            c.clone(),
+            "SELECT id FROM stream_c ORDER BY id".to_string(),
+            Some("readOnly".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("起流");
+
+        // ① 在途表里查得到（生产者还卡着 ⇒ 这一单还在跑）
+        let st = crate::db::cancel::in_flight().status(&start.stream_id);
+        assert!(
+            st.is_some(),
+            "流式查询没进在途表 ⇒ 取消永远查无此单（界面的取消按钮等于没有）"
+        );
+        // ② 取消被受理，而不是「查无此单」
+        let resp = crate::db::cancel::in_flight().cancel(&start.stream_id);
+        assert_eq!(
+            resp.state,
+            crate::db::cancel::CancelState::Accepted,
+            "取消应被受理，实际 {:?}：{}",
+            resp.state,
+            resp.message
+        );
+        // ③ 受理之后，生产者问得到「该停了」
+        assert!(
+            crate::db::cancel::in_flight().is_cancel_requested(&start.stream_id),
+            "取消受理后，is_cancel_requested 必须为真，否则生产者会一路读到底"
+        );
+
+        // 收尾：摘掉在途表，别影响别的用例
+        let _ = crate::db::cancel::in_flight().finish(&start.stream_id);
+    }
+
+    /// 被取消的流，流状态必须是 Cancelled 而不是 Succeeded ——
+    /// 写错了界面就会把一次「用户叫停」报成一次「跑完了」。
+    #[tokio::test]
+    async fn cancelled_stream_is_not_reported_as_succeeded() {
+        let (c, _dir) = cfg_isolated("stream-cancel-state");
+        exec_w(
+            "CREATE TABLE stream_s (id INTEGER PRIMARY KEY, v TEXT)",
+            c.clone(),
+        )
+        .await
+        .expect("建表");
+        let mut vals = String::new();
+        for i in 0..3000 {
+            if i > 0 {
+                vals.push(',');
+            }
+            vals.push_str(&format!("({},'x')", i));
+        }
+        exec_w(
+            &format!("INSERT INTO stream_s (id, v) VALUES {}", vals),
+            c.clone(),
+        )
+        .await
+        .expect("插入");
+
+        let start = query_start(
+            c.clone(),
+            "SELECT id FROM stream_s ORDER BY id".to_string(),
+            Some("readOnly".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("起流");
+        let _ = crate::db::cancel::in_flight().cancel(&start.stream_id);
+
+        // 取消是在生产者下一次循环开头才生效的 ⇒ 它此刻还卡在 send 上，
+        // 得**消费**掉队列里的批，它才有机会跑到那行检查。
+        let mut saw_cancelled = false;
+        while let Some(_b) = query_next(start.stream_id.clone()).await.expect("取下一批") {
+            if let Some(entry) = db::session::streams().get(&start.stream_id).await {
+                let sh = entry.shared.lock().unwrap_or_else(|p| p.into_inner());
+                if sh.state == db::session::QueryState::Cancelled {
+                    saw_cancelled = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_cancelled,
+            "被取消的流必须报 Cancelled（报成 Succeeded ⇒ 界面把一次取消显示成一次成功）"
+        );
+    }
+
     /// T-031：max_rows 到了要**如实**说"后面还有"，不能装作取全了。
     #[tokio::test]
     async fn stream_query_reports_truncation_at_max_rows() {
@@ -4959,10 +5249,15 @@ mod tests {
         );
     }
 
-    /// 批量接口也必须过同一道门（改之前它只判 access_mode，完全不查审批）。
+    /// 批量接口**不许写** —— 改之前它只判 access_mode，完全不查审批。
+    ///
+    /// 现在的口径比原来**更强**：批量只做只读（一条 grant 只对一个 sql_digest，
+    /// 一个审批覆盖多条语句在语义上就是错的）。所以断言也跟着走事实，
+    /// 但**强度不许降**：① 错误必须带机器可读码；② 批量里仍然不可能出现未经审批的写。
     #[tokio::test]
     async fn execute_batch_requires_approval_for_writes() {
         let (c, _dir) = cfg_isolated("batch-approval");
+        // ① 可写模式的批量 ⇒ 拒，且带机器可读码
         let err = execute_batch(
             vec!["CREATE TABLE batch_t (id INTEGER)".to_string()],
             c.clone(),
@@ -4970,12 +5265,53 @@ mod tests {
             None,
         )
         .await
-        .expect_err("可写模式下的写操作必须有审批");
+        .expect_err("批量不许写");
         assert!(
-            err.contains("APPROVAL_DENIED"),
+            err.contains("READONLY_BLOCKED"),
             "错误要带机器可读码，实际: {}",
             err
         );
+
+        // ② 只读批量里混进写语句 ⇒ 同样被门禁挡下（证明批量不是绕过审批的后门）
+        let err = execute_batch(
+            vec!["CREATE TABLE batch_t2 (id INTEGER)".to_string()],
+            c.clone(),
+            Some("readOnly".to_string()),
+            None,
+        )
+        .await
+        .expect_err("只读批量里的写语句必须被挡");
+        assert!(
+            err.contains("READONLY_BLOCKED"),
+            "只读批量里的写必须被只读门禁挡下，实际: {}",
+            err
+        );
+    }
+
+    /// 批量只读是**能用**的：多条只读语句应当逐条跑完并各带一份结果。
+    /// （改之前批量接口的只读分支直接报错 ⇒ 这个接口从来没真正用起来过。）
+    #[tokio::test]
+    async fn execute_batch_runs_readonly_statements() {
+        let (c, _dir) = cfg_isolated("batch-readonly");
+        exec_w("CREATE TABLE batch_r (id INTEGER)", c.clone())
+            .await
+            .expect("建表");
+        exec_w("INSERT INTO batch_r (id) VALUES (1)", c.clone())
+            .await
+            .expect("插入");
+        let results = execute_batch(
+            vec![
+                "SELECT id FROM batch_r".to_string(),
+                "SELECT COUNT(*) AS n FROM batch_r".to_string(),
+            ],
+            c.clone(),
+            Some("readOnly".to_string()),
+            None,
+        )
+        .await
+        .expect("只读批量应当能跑");
+        assert_eq!(results.len(), 2, "两条语句各带一份结果");
+        assert_eq!(results[0].rows.len(), 1, "第一条应当取到 1 行");
     }
 
     /// T-043：同一条连接上的**第二个** BEGIN 不能被状态机拒死。
@@ -5190,6 +5526,180 @@ mod tests {
             "改连接参数后旧池应已在保存时被关掉"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+    // ================== T-047：CSV 导入门禁 ==================
+
+    /// 写一个临时 CSV，返回文件路径
+    fn write_csv(dir: &std::path::Path, name: &str, content: &str) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, content).expect("写 CSV");
+        p.to_string_lossy().to_string()
+    }
+
+    /// 只读通道必须拒导入（导入永远是写）
+    #[tokio::test]
+    async fn csv_import_readonly_mode_blocked() {
+        let (c, dir) = cfg_isolated("csv-ro");
+        let path = write_csv(&dir, "a.csv", "id,name\n1,x\n");
+        let err = csv_import_execute(
+            c,
+            path,
+            "t".into(),
+            None,
+            None,
+            Some(ImportGate {
+                access_mode: Some("readOnly".into()),
+                approval: None,
+                expected_rows: None,
+            }),
+        )
+        .await
+        .expect_err("只读模式必须拒绝导入");
+        assert!(err.contains("READONLY_BLOCKED"), "要带机器可读码: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 可写但没审批 ⇒ 拒
+    #[tokio::test]
+    async fn csv_import_requires_approval() {
+        let (c, dir) = cfg_isolated("csv-noappr");
+        let path = write_csv(&dir, "a.csv", "id,name\n1,x\n");
+        let err = csv_import_execute(
+            c,
+            path,
+            "t".into(),
+            None,
+            None,
+            Some(ImportGate {
+                access_mode: Some("writable".into()),
+                approval: None,
+                expected_rows: None,
+            }),
+        )
+        .await
+        .expect_err("写入必须审批");
+        assert!(err.contains("APPROVAL_DENIED"), "要带机器可读码: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 摘要绑的是别的表 ⇒ 摘要对不上 ⇒ 拒
+    #[tokio::test]
+    async fn csv_import_rejects_wrong_digest() {
+        let (c, dir) = cfg_isolated("csv-digest");
+        let path = write_csv(&dir, "a.csv", "id,name\n1,x\n");
+        let grant = grant_for("CSV_IMPORT table=other rows=1");
+        let err = csv_import_execute(
+            c,
+            path,
+            "t".into(),
+            None,
+            None,
+            Some(ImportGate {
+                access_mode: Some("writable".into()),
+                approval: Some(grant),
+                expected_rows: Some(1),
+            }),
+        )
+        .await
+        .expect_err("摘要不符必须拒");
+        assert!(err.contains("APPROVAL_DENIED"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 行数与审批时对不上 ⇒ 拒（文件在预览之后被改过）
+    #[tokio::test]
+    async fn csv_import_rejects_row_count_mismatch() {
+        let (c, dir) = cfg_isolated("csv-rows");
+        let path = write_csv(&dir, "a.csv", "id,name\n1,x\n2,y\n");
+        let grant = grant_for("CSV_IMPORT table=t rows=2");
+        let err = csv_import_execute(
+            c,
+            path,
+            "t".into(),
+            None,
+            None,
+            Some(ImportGate {
+                access_mode: Some("writable".into()),
+                approval: Some(grant),
+                expected_rows: Some(99),
+            }),
+        )
+        .await
+        .expect_err("行数对不上必须拒");
+        assert!(err.contains("行数"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 带合法审批的导入：真写进库，且内容一字不差
+    #[tokio::test]
+    async fn csv_import_with_valid_grant_writes_rows() {
+        let (c, dir) = cfg_isolated("csv-ok");
+        let path = write_csv(&dir, "a.csv", "id,name\n1,张三\n2,李四\n");
+        exec_w("CREATE TABLE t (id INTEGER, name TEXT)", c.clone())
+            .await
+            .expect("建表");
+
+        // canonical 由后端出（前端不自己拼）
+        let plan = csv_import_plan(path.clone(), None, Some(20), Some(1000), "t".into())
+            .await
+            .expect("出计划");
+        assert_eq!(plan.import_rows, 2);
+        assert_eq!(plan.canonical, "CSV_IMPORT table=t rows=2");
+
+        let grant = grant_for(&plan.canonical);
+        let res = csv_import_execute(
+            c.clone(),
+            path,
+            "t".into(),
+            None,
+            Some(plan.import_limit),
+            Some(ImportGate {
+                access_mode: Some("writable".into()),
+                approval: Some(grant),
+                expected_rows: Some(plan.import_rows),
+            }),
+        )
+        .await
+        .expect("带审批的导入应当成功");
+        assert!(res.success, "导入失败: {:?}", res.errors);
+        assert_eq!(res.rows_imported, 2);
+
+        // 真落库了，而且中文没乱码
+        let r = exec_q("SELECT name FROM t ORDER BY id", c, None)
+            .await
+            .expect("查导入结果");
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(
+            r.rows[0][0],
+            serde_json::json!({"__kind": "text", "value": "张三"})
+        );
+        assert_eq!(
+            r.rows[1][0],
+            serde_json::json!({"__kind": "text", "value": "李四"})
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 计划里的 import_rows 必须与真导入时的行数一致（摘要绑的就是这个数）
+    #[tokio::test]
+    async fn csv_plan_import_rows_matches_execute() {
+        let (c, dir) = cfg_isolated("csv-plan");
+        let path = write_csv(&dir, "a.csv", "id,name\n1,x\n2,y\n3,z\n\n4,w\n");
+        let plan = csv_import_plan(path.clone(), None, Some(2), Some(1000), "t".into())
+            .await
+            .expect("出计划");
+        // 空行不插入 ⇒ 计划说 4 行，不是 5 行
+        assert_eq!(plan.import_rows, 4);
+        assert_eq!(plan.total_rows, 5, "原始行数仍是 5");
+        assert_eq!(plan.sample_rows.len(), 2, "样本行按 sample_limit 截断");
+
+        let (headers, rows) =
+            db::csv_import::parse_csv(&std::fs::read(&path).unwrap(), ',', plan.import_limit)
+                .expect("解析");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(rows.len() as u64, plan.import_rows, "计划与执行必须同口径");
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(c);
     }
 }
 

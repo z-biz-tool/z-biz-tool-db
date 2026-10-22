@@ -37,6 +37,14 @@ import {
   type BuiltStatement,
 } from "./ipc/changeCommit";
 import { classifyError, errorDescription } from "./ipc/errors";
+import { splitStatementTexts } from "./ipc/sqlStatements";
+import {
+  CSV_IMPORT_LIMIT,
+  CSV_SAMPLE_LIMIT,
+  defaultTableName,
+  describeImport,
+} from "./ipc/csvImport";
+import type { CsvImportPlan, CsvImportResult } from "./ipc/csvImport";
 
 interface ExportedConnection {
   name: string;
@@ -245,7 +253,8 @@ interface ColumnInfo {
   data_type: string;
   nullable: boolean;
   is_primary: boolean;
-  default_value: Option<string>;
+  /** Rust 的 `Option<String>` 在 JSON 里是 `null` —— 别把 Rust 类型抄进 TS。 */
+  default_value: string | null;
 }
 
 interface TableInfo {
@@ -270,10 +279,29 @@ interface SavedQuery {
   id: string;
   name: string;
   sql: string;
-  description: Option<string>;
+  /** Rust 的 `Option<String>` 在 JSON 里是 `null` —— 别把 Rust 类型抄进 TS。 */
+  description: string | null;
   tags: string[];
   created_at: number;
   updated_at: number;
+}
+
+/** 流式启动结果（后端 db::session::QueryBatch / QueryStreamStart） */
+interface QueryBatchV2 {
+  seq: number;
+  columns: ColumnMeta[];
+  rows: TaggedCell[][];
+  truncated: boolean;
+  affected_rows: number;
+}
+
+interface QueryStreamStartV2 {
+  stream_id: string;
+  columns: ColumnMeta[];
+  first_batch: QueryBatchV2;
+  state: string;
+  pushed_rows: number;
+  truncated: boolean;
 }
 
 function App() {
@@ -510,10 +538,14 @@ function App() {
         const r = await invoke<QueryResultV2>("execute_query", {
           sql: st.sql,
           config: toBackendConfig(selectedConnection),
-          access_mode: "writable",
+          // Tauri v2 的命令参数按 **camelCase** 收（宏把 Rust 的 snake_case 转过去，
+          // 运行时只查 camelCase 的 key）—— 传 snake_case 会被**静默丢掉**（Option ⇒ None），
+          // 之前就是因此让 accessMode 恒为空 ⇒ mode 恒为 "readOnly" ⇒ 写操作全被只读门禁挡掉。
+          // 钉子：src-tauri/tests/tauriArgNaming.rs（真跑 IPC 通道）+ tests/ipcContract.test.ts
+          accessMode: "writable",
           approval: grant,
-          expected_generation: null,
-          max_rows: null,
+          expectedGeneration: null,
+          maxRows: null,
         });
         if (Number(r?.affected_rows ?? 0) === 0) {
           failures.push(`第 ${st.rowIndexes[0] + 1} 行：0 行受影响，这行可能已被别人改走或删掉`);
@@ -737,14 +769,27 @@ function App() {
   const [pendingGrant, setPendingGrant] = useState<ApprovalGrant | null>(null);
   const approvalPendingRef = useRef<((g: ApprovalGrant | null) => void) | null>(null);
 
-  const requestApproval = (sql: string, environment: string): Promise<ApprovalGrant | null> =>
+  /**
+   * 弹审批窗，等用户点头。
+   *
+   * `subject` 是**要被摘要绑定的那段文本**（SQL 全文，或 CSV 导入的
+   * 「表 + 行数」规范串）—— 审批摘要就是对它算的，所以它必须与后端
+   * 将要执行/写入的东西**逐字一致**。
+   * `display` 只是给人看的说明，不参与摘要。
+   */
+  const requestApproval = (
+    subject: string,
+    environment: string,
+    display?: { title: string; detail: string }
+  ): Promise<ApprovalGrant | null> =>
     new Promise((resolve) => {
       const ttlSec = 60;
       const pending: PendingApproval = {
-        sql,
+        sql: subject,
         environment,
         issuedAt: Math.floor(Date.now() / 1000),
         ttlSec,
+        display,
       };
       setPendingApproval(pending);
       setPendingGrant(null);
@@ -808,10 +853,12 @@ function App() {
       const result = await invoke<QueryResultV2>("execute_query", {
         sql: sqlCode,
         config: toBackendConfig(selectedConnection),
-        access_mode: wantWrite ? "writable" : "readOnly",
+        // camelCase —— 见上面那处 invoke 的注释（Tauri v2 只认 camelCase 的 key，
+        // snake_case 会被静默丢掉 ⇒ accessMode 恒空 ⇒ mode 恒为 "readOnly"）。
+        accessMode: wantWrite ? "writable" : "readOnly",
         approval: grant ?? null,
-        expected_generation: null,
-        max_rows: rowCap > 0 ? rowCap : null,
+        expectedGeneration: null,
+        maxRows: rowCap > 0 ? rowCap : null,
       });
 
       // 异步校验：标签或连接已切走 → 丢弃结果
@@ -931,6 +978,340 @@ function App() {
       () => msgApi.success("已复制"),
       () => msgApi.error("复制失败")
     );
+  };
+
+  // ── 执行计划（EXPLAIN）─────────────────────────────────────────────
+  //
+  // 后端一直有 explain_query，界面上从没有入口 —— 一条 SQL 慢下来时，
+  // 用户没有第二条腿可走（只能猜）。后端会拒 EXPLAIN ANALYZE（那会真执行 SQL），
+  // 所以这里传的是**不带 EXPLAIN 前缀**的原始语句。
+  const explainQuery = async () => {
+    if (!selectedConnection) {
+      msgApi.warning("请先连接数据库");
+      return;
+    }
+    try {
+      const result = await invoke<QueryResultV2>("explain_query", {
+        sql: sqlCode,
+        config: toBackendConfig(selectedConnection),
+      });
+      setQueryColumnsMeta(result.column_meta ?? []);
+      setQueryResults(result.rows || []);
+      setResultSource(null);
+      setResultMeta(
+        result.truncated
+          ? { total: Number(result.total_rows || 0), shown: result.rows?.length || 0 }
+          : null
+      );
+      msgApi.success(
+        `已取执行计划（${result.rows?.length || 0} 行）—— 这是执行计划，不是查询结果`
+      );
+    } catch (e: any) {
+      msgApi.error(`取执行计划失败：${errorDescription(classifyError(String(e)))}`);
+    }
+  };
+
+  // ── 批量执行（只读）───────────────────────────────────────────────
+  //
+  // 后端**拒绝**多语句单次执行（那是审批/只读门禁的防绕过设计），
+  // 所以「批量」= 前端把编辑器拆成一条条，逐条交给 execute_batch。
+  // 口径：批量只做只读 —— 一条 grant 只对一个 sql_digest，
+  // 一个审批覆盖多条语句在语义上就是错的（⇒ 写语句请用「执行」逐条来）。
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchResults, setBatchResults] = useState<
+    { sql: string; ok: boolean; message: string }[] | null
+  >(null);
+  const [showBatchModal, setShowBatchModal] = useState(false);
+
+  const runBatch = async () => {
+    if (!selectedConnection) {
+      msgApi.warning("请先连接数据库");
+      return;
+    }
+    const statements = splitStatementTexts(sqlCode);
+    if (statements.length === 0) {
+      msgApi.warning("编辑器里没有可执行的语句");
+      return;
+    }
+    if (statements.length === 1) {
+      msgApi.info("只有一条语句，直接用「执行」即可");
+      return;
+    }
+    // 先自己把写语句挑出来 —— 让用户在**动手之前**就知道哪条不行，
+    // 而不是跑到第 3 条才报一句 READONLY_BLOCKED。
+    const writes = statements
+      .map((s, i) => ({ s, i }))
+      .filter((x) => isLikelyWriteSql(x.s));
+    if (writes.length > 0) {
+      msgApi.warning({
+        content: `第 ${writes.map((w) => w.i + 1).join("、")} 条是写语句，批量执行只做只读。写操作请用「执行」逐条来（每条各自审批）`,
+        duration: 6,
+      });
+      return;
+    }
+    setBatchRunning(true);
+    setBatchResults(null);
+    try {
+      const results = await invoke<QueryResultV2[]>("execute_batch", {
+        queries: statements,
+        config: toBackendConfig(selectedConnection),
+        // camelCase（Tauri v2 只认 camelCase 的 key）
+        accessMode: "readOnly",
+        approval: null,
+      });
+      setBatchResults(
+        results.map((r, i) => ({
+          sql: statements[i] ?? "",
+          ok: true,
+          message: `${r.rows?.length ?? 0} 行`,
+        }))
+      );
+      setShowBatchModal(true);
+      msgApi.success(`批量执行完成：${results.length} 条语句`);
+    } catch (e: any) {
+      msgApi.error(`批量执行失败：${errorDescription(classifyError(String(e)))}`);
+    } finally {
+      setBatchRunning(false);
+    }
+  };
+
+  // ── 流式执行 ─────────────────────────────────────────────────────
+  //
+  // 后端把结果分批推过来（不一次性把十万行塞进内存），
+  // 界面上给出**进度**与**取消**两个动作 ——
+  // 没有取消的流式查询，用户只能等它把库读完。
+  const [streamRunning, setStreamRunning] = useState(false);
+  const [streamInfo, setStreamInfo] = useState<{
+    streamId: string;
+    rows: number;
+    batches: number;
+  } | null>(null);
+
+  const runStreaming = async () => {
+    if (!selectedConnection) {
+      msgApi.warning("请先连接数据库");
+      return;
+    }
+    const requestConnId = selectedConnection.id;
+    const requestTabId = activeTabId;
+    const wantWrite = writeAccessEnabled;
+    const likelyWrite = isLikelyWriteSql(sqlCode);
+    let grant: ApprovalGrant | null | undefined = undefined;
+    if (wantWrite && likelyWrite) {
+      grant = await requestApproval(sqlCode, (selectedConnection as any).environment ?? "unknown");
+      if (!grant) {
+        msgApi.info("写入操作已取消");
+        return;
+      }
+    }
+    setStreamRunning(true);
+    setStreamInfo(null);
+    try {
+      const start = await invoke<QueryStreamStartV2>("query_start", {
+        config: toBackendConfig(selectedConnection),
+        sql: sqlCode,
+        accessMode: wantWrite ? "writable" : "readOnly",
+        approval: grant ?? null,
+        expectedGeneration: null,
+        maxRows: rowCap > 0 ? rowCap : null,
+      });
+      const allRows: any[][] = [];
+      let batches = 0;
+      const columns = start.columns ?? [];
+      let push = (b: { rows?: any[][]; truncated?: boolean }) => {
+        if (b.rows?.length) allRows.push(...b.rows);
+        batches += 1;
+      };
+      push(start.first_batch);
+      let truncated = Boolean(start.first_batch?.truncated);
+      // 一批一批取；取完为止
+      for (;;) {
+        const b = await invoke<QueryBatchV2 | null>("query_next", { streamId: start.stream_id });
+        if (!b) break;
+        push(b);
+        truncated = truncated || Boolean(b.truncated);
+        setStreamInfo({ streamId: start.stream_id, rows: allRows.length, batches });
+      }
+      if (requestConnId !== selectedConnection?.id || requestTabId !== activeTabId) {
+        msgApi.warning("连接或标签已切换，结果已丢弃");
+        return;
+      }
+      setQueryColumnsMeta(columns as any);
+      setQueryResults(allRows);
+      setResultSource(null);
+      setResultMeta(
+        truncated ? { total: Number(allRows.length), shown: allRows.length } : null
+      );
+      setStreamInfo({ streamId: start.stream_id, rows: allRows.length, batches });
+      msgApi.success(
+        `流式完成：${allRows.length} 行 / ${batches} 批${truncated ? "（已达行数上限，后面还有）" : ""}`
+      );
+    } catch (e: any) {
+      msgApi.error(`流式执行失败：${errorDescription(classifyError(String(e)))}`);
+    } finally {
+      setStreamRunning(false);
+    }
+  };
+
+  // 取消正在跑的流
+  const cancelStream = async () => {
+    const sid = streamInfo?.streamId;
+    if (!sid) return;
+    try {
+      const resp = await invoke<{ state: string; message: string }>("query_cancel_v2", {
+        queryId: sid,
+      });
+      // 后端回的是 V2Envelope 信封
+      const inner = (resp as any)?.data ?? resp;
+      if (inner?.state === "accepted" || inner?.state === "Accepted") {
+        msgApi.info("已请求取消，等待查询停下");
+      } else if (inner?.state === "not_found" || inner?.state === "NotFound") {
+        msgApi.info("这一单已经跑完了，没什么可取消的");
+      } else {
+        msgApi.info(inner?.message ?? "取消请求已发出");
+      }
+    } catch (e: any) {
+      msgApi.error(`取消失败：${errorDescription(classifyError(String(e)))}`);
+    }
+  };
+
+  // ── 查当前这一单的状态 ───────────────────────────────────────────
+  const [queryStatus, setQueryStatus] = useState<string>("");
+  const showQueryStatus = async () => {
+    const sid = streamInfo?.streamId;
+    if (!sid) {
+      msgApi.info("还没有可查的查询");
+      return;
+    }
+    try {
+      const resp = await invoke<any>("query_status_v2", { queryId: sid });
+      const inner = resp?.data ?? resp;
+      const text = `${inner?.state ?? "?"}：${inner?.message ?? ""}`;
+      setQueryStatus(text);
+      msgApi.info(text);
+    } catch (e: any) {
+      msgApi.error(`查状态失败：${errorDescription(classifyError(String(e)))}`);
+    }
+  };
+
+  // ── CSV 导入 ─────────────────────────────────────────────────────
+  //
+  // 流程：选文件 → 看计划（编码 + 置信度 + 列名 + 样本行 + **真正会写多少行**）
+  //      → 改表名（改了要重新出计划）→ 写入审批 → 导入。
+  //
+  // 为什么要有「写入审批」这一步：导入是写操作，而后端 csv_import_execute
+  // **只认带审批的请求**（access_mode=writable + 摘要绑「表 + 行数」）。
+  // 不走审批 ⇒ 后端直接拒 —— 界面不会拿到一个"看起来成功、其实没写"的结果。
+  const [csvPlan, setCsvPlan] = useState<CsvImportPlan | null>(null);
+  const [csvPath, setCsvPath] = useState("");
+  const [csvImporting, setCsvImporting] = useState(false);
+
+  /** 出计划：canonical 由后端算，前端不自己拼 */
+  const loadCsvPlan = async (path: string, table: string) => {
+    const plan = await invoke<CsvImportPlan>("csv_import_plan", {
+      filePath: path,
+      delimiter: null,
+      sampleLimit: CSV_SAMPLE_LIMIT,
+      importLimit: CSV_IMPORT_LIMIT,
+      tableName: table,
+    });
+    setCsvPlan(plan);
+    setCsvPath(path);
+  };
+
+  const pickCsvAndPreview = async () => {
+    if (!selectedConnection) {
+      msgApi.warning("请先连接数据库");
+      return;
+    }
+    if (!writeAccessEnabled) {
+      msgApi.warning("当前是只读模式，导入需要先把右上角的「只读」切到「可写」");
+      return;
+    }
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({
+        multiple: false,
+        filters: [{ name: "CSV", extensions: ["csv", "tsv", "txt"] }],
+      });
+      if (typeof picked !== "string") return;
+      await loadCsvPlan(picked, defaultTableName(picked));
+    } catch (e: any) {
+      msgApi.error(`读 CSV 失败：${errorDescription(classifyError(String(e)))}`);
+    }
+  };
+
+  /** 改目标表名 ⇒ 必须重新出计划（canonical 绑的是表名 + 行数） */
+  const renameCsvTarget = async (table: string) => {
+    if (!csvPath) return;
+    try {
+      await loadCsvPlan(csvPath, table);
+    } catch (e: any) {
+      msgApi.error(`改表名后重新出计划失败：${errorDescription(classifyError(String(e)))}`);
+    }
+  };
+
+  const doCsvImport = async () => {
+    if (!csvPlan || !selectedConnection) return;
+    setCsvImporting(true);
+    try {
+      // ① 先审批：摘要绑「表 + 真正会写入的行数」
+      const grant = await requestApproval(
+        csvPlan.canonical,
+        (selectedConnection as any).environment ?? "unknown",
+        {
+          title: "确认 CSV 导入",
+          detail: describeImport(csvPlan),
+        }
+      );
+      if (!grant) {
+        msgApi.info("导入已取消");
+        return;
+      }
+      // ② 再导入
+      const res = await invoke<CsvImportResult>("csv_import_execute", {
+        config: toBackendConfig(selectedConnection),
+        filePath: csvPath,
+        // 表名取**计划里的**那份，不是界面上的草稿 ——
+        // 摘要绑的就是它，两者必须一字不差。
+        tableName: csvPlan.table_name,
+        delimiter: null,
+        limit: csvPlan.import_limit,
+        // 门禁三项打包成一个结构（嵌套字段走 serde ⇒ snake_case）
+        gate: {
+          access_mode: "writable",
+          approval: grant,
+          expected_rows: csvPlan.import_rows,
+        },
+      });
+      if (res?.success) {
+        msgApi.success(
+          `已导入 ${res.rows_imported} 行${res.rows_failed ? `，失败 ${res.rows_failed} 行` : ""}`
+        );
+        setCsvPlan(null);
+        setCsvPath("");
+      } else {
+        msgApi.error(
+          `导入失败：${(res?.errors ?? []).slice(0, 3).join("；") || "后端没给出原因"}`
+        );
+      }
+    } catch (e: any) {
+      msgApi.error(`导入失败：${errorDescription(classifyError(String(e)))}`);
+    } finally {
+      setCsvImporting(false);
+    }
+  };
+
+  // ── 清空查询历史 ─────────────────────────────────────────────────
+  const clearHistory = async () => {
+    try {
+      await invoke("clear_query_history");
+    } catch (e: any) {
+      msgApi.error(`清空历史失败：${e}`);
+      return;
+    }
+    setHistory([]);
+    msgApi.success("已清空查询历史");
   };
 
   // 转换为后端 DBConfig（Rust 侧字段为 db_type）
@@ -1728,31 +2109,53 @@ function App() {
     }
   };
 
-  // 保存常用查询
-  const saveAsSavedQuery = (values: any) => {
+  // 保存常用查询 —— T-017 接通后端持久化
+  //
+  // ⚠ 这里以前是个**假成功**：只往 React state 里塞一条，然后弹「已保存到常用查询」，
+  // 刷新页面就没了（后端的 save_query 一直注册着、没人调）。
+  // 现在改成真落盘：**先写后端，写成功才更新界面**；写失败就报错，
+  // 界面保持原样 —— 宁可让用户重试，也不假装存上了。
+  const saveAsSavedQuery = async (values: any) => {
     const now = Math.floor(Date.now() / 1000);
+    const item: SavedQuery = editingSavedQuery
+      ? { ...editingSavedQuery, ...values, updated_at: now }
+      : {
+          id: `sq-${Date.now()}`,
+          name: values.name,
+          sql: values.sql || sqlCode,
+          description: values.description || null,
+          tags: values.tags || [],
+          created_at: now,
+          updated_at: now,
+        };
+    try {
+      await invoke("save_query", { item });
+    } catch (e: any) {
+      msgApi.error(`保存常用查询失败：${e}`);
+      return;
+    }
     if (editingSavedQuery) {
-      setSavedQueries(
-        savedQueries.map((q) =>
-          q.id === editingSavedQuery.id ? { ...q, ...values, updated_at: now } : q
-        )
-      );
+      setSavedQueries(savedQueries.map((q) => (q.id === item.id ? item : q)));
       msgApi.success("已更新");
     } else {
-      const newQ: SavedQuery = {
-        id: `sq-${Date.now()}`,
-        name: values.name,
-        sql: values.sql || sqlCode,
-        description: values.description || null,
-        tags: values.tags || [],
-        created_at: now,
-        updated_at: now,
-      };
-      setSavedQueries([...savedQueries, newQ]);
+      setSavedQueries([...savedQueries, item]);
       msgApi.success("已保存到常用查询");
     }
     setShowSaveQueryModal(false);
     setEditingSavedQuery(null);
+  };
+
+  // 删除常用查询 —— 同样要真落盘。
+  // 以前只从内存里删（后端记录还在），刷新页面它又回来了。
+  const deleteSavedQuery = async (id: string) => {
+    try {
+      await invoke("delete_saved_query", { id });
+    } catch (e: any) {
+      msgApi.error(`删除常用查询失败：${e}`);
+      return;
+    }
+    setSavedQueries(savedQueries.filter((s) => s.id !== id));
+    msgApi.success("已删除");
   };
 
   // 加载保存的查询
@@ -2209,6 +2612,72 @@ function App() {
                           >
                             格式化
                           </Button>
+                          <Tooltip title="看这条语句的执行计划（不写 EXPLAIN 前缀，后端会自己加）">
+                            <Button
+                              size="small"
+                              icon={<DashboardOutlined />}
+                              onClick={explainQuery}
+                              style={{ borderRadius: 6 }}
+                            >
+                              执行计划
+                            </Button>
+                          </Tooltip>
+                          <Tooltip title="把编辑器里的多条语句逐条执行（只读；写语句请用「执行」逐条来）">
+                            <Button
+                              size="small"
+                              icon={<SnippetsOutlined />}
+                              onClick={runBatch}
+                              loading={batchRunning}
+                              style={{ borderRadius: 6 }}
+                            >
+                              批量
+                            </Button>
+                          </Tooltip>
+                          <Tooltip title="流式执行：结果分批取回，大结果集不会一次性塞满内存">
+                            <Button
+                              size="small"
+                              icon={<ThunderboltOutlined />}
+                              onClick={runStreaming}
+                              loading={streamRunning}
+                              style={{ borderRadius: 6 }}
+                            >
+                              流式
+                            </Button>
+                          </Tooltip>
+                          {streamRunning && (
+                            <Tooltip title="请求取消这一单（后端会真的把查询停掉）">
+                              <Button
+                                size="small"
+                                danger
+                                onClick={cancelStream}
+                                style={{ borderRadius: 6 }}
+                              >
+                                取消
+                              </Button>
+                            </Tooltip>
+                          )}
+                          {streamInfo && !streamRunning && (
+                            <Tooltip title={queryStatus || "查这一单的状态"}>
+                              <Button
+                                size="small"
+                                type="text"
+                                onClick={showQueryStatus}
+                                style={{ borderRadius: 6, fontSize: 12 }}
+                              >
+                                状态 {streamInfo.rows} 行/{streamInfo.batches} 批
+                              </Button>
+                            </Tooltip>
+                          )}
+                          <Tooltip title="从 CSV 文件导入数据（先看计划与真正写入的行数，写入审批后才落库；需要「可写」模式）">
+                            <Button
+                              size="small"
+                              icon={<UploadOutlined />}
+                              onClick={pickCsvAndPreview}
+                              style={{ borderRadius: 6 }}
+                            >
+                              导入 CSV
+                            </Button>
+                          </Tooltip>
                           <Button
                             size="small"
                             icon={<CopyOutlined />}
@@ -2401,14 +2870,24 @@ function App() {
                           children: (
                             <div style={{ maxHeight: "calc(100vh - 200px)", overflow: "auto" }}>
                               {/* T-035: 历史搜索和过滤 */}
-                              <Input
-                                placeholder="搜索 SQL 或连接名称..."
-                                prefix={<SearchOutlined style={{ color: "#aaa" }} />}
-                                size="small"
-                                allowClear
-                                style={{ marginBottom: 8 }}
-                                onChange={(e) => setHistorySearch(e.target.value.toLowerCase())}
-                              />
+                              <Space style={{ marginBottom: 8, width: "100%" }}>
+                                <Input
+                                  placeholder="搜索 SQL 或连接名称..."
+                                  prefix={<SearchOutlined style={{ color: "#aaa" }} />}
+                                  size="small"
+                                  allowClear
+                                  style={{ flex: 1 }}
+                                  onChange={(e) => setHistorySearch(e.target.value.toLowerCase())}
+                                />
+                                <Tooltip title="清空历史（会真的删掉落盘的那份）">
+                                  <Button
+                                    size="small"
+                                    icon={<DeleteOutlined />}
+                                    onClick={clearHistory}
+                                    disabled={history.length === 0}
+                                  />
+                                </Tooltip>
+                              </Space>
                               {history
                                 .filter((h) => {
                                   if (!historySearch) return true;
@@ -2510,12 +2989,9 @@ function App() {
                                           }}
                                         />
                                         <DeleteOutlined
-                                          onClick={(e) => {
+                                          onClick={async (e) => {
                                             e.stopPropagation();
-                                            setSavedQueries(
-                                              savedQueries.filter((s) => s.id !== q.id)
-                                            );
-                                            msgApi.success("已删除");
+                                            await deleteSavedQuery(q.id);
                                           }}
                                         />
                                       </Space>
@@ -3321,7 +3797,7 @@ function App() {
         title={
           <Space>
             <Tag color="orange">写入审批</Tag>
-            <span>确认高风险 SQL</span>
+            <span>{pendingApproval?.display?.title ?? "确认高风险 SQL"}</span>
           </Space>
         }
         onCancel={() => {
@@ -3348,7 +3824,10 @@ function App() {
             <Alert
               type="warning"
               showIcon
-              title="此 SQL 包含写入/危险子句，需要显式审批"
+              title={
+                pendingApproval.display?.detail ??
+                "此 SQL 包含写入/危险子句，需要显式审批"
+              }
               description={
                 <span>
                   环境：
@@ -3409,6 +3888,110 @@ function App() {
                 { title: "数据库", dataIndex: "database", key: "database" },
               ]}
             />
+          </Space>
+        )}
+      </Modal>
+
+      {/* 批量执行结果 Modal */}
+      <Modal
+        open={showBatchModal}
+        title={`批量执行结果（${batchResults?.length ?? 0} 条）`}
+        onCancel={() => setShowBatchModal(false)}
+        footer={[
+          <Button key="close" onClick={() => setShowBatchModal(false)}>
+            关闭
+          </Button>,
+        ]}
+        width={820}
+      >
+        <Table
+          size="small"
+          dataSource={batchResults ?? []}
+          rowKey={(_, i) => String(i)}
+          pagination={false}
+          columns={[
+            {
+              title: "#",
+              key: "idx",
+              width: 48,
+              render: (_: any, __: any, i: number) => i + 1,
+            },
+            {
+              title: "语句",
+              key: "sql",
+              render: (r: any) => (
+                <Text code style={{ fontSize: 12 }}>
+                  {r.sql.length > 120 ? `${r.sql.slice(0, 120)}…` : r.sql}
+                </Text>
+              ),
+            },
+            {
+              title: "结果",
+              key: "msg",
+              width: 120,
+              render: (r: any) => (
+                <Tag color={r.ok ? "green" : "red"}>{r.ok ? r.message : r.message}</Tag>
+              ),
+            },
+          ]}
+        />
+      </Modal>
+
+      {/* CSV 导入计划 Modal —— 先看，再写 */}
+      <Modal
+        open={!!csvPlan}
+        title="导入 CSV（确认后才会写入数据库）"
+        onCancel={() => {
+          setCsvPlan(null);
+          setCsvPath("");
+        }}
+        onOk={doCsvImport}
+        okText="确认导入"
+        cancelText="取消"
+        confirmLoading={csvImporting}
+        okButtonProps={{ disabled: !csvPlan || csvPlan.import_rows === 0 }}
+        width={860}
+      >
+        {csvPlan && (
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
+            <Alert
+              type={csvPlan.encoding_confidence >= 0.8 ? "info" : "warning"}
+              showIcon
+              title={`文件：${csvPath}`}
+              description={
+                `文件共 ${csvPlan.total_rows} 行数据，**真正会写入 ${csvPlan.import_rows} 行**` +
+                `（空行不生成语句）；编码判定 ${csvPlan.encoding}` +
+                `（置信度 ${csvPlan.encoding_confidence.toFixed(2)}）。` +
+                (csvPlan.encoding_confidence < 0.8
+                  ? "置信度偏低，导入后中文可能乱码 —— 先确认编码再导。"
+                  : "下面只预览前几行，确认无误再导入。")
+              }
+            />
+            <Table
+              size="small"
+              dataSource={(csvPlan.sample_rows ?? []).map((r, i) => ({ _k: i, r }))}
+              rowKey="_k"
+              pagination={false}
+              columns={(csvPlan.headers ?? []).map((h, i) => ({
+                title: h,
+                key: `c${i}`,
+                render: (row: any) => row.r[i] ?? "",
+              }))}
+            />
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              将导入到表 <Text code>{csvPlan.table_name}</Text>（表名取自文件名，可在下方改；
+              改完会重新出计划，审批摘要也跟着重算）
+            </Text>
+            <Input
+              size="small"
+              value={csvPlan.table_name}
+              onChange={(e) => renameCsvTarget(e.target.value)}
+              placeholder="目标表名"
+              style={{ width: 320 }}
+            />
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              审批摘要绑定的是：<Text code>{csvPlan.canonical}</Text>
+            </Text>
           </Space>
         )}
       </Modal>

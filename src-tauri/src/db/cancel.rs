@@ -202,6 +202,21 @@ impl InFlightRegistry {
         }
     }
 
+    /// 是否已经请求过取消。
+    ///
+    /// 为什么需要这个「便宜」的查询：流式生产者每批都要问一次「要不要停」，
+    /// 而 `status()` 会顺带算「受理了多久」、拼消息文本 —— 那是给界面看的，
+    /// 放在每批的热路径上纯属浪费。生产者只关心「有没有被要求停」。
+    ///
+    /// 查无此单 ⇒ false（这一单已经结束或从未登记 ⇒ 没有要停的）。
+    pub fn is_cancel_requested(&self, query_id: &str) -> bool {
+        let guard = self.inner.lock().expect("poisoned");
+        guard
+            .get(query_id)
+            .map(|e| e.cancel_requested)
+            .unwrap_or(false)
+    }
+
     /// 作废**某条连接**上的全部在途单子（关连接时用），并把它们交还。
     ///
     /// 返回的单子里 `cancel_requested == true` 的那些 ⇒ 它们的取消**无法确认**

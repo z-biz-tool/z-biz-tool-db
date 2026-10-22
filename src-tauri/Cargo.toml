@@ -45,3 +45,8 @@ futures-util = "0.3"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+# tauri 的 test feature 用来跑真实 IPC 通道（tests/tauriArgNaming.rs）：
+# 把「Tauri v2 怎么收参」变成可复跑的断言，而不是注释里的口头约定。
+tauri = { version = "2", features = ["test"] }
