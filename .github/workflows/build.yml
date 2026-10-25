@@ -142,17 +142,39 @@ jobs:
       - name: Install npm dependencies
         run: npm install
 
+      # 自动更新签名（2026-10-25 接入，详见 z-biz-tool-lead/doc/分发/updater-官方化指南.md）：
+      # tauri.conf.json 里 createUpdaterArtifacts=true + 非空 pubkey 时，tauri build 在没有
+      # TAURI_SIGNING_PRIVATE_KEY 的情况下会**直接报错**（"A public key has been found, but
+      # no private key"）。这里做 fail-soft：缺 secret 就加 --no-sign 跳过签名并打 warning，
+      # 保证密钥未就绪时发布构建不挂；密钥配好后自动恢复签名 + 产出 .sig。
+      - name: Check updater signing secret (fail-soft)
+        id: signing
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "mode=signed" >> "$GITHUB_OUTPUT"
+            echo "extra-args=" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::未配置 TAURI_SIGNING_PRIVATE_KEY：本次发布跳过更新包签名（--no-sign）。配置方法见 z-biz-tool-lead/doc/分发/updater-官方化指南.md"
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+            echo "extra-args=--no-sign" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ steps.signing.outputs.mode == 'signed' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ steps.signing.outputs.mode == 'signed' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: '${{ github.ref_name }}'
           releaseBody: 'See the assets below to download this version.'
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          args: ${{ matrix.args }} ${{ steps.signing.outputs.extra-args }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
