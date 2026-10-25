@@ -5,6 +5,7 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlRow};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
+use tauri::Manager;
 
 #[path = "ai_sql.rs"]
 mod ai_sql;
@@ -3472,6 +3473,15 @@ async fn keyset_query(
 pub fn run() {
     spawn_pool_lifecycle();
     tauri::Builder::default()
+        // 单实例（2026-10-26 分发底座）：第二次启动聚焦已有窗口，不再开新进程。
+        // 必须作为第一个注册的插件（tauri-plugin-single-instance 官方要求）。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
