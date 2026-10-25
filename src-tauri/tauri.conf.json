@@ -26,13 +26,14 @@
   "plugins": {
     "updater": {
       "endpoints": ["https://raw.githubusercontent.com/z-biz-tool/z-biz-tool-db/main/latest.json"],
-      "pubkey": "<TAURI_UPDATER_PUBKEY>",
+      "pubkey": "MTsf5vTXs6yN3b/dJp/RnNCCoGOrFHYXr+07qOP91IU=",
       "//": "pubkey 由 CEO 填入：在 CEO 本机执行 npx @tauri-apps/cli signer generate，把输出里的 Public Key 粘到上一行；私钥存 GitHub Secrets（TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_KEY_PASSWORD），完整流程见 z-biz-tool-lead/doc/分发/updater-官方化指南.md。注：tauri.conf.json 是严格 JSON、不支持 // 行注释，故用 \"//\" 键做旁注（updater 插件会忽略未知字段）。方案与 file 仓保持一致（静态 latest.json + 固定分支 main）。"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
