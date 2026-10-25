@@ -112,7 +112,15 @@ pub fn unseal(
                 Err(e) => {
                     r.password = String::new();
                     r.credential_state = CREDENTIAL_MISSING.to_string();
-                    let reason = if store.persistent() {
+                    let reason = if sref.backend == "inmemory" && store.persistent() {
+                        // 磁盘上的旧引用指向进程内存后端（从不持久化，重启即丢）。
+                        // 必须点名"重新输入"，否则用户只看到"找不到"不知道该干嘛。
+                        format!(
+                            "连接 {} 的密码无法恢复：该凭据由旧版进程内存后端保存，\
+                             重启后即失效，请重新输入密码",
+                            r.name
+                        )
+                    } else if store.persistent() {
                         format!("密钥库中找不到该连接的凭据（{}）：{}", r.name, e)
                     } else {
                         format!(

@@ -3,9 +3,17 @@
 // 落盘只存 SecretRef（索引），绝不存明文；明文只存在于 SecretStore 拿回的
 // 内存对象里，且 PlainSecret 在 drop 时把字节清零。
 //
-// 当前默认后端是 InMemorySecretStore：进程内有效、**跨进程不持久**。
-// 将来在 src-tauri/src/secrets/keychain.rs 里换成 macOS Keychain /
-// Windows DPAPI / Linux Secret Service 实现即可，接口不变。
+// 默认后端：`keychain::select_backend()` —— env ZBIZ_SECRET_BACKEND 可配
+// （keychain | inmemory），缺省 auto：本机 keychain 可用就用 OS 密钥库
+// （macOS Keychain / Windows Credential Manager / Linux Secret Service，
+// 跨进程重启后仍能取回），不可用则回退 InMemorySecretStore 并打 warning。
+// 详见子模块 secrets/keychain.rs；SecretStore trait 本身保持不变。
+
+// 注意 #[path]：lib.rs 用 `#[path = "secrets.rs"]` 挂载本模块，
+// 该属性下子模块按 path 的目录部分解析，`secrets.rs` 没有目录部分，
+// 所以这里必须显式指到 secrets/ 子目录，否则会被解析到 src/keychain.rs。
+#[path = "secrets/keychain.rs"]
+pub mod keychain;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -169,14 +177,13 @@ impl SecretStore for InMemorySecretStore {
 /// 测试无法注入探针后端。这里允许测试整体替换（`install_secret_store_for_test`）。
 static STORE: RwLock<Option<Arc<dyn SecretStore>>> = RwLock::new(None);
 
-/// 取全局 secret store；首次调用时装配默认的内存后端。
+/// 取全局 secret store；首次调用时按 env 装配默认后端（auto：优先 keychain）。
 pub fn secret_store() -> Arc<dyn SecretStore> {
     if let Some(s) = STORE.read().ok().and_then(|g| g.clone()) {
         return s;
     }
     let mut g = STORE.write().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(|| Arc::new(InMemorySecretStore::default()))
-        .clone()
+    g.get_or_insert_with(keychain::select_backend).clone()
 }
 
 /// 仅用于测试：替换全局 secret store，返回被替换掉的那一个（便于还原）。
