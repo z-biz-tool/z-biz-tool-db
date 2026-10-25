@@ -3476,6 +3476,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        // 自动更新（2026-10-25 接入，方案与 z-biz-tool-file 一致）：启动后由前端
+        // UpdaterDialog 延时调用 check()，endpoint 与 pubkey 见 tauri.conf.json。
+        // pubkey 目前是占位符，CEO 填入真实公钥前 check() 会失败并按设计静默降级。
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // 更新安装完成后的「立即重启」
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             test_connection,
             execute_query,

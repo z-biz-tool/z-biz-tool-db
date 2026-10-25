@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from "react";
 import SqlEditor from "./components/SqlEditor";
+import UpdaterGate from "./components/UpdaterDialog";
 import ErrorBoundary from "./components/ErrorBoundary";
 import {
   ConfigProvider,
@@ -3995,6 +3996,9 @@ function App() {
           </Space>
         )}
       </Modal>
+
+      {/* 自动更新闸门：窗口 ready 后延时检查，有更新才弹窗 */}
+      <UpdaterGate />
     </ConfigProvider>
   );
 }
