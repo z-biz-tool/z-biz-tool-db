@@ -3302,7 +3302,10 @@ async fn delete_report(id: String) -> Result<(), String> {
 // - 后台 tokio task 按 TTL 周期回收空闲池（默认 5 分钟，可在 future 提供配置）
 // - 启动时 spawn；进程退出随 Tauri Builder drop 而结束
 fn spawn_pool_lifecycle() {
-    tokio::spawn(async move {
+    // 必须走 tauri::async_runtime：本函数在 `tauri::Builder::run()` 之前调用，
+    // 此刻线程上没有 Tokio 运行时上下文，裸 `tokio::spawn` 会 panic
+    // （"there is no reactor running"）。Tauri 的全局运行时句柄没有这个前提。
+    tauri::async_runtime::spawn(async move {
         let ttl = std::time::Duration::from_secs(5 * 60);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
