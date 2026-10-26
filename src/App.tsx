@@ -683,8 +683,9 @@ function App() {
         setSqlCode(active.sql);
       }
       if (typeof saved.rowCap === "number") setRowCap(saved.rowCap);
-    } catch {
-      // 读不出来就用默认值，别把启动卡在一屏空白上
+    } catch (e) {
+      // 读不出来就用默认值，别把启动卡在一屏空白上；但要留下原因
+      console.warn("[db] 上次的标签/草稿没读出来，本次用默认工作区:", e);
     }
   }, []);
 
@@ -699,8 +700,9 @@ function App() {
             rowCap,
           })
         );
-      } catch {
-        /* 存不下不影响干活 */
+      } catch (e) {
+        /* 存不下不影响干活，但用户下次启动会丢标签，得在控制台留痕 */
+        console.warn("[db] 标签/草稿没写进本地存储（本次会话内仍可用）:", e);
       }
     }, 300);
     return () => clearTimeout(timer);
@@ -827,6 +829,7 @@ function App() {
   } | null>(null);
 
   const [msgApi, msgContext] = message.useMessage();
+  const [modal, modalContext] = Modal.useModal();
 
   // 执行查询
   // T-009：invoke 前快照 connectionId+activeTabId，响应后比对当前状态
@@ -1304,15 +1307,25 @@ function App() {
   };
 
   // ── 清空查询历史 ─────────────────────────────────────────────────
-  const clearHistory = async () => {
-    try {
-      await invoke("clear_query_history");
-    } catch (e: any) {
-      msgApi.error(`清空历史失败：${e}`);
-      return;
-    }
-    setHistory([]);
-    msgApi.success("已清空查询历史");
+  const clearHistory = () => {
+    if (history.length === 0) return;
+    return modal.confirm({
+      title: `清空 ${history.length} 条查询历史？`,
+      content: "本机落盘的查询历史会一起删掉，删了不能恢复；常用查询与编辑器草稿不受影响。",
+      okText: "清空历史",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await invoke("clear_query_history");
+        } catch (e: any) {
+          msgApi.error(`清空历史失败：${e}`);
+          throw e;
+        }
+        setHistory([]);
+        msgApi.success("已清空查询历史");
+      },
+    });
   };
 
   // 转换为后端 DBConfig（Rust 侧字段为 db_type）
@@ -1338,11 +1351,9 @@ function App() {
     [aiConfig]
   );
 
-  // 连接配置落盘
-  const persistConnections = (list: DBConnection[]) => {
-    invoke("save_connections", { connections: list.map(toBackendConfig) }).catch((e) =>
-      msgApi.error(`保存连接配置失败: ${e}`)
-    );
+  // 连接配置落盘。调用方必须等它成功再宣布"已保存"，否则界面在骗人。
+  const persistConnections = async (list: DBConnection[]) => {
+    await invoke("save_connections", { connections: list.map(toBackendConfig) });
   };
 
   // 启动时加载落盘的连接配置
@@ -1368,7 +1379,10 @@ function App() {
           }))
         )
       )
-      .catch(() => {});
+      .catch((e) => {
+        /* 读不出配置不能假装"还没有连接"：用户会以为保存的连接丢了 */
+        msgApi.warning(`读取连接配置失败：${e}（已保存的配置可能还在磁盘上，可以重开应用重试）`);
+      });
   }, []);
 
   // 加载 AI 配置
@@ -1383,7 +1397,9 @@ function App() {
           });
         }
       })
-      .catch(() => {});
+      .catch((e) => {
+        console.warn("[db] AI 配置没读出来，本次按未配置启动:", e);
+      });
   }, []);
 
   // 一次问数用的表目录。列清单读不到的表要丢掉：没有列清单，后端的列校验对那张表形同虚设。
@@ -1935,6 +1951,10 @@ function App() {
     setIsConnected(false);
     setSelectedConnection(null);
     setQueryResults([]);
+    /* 表树和字段属于刚才那条连接，断开后不能继续挂着冒充当前上下文 */
+    setTables([]);
+    setSelectedTable(null);
+    setColumns([]);
     if (conn) {
       try {
         const report = await invoke<any>("close_pool", {
@@ -1950,25 +1970,19 @@ function App() {
     msgApi.info("已断开连接");
   };
 
-  // 保存连接
-  const saveConnection = (values: any) => {
-    if (editingConnection) {
-      const next = connections.map((c) =>
-        c.id === editingConnection.id ? { ...c, ...values } : c
-      );
-      setConnections(next);
-      persistConnections(next);
-      msgApi.success("连接已更新");
-    } else {
-      const newConnection: DBConnection = {
-        id: Date.now().toString(),
-        ...values,
-      };
-      const next = [...connections, newConnection];
-      setConnections(next);
-      persistConnections(next);
-      msgApi.success("连接已创建");
+  // 保存连接：先落盘，成功才更新界面并报成功；落盘失败时弹窗不关，用户不会以为已经存住
+  const saveConnection = async (values: any) => {
+    const next = editingConnection
+      ? connections.map((c) => (c.id === editingConnection.id ? { ...c, ...values } : c))
+      : [...connections, { id: Date.now().toString(), ...values } as DBConnection];
+    try {
+      await persistConnections(next);
+    } catch (e: any) {
+      msgApi.error(`保存连接配置失败：${e}（这次修改没有生效）`);
+      return;
     }
+    setConnections(next);
+    msgApi.success(editingConnection ? "连接已更新" : "连接已创建");
     setShowConnectionModal(false);
     setEditingConnection(null);
     form.resetFields();
@@ -1981,16 +1995,59 @@ function App() {
     setShowConnectionModal(true);
   };
 
-  // 删除连接
+  // 删除连接：确认框写清删的是哪条、会断开什么；先落盘成功再从界面移除
   const deleteConnection = (id: string) => {
-    Modal.confirm({
-      title: "确认删除",
-      content: "确定要删除这个连接吗？",
-      onOk: () => {
+    const target = connections.find((c) => c.id === id);
+    if (!target) return;
+    const isCurrent = selectedConnection?.id === id;
+    const pending = isCurrent ? changeSet.size : 0;
+    const label = target.name || target.database || target.id;
+    return modal.confirm({
+      title: `删除连接「${label}」？`,
+      content: (
+        <div>
+          <p>
+            {target.type} · {target.host || "本地文件"}
+            {target.database ? ` · ${target.database}` : ""}
+          </p>
+          <p>
+            只删除本机保存的连接配置{isCurrent ? "，并先断开当前连接" : ""}；数据库里的数据不受影响。
+          </p>
+          {pending > 0 && (
+            <p style={{ color: "#ff4d4f" }}>
+              当前结果里还有 {pending} 项未提交的网格变更，删除连接会一起丢弃。
+            </p>
+          )}
+        </div>
+      ),
+      okText: "删除连接",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      onOk: async () => {
         const next = connections.filter((c) => c.id !== id);
+        try {
+          await persistConnections(next);
+        } catch (e: any) {
+          msgApi.error(`删除连接失败：${e}（本机配置没有改动）`);
+          throw e;
+        }
         setConnections(next);
-        persistConnections(next);
-        msgApi.success("连接已删除");
+        if (isCurrent) {
+          setIsConnected(false);
+          setSelectedConnection(null);
+          setQueryResults([]);
+          setChangeSet(new Map());
+          setTables([]);
+          setSelectedTable(null);
+          setColumns([]);
+          try {
+            await invoke("close_pool", { connectionId: id, revision: 0 });
+          } catch (e) {
+            /* 配置已删；池没关掉只是后端的会话晚一点释放，不阻塞删除，但要看得到 */
+            console.warn("[db] 删除连接后关闭后端连接池失败:", e);
+          }
+        }
+        msgApi.success(`连接「${label}」已删除`);
       },
     });
   };
@@ -2102,9 +2159,34 @@ function App() {
       msgApi.warning("至少保留一个标签页");
       return;
     }
+    const target = tabs.find((t) => t.id === id);
+    if (!target) return;
+    const isActive = activeTabId === id;
+    // 当前标签的 SQL 以编辑器为准（tabs 里的 sql 只在切换时回写）
+    const draft = isActive ? sqlCode : target.sql;
+    const pending = isActive ? changeSet.size : 0;
+    if (!draft.trim() && pending === 0) {
+      applyCloseTab(id);
+      return;
+    }
+    return modal.confirm({
+      title: `关闭标签「${target.title}」？`,
+      content:
+        pending > 0
+          ? `标签里还有 ${pending} 项未提交的网格变更，关闭会一起丢弃；SQL 草稿也会从本机移除。`
+          : "这个标签的 SQL 草稿没有保存为常用查询，关闭后会从本机移除。",
+      okText: pending > 0 ? "丢弃并关闭" : "关闭标签",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      onOk: () => applyCloseTab(id),
+    });
+  };
+
+  const applyCloseTab = (id: string) => {
     const newTabs = tabs.filter((t) => t.id !== id);
     setTabs(newTabs);
     if (activeTabId === id) {
+      setChangeSet(new Map());
       setActiveTabId(newTabs[0].id);
       setSqlCode(newTabs[0].sql);
     }
@@ -2148,15 +2230,25 @@ function App() {
 
   // 删除常用查询 —— 同样要真落盘。
   // 以前只从内存里删（后端记录还在），刷新页面它又回来了。
-  const deleteSavedQuery = async (id: string) => {
-    try {
-      await invoke("delete_saved_query", { id });
-    } catch (e: any) {
-      msgApi.error(`删除常用查询失败：${e}`);
-      return;
-    }
-    setSavedQueries(savedQueries.filter((s) => s.id !== id));
-    msgApi.success("已删除");
+  const deleteSavedQuery = (id: string) => {
+    const target = savedQueries.find((s) => s.id === id);
+    return modal.confirm({
+      title: `删除常用查询「${target?.name ?? id}」？`,
+      content: "删除后本机落盘的那份也会消失，不能撤销；编辑器里当前的 SQL 不受影响。",
+      okText: "删除",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await invoke("delete_saved_query", { id });
+        } catch (e: any) {
+          msgApi.error(`删除常用查询失败：${e}`);
+          throw e;
+        }
+        setSavedQueries(savedQueries.filter((s) => s.id !== id));
+        msgApi.success("已删除常用查询");
+      },
+    });
   };
 
   // 加载保存的查询
@@ -2336,25 +2428,35 @@ function App() {
                   <Space size="small">
                     {conn.credentialState === "missing" ? (
                       <Tooltip title={conn.credentialNote ?? "密码取不回来了，请重新输入"}>
-                        <WarningOutlined style={{ color: "#faad14" }} />
+                        <WarningOutlined
+                          role="img"
+                          aria-label={conn.credentialNote ?? "密码取不回来了，请重新输入"}
+                          style={{ color: "#faad14" }}
+                        />
                       </Tooltip>
                     ) : null}
-                    <Tooltip title="编辑">
-                      <EditOutlined
+                    <Tooltip title="编辑连接">
+                      <Button
+                        type="text"
+                        size="small"
+                        aria-label={`编辑连接「${conn.name}」`}
+                        icon={<EditOutlined style={{ color: "#1890ff" }} />}
                         onClick={(e) => {
                           e.stopPropagation();
                           editConnection(conn);
                         }}
-                        style={{ color: "#1890ff" }}
                       />
                     </Tooltip>
-                    <Tooltip title="删除">
-                      <DeleteOutlined
+                    <Tooltip title="删除连接">
+                      <Button
+                        type="text"
+                        size="small"
+                        aria-label={`删除连接「${conn.name}」`}
+                        icon={<DeleteOutlined style={{ color: "#ff4d4f" }} />}
                         onClick={(e) => {
                           e.stopPropagation();
                           deleteConnection(conn.id);
                         }}
-                        style={{ color: "#ff4d4f" }}
                       />
                     </Tooltip>
                   </Space>
@@ -2403,16 +2505,24 @@ function App() {
               <Switch
                 checked={darkMode}
                 onChange={setDarkMode}
+                aria-label="深色模式"
                 checkedChildren="🌙"
                 unCheckedChildren="☀️"
               />
               <Space>
                 <Tooltip title="AI 助手">
-                  <Button type="primary" icon={<RobotOutlined />} onClick={openAiAssistant} />
+                  <Button
+                    type="primary"
+                    aria-label="打开 AI 助手"
+                    icon={<RobotOutlined />}
+                    onClick={openAiAssistant}
+                  />
                 </Tooltip>
                 <Tooltip title="AI 服务设置">
-                  <SettingOutlined
-                    style={{ fontSize: "16px", cursor: "pointer" }}
+                  <Button
+                    type="text"
+                    aria-label="打开 AI 服务设置"
+                    icon={<SettingOutlined style={{ fontSize: "16px" }} />}
                     onClick={() => setShowAiConfigModal(true)}
                   />
                 </Tooltip>
@@ -2492,6 +2602,7 @@ function App() {
                           <Button
                             size="small"
                             type="text"
+                            aria-label="刷新表列表"
                             icon={<SyncOutlined />}
                             onClick={refreshTables}
                           />
@@ -2883,6 +2994,7 @@ function App() {
                                 <Tooltip title="清空历史（会真的删掉落盘的那份）">
                                   <Button
                                     size="small"
+                                    aria-label="清空查询历史"
                                     icon={<DeleteOutlined />}
                                     onClick={clearHistory}
                                     disabled={history.length === 0}
@@ -2982,17 +3094,25 @@ function App() {
                                     >
                                       <strong style={{ fontSize: 13 }}>{q.name}</strong>
                                       <Space size={4}>
-                                        <EditOutlined
+                                        <Button
+                                          type="text"
+                                          size="small"
+                                          aria-label={`编辑常用查询「${q.name}」`}
+                                          icon={<EditOutlined />}
                                           onClick={(e) => {
                                             e.stopPropagation();
                                             setEditingSavedQuery(q);
                                             setShowSaveQueryModal(true);
                                           }}
                                         />
-                                        <DeleteOutlined
-                                          onClick={async (e) => {
+                                        <Button
+                                          type="text"
+                                          size="small"
+                                          aria-label={`删除常用查询「${q.name}」`}
+                                          icon={<DeleteOutlined />}
+                                          onClick={(e) => {
                                             e.stopPropagation();
-                                            await deleteSavedQuery(q.id);
+                                            void deleteSavedQuery(q.id);
                                           }}
                                         />
                                       </Space>
@@ -3065,6 +3185,7 @@ function App() {
       </Layout>
 
       {msgContext}
+      {modalContext}
 
       {/* 连接编辑弹窗 */}
       <Modal

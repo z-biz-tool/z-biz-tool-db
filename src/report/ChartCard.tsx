@@ -227,6 +227,7 @@ export function ChartCard({
           <Button
             size="small"
             type="text"
+            aria-label={`导出图表「${chart.title || chart.widget}」为 CSV`}
             icon={<DownloadOutlined />}
             onClick={() => {
               const { headers, rows } = chartCsv(chart);

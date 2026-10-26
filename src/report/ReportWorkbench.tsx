@@ -1739,7 +1739,13 @@ export function ReportWorkbench({
                             okButtonProps={{ danger: true }}
                             onConfirm={() => onDeleteReport(r)}
                           >
-                            <Button size="small" danger type="text" icon={<DeleteOutlined />} />
+                            <Button
+                              size="small"
+                              danger
+                              type="text"
+                              aria-label={`移除报表「${r.name}」`}
+                              icon={<DeleteOutlined />}
+                            />
                           </Popconfirm>,
                         ]}
                       >

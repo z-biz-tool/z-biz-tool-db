@@ -10,7 +10,6 @@ import {
   Space,
   Statistic,
   Typography,
-  message,
 } from "antd";
 import {
   CheckCircleOutlined,
@@ -50,6 +49,7 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
   const [received, setReceived] = useState(0);
   const [total, setTotal] = useState(0);
   const [restarting, setRestarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -72,15 +72,20 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
   const dismiss = useCallback(() => {
     if (phase === "downloading") return;
     // Update 在 Rust 侧持有资源，不安装就主动释放
-    if (update) void update.close().catch(() => {});
+    if (update)
+      void update.close().catch((e) => {
+        console.warn("[updater] 释放更新资源失败（不影响关闭对话框）:", e);
+      });
     setUpdate(null);
     setPhase("idle");
     setReceived(0);
     setTotal(0);
+    setError(null);
   }, [phase, update]);
 
   const startUpdate = useCallback(async () => {
     if (!update) return;
+    setError(null);
     setPhase("downloading");
     setReceived(0);
     setTotal(0);
@@ -95,7 +100,7 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
       setPhase("done");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      message.error("更新下载失败: " + msg);
+      setError(`更新下载失败：${msg}`);
       setPhase("idle");
     }
   }, [update]);
@@ -106,7 +111,7 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
       await relaunch();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      message.error("重启失败，请手动重启应用: " + msg);
+      setError(`重启失败，请手动重启应用：${msg}`);
       setRestarting(false);
     }
   }, []);
@@ -153,6 +158,17 @@ export default function UpdaterGate({ delayMs = 5000 }: { delayMs?: number }) {
             </Card>
           </Col>
         </Row>
+
+        {error && (
+          <Alert
+            type="error"
+            showIcon
+            closable
+            onClose={() => setError(null)}
+            message="更新没有完成"
+            description={error}
+          />
+        )}
 
         {update.body && (
           <Card size="small" title="更新内容">

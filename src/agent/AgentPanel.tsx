@@ -317,7 +317,13 @@ export function AgentPanel({ hint, onUseSql, onClear, onGoReport, onGoPickTables
           rows={2}
           style={{ flex: 1 }}
         />
-        <Button type="primary" icon={<SendOutlined />} onClick={send} disabled={!input.trim() || busy} />
+        <Button
+          type="primary"
+          aria-label="发送消息"
+          icon={<SendOutlined />}
+          onClick={send}
+          disabled={!input.trim() || busy}
+        />
       </Space>
     </Card>
   );
