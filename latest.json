@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "notes": "See the assets below to download this version.",
+  "pub_date": "2026-10-28T17:29:18Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "https://github.com/z-biz-tool/z-biz-tool-db/releases/download/v0.2.0/z-biz-tool-db_aarch64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSdXNzZDVpbWtnK2ZIQkdUekFjQ2FFL0dDVmtMWlJTOTZzY3p0TlNvSC9BU0VmRlFDNGhWdDhuOVZLRnpSVE5DYTMxRzd3ek1mVjdtejZSd1VNTk1lblVpRkhkc3lXOWdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjA3MTUxCWZpbGU6ei1iaXotdG9vbC1kYi5hcHAudGFyLmd6CmJIcFZ1L2tmS0FwY2xWRUYxQzA1eURUVVp5UzlmeElEZmFSVzkwQjdPUSt2bk8vTzZ6T3BxRTdCL2k0SHJkeThrQzBIUGNHcndFdDhERlVDVG1lVkRRPT0K"
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/z-biz-tool/z-biz-tool-db/releases/download/v0.2.0/z-biz-tool-db_x64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSdXNzZDVpbWtnK1Y3QmdCTHB4VFlMQ0FyTFZrRFZMQ1lTbUFRcW0rR2tyYndzVklmZXcrWnZLUFEvSjI2SG9rMm12MnRaZ2VTQjFlM0lqK01qWEFLenJjV0xFamFxUXdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjA4NTI5CWZpbGU6ei1iaXotdG9vbC1kYi5hcHAudGFyLmd6Cnk4WDE2TkxxQTdtd1lkZmkzYWF2UEhVMXBYbmRZZjZ4ay9VbVVBQmQ3VGc0V1N5TFRIUnBjVm91RkdNb2tLTUxqTjZyNW02Q1VBT3NqMmJqN2xVL0J3PT0K"
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/z-biz-tool/z-biz-tool-db/releases/download/v0.2.0/z-biz-tool-db_0.2.0_amd64.AppImage",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSdXNzZDVpbWtnK2ZrUThYZmVYTEdsZHpWUVkxUHJzYlJObkx6bDZEZlRMNzN5bHVKNmNtOXl6a1JvYjljWmwwam9WTTlBYzRVYWNlM3BiQ0k4dDY2ZW5qYkE4YVcvUVF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjA3MzAyCWZpbGU6ei1iaXotdG9vbC1kYl8wLjIuMF9hbWQ2NC5BcHBJbWFnZQo3VlBYOCt4dHZNR0I1dm5RUFRubmVMdEw5Sm45TDJCU1JiaVF2Qmt5SkVzTWRIUndqbmdZcmVremg1c2RCR3pYSFB2anRBS3FkWW0wbnFsM0RGY2tCQT09Cg=="
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/z-biz-tool/z-biz-tool-db/releases/download/v0.2.0/z-biz-tool-db_0.2.0_x64_en-US.msi",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSdXNzZDVpbWtnK1VUZDJCNzdDLzU3YzBHRzVad25CUDNRNlEyL0ZHQ25qajlySkV2QzBvNk5CRFo3TkZ6WVlkYmw5dUxYRVMxQWo3UGpZOFNFeTNWcUVkZ0JvbldsTXdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjA3MzY0CWZpbGU6ei1iaXotdG9vbC1kYl8wLjIuMF94NjRfZW4tVVMubXNpCkpEdjh6V3dpUUNJT0dsd2JUNkhVMmRjV3lQOFRqMFlHZWMyeldQYmswcnI1SWwzdE1lRXRCVGFPT3ExSnJwV2xPTW51T013L2N4bDdoK25Jd0dDbUJBPT0K"
+    }
+  }
+}
