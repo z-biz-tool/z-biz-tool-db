@@ -198,12 +198,17 @@ jobs:
       # 本平台的 latest.json 条目（url 指向 release 资产，signature 是 .sig 文件内容）。
       # v2 模式（createUpdaterArtifacts: true）的更新包：macOS=*.app.tar.gz、
       # Windows=*.msi、Linux=*.AppImage，各自旁边应有同名 .sig。
+      # ⚠️ 目录名不带点：actions/upload-artifact@v4 **默认不上传隐藏文件/目录**，
+      # 早期写成 .updater-fragments 时四平台都报 "No files were found"，
+      # 于是 latest.json 永远推不出去、更新通道静默失效（music v0.1.0 首次发布实测踩到）。
       - name: Generate updater manifest fragment
         if: steps.signing.outputs.mode == 'signed'
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p .updater-fragments
+          mkdir -p updater-fragments
           case "${{ matrix.label }}" in
             macOS-ARM)
               PLATFORM="darwin-aarch64"
@@ -236,13 +241,50 @@ jobs:
             echo "::error::缺少签名文件 $SIG —— 签名应在 Build 步骤随 TAURI_SIGNING_PRIVATE_KEY 一起生成"
             exit 1
           fi
-          NAME=$(basename "$ASSET")
-          URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$NAME"
+          # ⚠️ 远端资产名 ≠ 本地文件名。同一个 Release 里两个 macOS 矩阵都产出
+          # `z-biz-tool-db.app.tar.gz`，tauri-action 上传时会自动加架构后缀消歧
+          #   → z-biz-tool-db_aarch64.app.tar.gz / ..._x64.app.tar.gz
+          # 所以 url 不能拿本地文件名拼，否则 latest.json 里的链接直接 404
+          # （music v0.1.0 第一次发布就是这个形状：文件都在、链接全错、点更新必失败）。
+          # 做法：回查本 tag 的 release 资产，按「同扩展名 + 同架构词」唯一匹配，
+          # 再用远端 .sig 与本地 .sig 逐字节比对，确认挑的确实是同一个包。
+          LOCAL_NAME=$(basename "$ASSET")
+          EXT=".${LOCAL_NAME#*.}"
+          case "$PLATFORM" in
+            darwin-aarch64) ARCH_TOKEN="aarch64" ;;
+            darwin-x86_64)  ARCH_TOKEN="x64" ;;
+            linux-x86_64)   ARCH_TOKEN="amd64" ;;
+            windows-x86_64) ARCH_TOKEN="x64" ;;
+          esac
+          REPO="${{ github.repository }}"
+          TAG="${{ github.ref_name }}"
+          gh api "repos/$REPO/releases/tags/$TAG" --jq '.assets[] | [.id, .name] | @tsv' > /tmp/assets.tsv
+          MATCHES=$(awk -F'\t' -v ext="$EXT" -v arch="$ARCH_TOKEN" \
+            'index($2, ext) == length($2) - length(ext) + 1 && index($2, arch) > 0 { print }' /tmp/assets.tsv)
+          COUNT=$(printf '%s\n' "$MATCHES" | awk 'NF' | wc -l | tr -d ' ')
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::在 release $TAG 里按「$EXT + $ARCH_TOKEN」匹配到 $COUNT 个资产（应为 1）："
+            printf '%s\n' "$MATCHES"
+            cut -f2 /tmp/assets.tsv
+            exit 1
+          fi
+          NAME=$(printf '%s\n' "$MATCHES" | cut -f2)
+          SIG_ID=$(awk -F'\t' -v n="$NAME.sig" '$2 == n { print $1 }' /tmp/assets.tsv)
+          if [ -z "$SIG_ID" ]; then
+            echo "::error::release 里找不到 $NAME.sig"
+            exit 1
+          fi
+          gh api "repos/$REPO/releases/assets/$SIG_ID" -H "Accept: application/octet-stream" > /tmp/remote.sig
+          if ! diff -q /tmp/remote.sig "$SIG" > /dev/null; then
+            echo "::error::远端 $NAME.sig 与本地签名不一致 —— 挑错资产了，或者签的不是同一个包"
+            exit 1
+          fi
+          URL="https://github.com/$REPO/releases/download/$TAG/$NAME"
           node -e '
             const fs = require("fs");
             const [platform, url, sigPath] = process.argv.slice(1);
             const fragment = { [platform]: { url, signature: fs.readFileSync(sigPath, "utf8").trim() } };
-            fs.writeFileSync(`.updater-fragments/${platform}.json`, JSON.stringify(fragment, null, 2) + "\n");
+            fs.writeFileSync(`updater-fragments/${platform}.json`, JSON.stringify(fragment, null, 2) + "\n");
           ' "$PLATFORM" "$URL" "$SIG"
 
       - name: Upload updater manifest fragment
@@ -250,7 +292,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: updater-frag-${{ matrix.label }}
-          path: .updater-fragments/*.json
+          path: updater-fragments/*.json
           if-no-files-found: error
 
   # 把 4 个平台的片段合并成一个 latest.json 推到 main（固定分支）。
@@ -275,7 +317,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: updater-frag-*
-          path: .updater-fragments
+          path: updater-fragments
           merge-multiple: true
 
       - name: Compose latest.json and push to main
@@ -297,7 +339,7 @@ jobs:
           node -e '
             const fs = require("fs");
             const [version, notes] = process.argv.slice(1);
-            const dir = ".updater-fragments";
+            const dir = "updater-fragments";
             const platforms = {};
             for (const f of fs.readdirSync(dir).filter((f) => f.endsWith(".json"))) {
               Object.assign(platforms, JSON.parse(fs.readFileSync(`${dir}/${f}`, "utf8")));
