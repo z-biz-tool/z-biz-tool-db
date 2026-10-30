@@ -335,6 +335,13 @@ const RESERVED_NOT_WIRED = new Map<string, string>([
       "不该藏在日常工具的菜单里；且 load_connections 已在取不到密钥时显式上报" +
       "「需重新输入密码」，不依赖这个命令也能安全降级。",
   ],
+  [
+    "zbiz_take_pending",
+    "zbiz:// 深链队列的前端消费口。协议与队列在 capability 仓的 cap-hub 里，" +
+      "本仓 Rust 侧已接（box 用 zbiz://db/open?query=… 唤起本仓时靠它入队），" +
+      "但本仓界面的语义层（拿到 query 后干什么）尚未设计 —— aigen 是本轮试点，" +
+      "其余仓铺开时一并接界面并从本清单删除。",
+  ],
 ]);
 
 /* ────────────────────────── 有意省略的可选参数 ────────────────────────── */
