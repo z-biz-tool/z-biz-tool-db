@@ -178,8 +178,12 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }} ${{ steps.signing.outputs.extra-args }}
-          # latest.json 由 latest-json 作业统一生成，矩阵各自生成会互相覆盖
-          uploadUpdaterJson: false
+          # ⚠️ 参数名必须写 includeUpdaterJson —— 写成 uploadUpdaterJson 会被 tauri-action
+          # 当未知输入**静默忽略**（只报一条 warning），于是每条矩阵腿都各自生成并上传
+          # latest.json，四腿并发抢同一个资产名，后到者把先到的顶掉、或直接把那条腿
+          # 判成失败（2026-10-30 note v1.2.0 实测：macOS x64 腿就倒在 "Uploading latest.json"）。
+          # latest.json 一律由 latest-json 作业统一生成。
+          includeUpdaterJson: false
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
