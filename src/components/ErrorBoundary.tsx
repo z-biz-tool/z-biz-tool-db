@@ -1,5 +1,5 @@
 import React from "react";
-import { Alert, Button, Space } from "antd";
+import { Alert, Button, Space, message } from "antd";
 
 interface ErrorBoundaryProps {
   /** 出错区域的名字，进提示文案（"报表看板" 而不是"某处"） */
@@ -43,6 +43,18 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
 
   private reset = () => this.setState({ error: null });
 
+  private copyError = () => {
+    const { error } = this.state;
+    const text = `${error?.message ?? "未知错误"}\n${error?.stack ?? ""}`;
+    navigator.clipboard.writeText(text).then(
+      () => message.success("错误详情已复制"),
+      (e) => {
+        console.warn(`[${this.props.label}] 复制错误详情失败:`, e);
+        message.error("复制失败，请手动选中文本复制");
+      },
+    );
+  };
+
   render() {
     const { error } = this.state;
     if (!error) return this.props.children;
@@ -65,11 +77,7 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
               </Button>
               <Button
                 size="small"
-                onClick={() =>
-                  void navigator.clipboard.writeText(
-                    `${error.message}\n${error.stack ?? ""}`,
-                  )
-                }
+                onClick={this.copyError}
               >
                 复制错误详情
               </Button>
