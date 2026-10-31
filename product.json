@@ -1,0 +1,16 @@
+{
+  "id": "db",
+  "displayName": "数据库 GUI",
+  "description": "MySQL / PostgreSQL / SQLite / MSSQL 连接管理",
+  "acceptsDeepLink": true,
+  "actions": [
+    "open",
+    "connect"
+  ],
+  "keywords": [
+    "数据库",
+    "SQL",
+    "MySQL",
+    "PG"
+  ]
+}
