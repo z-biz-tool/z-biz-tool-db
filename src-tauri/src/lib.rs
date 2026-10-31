@@ -1255,9 +1255,7 @@ async fn ai_explain_results(
     results: Vec<serde_json::Value>,
     config: AIConfig,
 ) -> Result<String, String> {
-    if config.base_url.is_empty() || config.api_key.is_empty() {
-        return Err("请先在设置中配置 AI 参数".to_string());
-    }
+    report::ai::ensure_configured(&config)?;
 
     let results_str =
         serde_json::to_string_pretty(&results).unwrap_or_else(|_| "无法序列化结果".to_string());
@@ -1284,9 +1282,7 @@ async fn ai_optimize_sql(
     table_schema: Vec<ColumnInfo>,
     config: AIConfig,
 ) -> Result<String, String> {
-    if config.base_url.is_empty() || config.api_key.is_empty() {
-        return Err("请先在设置中配置 AI 参数".to_string());
-    }
+    report::ai::ensure_configured(&config)?;
 
     let schema_str = table_schema
         .iter()
@@ -1326,9 +1322,7 @@ async fn ai_optimize_sql(
 // AI 解释 SQL 执行逻辑
 #[command]
 async fn ai_explain_sql(sql: String, config: AIConfig) -> Result<String, String> {
-    if config.base_url.is_empty() || config.api_key.is_empty() {
-        return Err("请先在设置中配置 AI 参数".to_string());
-    }
+    report::ai::ensure_configured(&config)?;
 
     let prompt = format!(
         "你是一个 SQL 教学专家。请详细解释以下 SQL 语句的执行逻辑。\n\n\
@@ -1351,9 +1345,7 @@ async fn ai_diagnose_error(
     sql: String,
     config: AIConfig,
 ) -> Result<String, String> {
-    if config.base_url.is_empty() || config.api_key.is_empty() {
-        return Err("请先在设置中配置 AI 参数".to_string());
-    }
+    report::ai::ensure_configured(&config)?;
 
     let prompt = format!(
         "你是一个数据库排错专家。请分析以下 SQL 错误。\n\n\

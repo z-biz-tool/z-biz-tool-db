@@ -697,10 +697,60 @@ fn strip_dead_widgets(
 
 // ==================== 模型调用 ====================
 
+/// 该地址是否指向本机 / 局域网。
+///
+/// 与 `cap-llm::is_private_endpoint` 同一套判据（本仓未依赖 cap-llm，
+/// 故本地保留一份最小实现）。用途只有一个：私有地址上的 llama.cpp /
+/// Ollama / LM Studio 没有鉴权层，不该逼用户为它们编一个假密钥。
+pub(crate) fn is_private_endpoint(url: &str) -> bool {
+    let rest = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => url,
+    };
+    let hostport = rest.split('/').next().unwrap_or("");
+    let host = match hostport.rfind('@') {
+        Some(i) => &hostport[i + 1..],
+        None => hostport,
+    };
+    let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
+        return true;
+    }
+    if host == "host.docker.internal" || host.ends_with(".local") || host.ends_with(".lan") {
+        return true;
+    }
+    let octets: Vec<u8> = host
+        .split('.')
+        .map(|p| p.parse::<u8>().ok())
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    matches!(octets.as_slice(), [127, ..] | [10, ..] | [172, 16..=31, ..] | [192, 168, ..])
+}
+
+/// 配置是否足以发请求。**本地/内网地址允许空密钥**（那类服务没有鉴权层）。
+///
+/// 四个 `ai_*` 命令各自抄了一遍 `base_url.is_empty() || api_key.is_empty()`，
+/// 于是「指向 mini 网关」的用户在每个入口都被拦一次。判定收口到这里。
+pub(crate) fn ensure_configured(cfg: &AIConfig) -> Result<(), String> {
+    if cfg.base_url.trim().is_empty() {
+        return Err("请先在设置中配置 AI 参数".to_string());
+    }
+    if cfg.api_key.trim().is_empty() && !is_private_endpoint(cfg.base_url.trim()) {
+        return Err("请先在设置中配置 AI 参数".to_string());
+    }
+    Ok(())
+}
+
 /// 唯一的大模型出口：标准 OpenAI 兼容 chat/completions。
 /// 单条 user 消息即可覆盖本工具的用法，不引入会话状态。
 pub async fn chat(cfg: &AIConfig, prompt: &str) -> Result<String, String> {
-    if cfg.base_url.trim().is_empty() || cfg.api_key.trim().is_empty() {
+    if cfg.base_url.trim().is_empty() {
+        return Err("请先在设置中配置 AI 服务地址".into());
+    }
+    // 2026-10-31 修：原来密钥为空一律拒，于是指向 mini 本地网关（无鉴权）
+    // 的用户必须填占位串才能用「AI 生成报表」。私有地址放行，公开地址仍拦。
+    let keyless = cfg.api_key.trim().is_empty();
+    if keyless && !is_private_endpoint(cfg.base_url.trim()) {
         return Err("请先在设置中配置 AI 服务地址与密钥".into());
     }
     let base = cfg.base_url.trim().trim_end_matches('/');
@@ -720,9 +770,13 @@ pub async fn chat(cfg: &AIConfig, prompt: &str) -> Result<String, String> {
     } else {
         format!("{}/chat/completions", base)
     };
-    let response = client
-        .post(endpoint)
-        .bearer_auth(&cfg.api_key)
+    let mut req = client.post(endpoint);
+    // 没有密钥就别发 `Authorization: Bearer `（空值）—— 个别网关会当成
+    // 「给了错误凭据」直接 401，把免鉴权的正常调用打成失败
+    if !keyless {
+        req = req.bearer_auth(cfg.api_key.trim());
+    }
+    let response = req
         .json(&body)
         .send()
         .await
@@ -2803,6 +2857,48 @@ mod minimax_live_tests {
         assert!(
             err.contains("401") || err.contains("403"),
             "期望 401/403，实际：{err}"
+        );
+    }
+
+    // ==================== 真实网关直连 ====================
+
+    /// 免密钥的私有网关必须能生成报表文本（未设 `ZBIZ_GW` 时静默跳过）。
+    ///
+    /// db 不依赖 cap-llm，自带一套 reqwest 调用 —— 它的「必须有 key」校验
+    /// 与 `Authorization: Bearer `（空值）是两个坑，这条用例一起钉住。
+    ///
+    /// ```sh
+    /// ZBIZ_GW=http://192.168.31.249:8200/v1 ZBIZ_MODEL=zBiz-Text-35B \
+    ///   cargo test -p z-biz-tool-db live_zbiz -- --nocapture
+    /// ```
+    #[tokio::test]
+    async fn live_zbiz_gateway_accepts_keyless_and_replies() {
+        let Ok(gw) = std::env::var("ZBIZ_GW") else {
+            return;
+        };
+        let model = std::env::var("ZBIZ_MODEL").unwrap_or_else(|_| "zBiz-Text-35B".to_string());
+
+        // ① 私有地址 + 空 key：必须放行
+        let cfg = AIConfig {
+            base_url: gw.clone(),
+            api_key: String::new(),
+            model,
+        };
+        let out = chat(&cfg, "用一句话介绍你自己，不超过30字。")
+            .await
+            .expect("免 Key 的本地网关调用失败");
+        assert!(!out.trim().is_empty(), "返回为空（网关 {gw}）");
+        println!("[db → {gw}] {}", out.trim());
+
+        // ② 公网地址 + 空 key：仍必须拦住 —— 放行等于把配置错误推到 401
+        let cloud = AIConfig {
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            api_key: String::new(),
+            model: "deepseek-chat".to_string(),
+        };
+        assert!(
+            chat(&cloud, "hi").await.is_err(),
+            "公网地址缺 key 时不能放行"
         );
     }
 }
