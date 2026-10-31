@@ -75,6 +75,7 @@ import type {
 } from "./types";
 import { ReportBoard, SqlList } from "./ReportBoard";
 import { describeDiff, diffSpec, type SpecSide } from "./diffSpec";
+import { isAiConfigured } from "./aiNeedsKey";
 
 const { Text, Title } = Typography;
 const { TextArea } = Input;
@@ -262,7 +263,10 @@ export function ReportWorkbench({
   // 但别再谎称这份设计是为了那句需求写的。
   const priorRef = useRef<{ question: string; specText: string } | null>(null);
 
-  const aiReady = Boolean(aiConfig.base_url && aiConfig.api_key && aiConfig.model);
+  // 判据与后端 `ensure_configured()` 同口径：
+  // 私网地址允许空密钥（自建服务没有鉴权层）—— 此前一律要 key，
+  // 于是指向 mini 网关的用户在工作台里被直接挡住。
+  const aiReady = isAiConfigured(aiConfig);
 
   useEffect(() => {
     let cancelled = false;

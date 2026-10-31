@@ -98,6 +98,7 @@ const ReportWorkbench = lazy(() =>
 const AgentPanel = lazy(() => import("./agent/AgentPanel"));
 import { csvDoc, downloadCsv, stampName } from "./report/csv";
 import { aiSqlGenerate, catalogColumns, listTables, reportDescribeColumns } from "./report/api";
+import { isAiConfigured, aiNeedsApiKey } from "./report/aiNeedsKey";
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
 import type { BackendConfig, TableSummary } from "./report/api";
 import type { CatalogTable, ChainOutcome, SqlDraft, SqlReject } from "./report/types";
@@ -1487,7 +1488,7 @@ function App() {
       msgApi.warning("请先连接数据库");
       return;
     }
-    if (!aiConfig.baseUrl || !aiConfig.apiKey || !aiConfig.model) {
+    if (!isAiConfigured(aiConfig)) {
       msgApi.warning("先配置 AI 服务地址、密钥与模型");
       setShowAiConfigModal(true);
       return;
@@ -1621,7 +1622,7 @@ function App() {
   // 四条解说链路（优化/解释/诊断/结果）只回文字，不动数据：
   // 会改库的那两条另有本机校验与审批门禁。
   const runAiText = async (call: () => Promise<string>) => {
-    if (!aiConfig.baseUrl || !aiConfig.apiKey || !aiConfig.model) {
+    if (!isAiConfigured(aiConfig)) {
       msgApi.warning("先配置 AI 服务地址、密钥与模型");
       setShowAiConfigModal(true);
       return;
@@ -1711,7 +1712,7 @@ function App() {
     text: string,
     ctx?: AgentAskContext
   ): Promise<AgentResponse> => {
-    if (!aiConfig.baseUrl || !aiConfig.apiKey || !aiConfig.model) {
+    if (!isAiConfigured(aiConfig)) {
       setShowAiConfigModal(true);
       return {
         success: false,
@@ -3495,8 +3496,26 @@ function App() {
             <Input placeholder="例如：https://maas-coding-api.cn-huabei-1.xf-yun.com/v2" />
           </Form.Item>
 
-          <Form.Item name="apiKey" label="API Key" rules={[{ required: true }]}>
-            <Input.Password placeholder="格式：APIKey:APISecret" />
+          <Form.Item
+            name="apiKey"
+            label="API Key"
+            rules={[
+              {
+                // 私网地址允许空密钥 —— 自建服务（mini 网关等）没有鉴权层。
+                // 与后端 `ensure_configured()` 同口径：此前一刀切 required，
+                // 于是指向本地网关的用户连保存都保存不了。
+                validator: (_rule, value) => {
+                  const baseUrl = (aiForm.getFieldValue("baseUrl") ?? "").trim();
+                  if (value && value.trim()) return Promise.resolve();
+                  if (baseUrl && !aiNeedsApiKey({ baseUrl, apiKey: "", model: "" })) {
+                    return Promise.resolve();
+                  }
+                  return Promise.reject(new Error("公网 AI 服务需要 API Key"));
+                },
+              },
+            ]}
+          >
+            <Input.Password placeholder="格式：APIKey:APISecret（本地网关可留空）" />
           </Form.Item>
 
           <Form.Item name="model" label="模型" rules={[{ required: true }]}>
