@@ -85,6 +85,9 @@ import {
   WarningOutlined,
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { startDeepLinkReceiver, ZBIZ_TAKE_PENDING } from "z-biz-tool-shared/protocol";
+import { resolveDbDeepLink, type HandoffItem } from "./_shared/deepLink";
 // 使用本地 Agent 组件（临时方案，待共享库修复后迁移到 z-biz-tool-shared）
 import { useAgentStore } from "./agent/AgentManager";
 // 报表看板带着 recharts、Agent 面板带着语法高亮：两者都只在各自视图打开时才用得到，
@@ -1910,6 +1913,69 @@ function App() {
       msgApi.warning(`获取表列表失败: ${e}`);
     }
   };
+
+  // 家族深链（zbiz://db/connect?conn=<id>）：box 等产品递过来的连接请求。
+  //
+  // 机制（冷启动补取 + zbiz-open 监听 + 不静默吞掉）在共享层 startDeepLinkReceiver，
+  // 本仓只提供语义：resolveDbDeepLink 决定「要连哪个连接」。
+  //
+  // 时序坑：连接列表是异步从后端读的（见上面的 load_connections effect）。
+  // 深链在冷启动时到达，列表很可能还没就绪 —— 直接查会得到「找不到这个连接」。
+  // 所以先记下待连接的标识，等列表就绪后再落地（下面那个 effect）。
+  const [pendingDeepLinkConn, setPendingDeepLinkConn] = useState<{
+    id: string | null;
+    name: string | null;
+  } | null>(null);
+
+  // 连接列表就绪后落地待连接的深链。
+  useEffect(() => {
+    if (!pendingDeepLinkConn) return;
+    // 列表还没加载出来（空数组）时先等等 —— 但空列表也可能就是「一个连接都没存」，
+    // 那要靠下面的兜底提示告诉用户，而不是无限等下去。
+    if (connections.length === 0) return;
+
+    const target = pendingDeepLinkConn.id
+      ? connections.find((c) => c.id === pendingDeepLinkConn.id)
+      : connections.find((c) => c.name === pendingDeepLinkConn.name);
+
+    setPendingDeepLinkConn(null);
+
+    if (!target) {
+      const asked = pendingDeepLinkConn.id ?? pendingDeepLinkConn.name ?? "";
+      msgApi.warning(`找不到要连接的数据库：${asked}`);
+      return;
+    }
+    void connectDB(target);
+  }, [connections, pendingDeepLinkConn]);
+
+  useEffect(() => {
+    const stop = startDeepLinkReceiver({
+      productId: "db",
+      invoke: () => invoke<HandoffItem[]>(ZBIZ_TAKE_PENDING),
+      listen: (event, handler) => listen(event, handler),
+      translate: (item) => {
+        const out = resolveDbDeepLink(item);
+        if (!out.connectionId && !out.connectionName) {
+          return { ok: false, problem: out.problem ?? "深链里没有要连接的连接" };
+        }
+        return {
+          ok: true,
+          effect: { id: out.connectionId, name: out.connectionName },
+        };
+      },
+      onProblem: (msg) => {
+        console.warn("[db] 深链:", msg);
+        msgApi.warning(msg);
+      },
+      onEffect: (effect) => {
+        setPendingDeepLinkConn({
+          id: (effect.id as string | null) ?? null,
+          name: (effect.name as string | null) ?? null,
+        });
+      },
+    });
+    return stop;
+  }, []);
 
   // 刷新表列表
   const refreshTables = async () => {

@@ -26,6 +26,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { collectSharedConsumedCommands } from "z-biz-tool-shared/testkit";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const repoRoot = path.resolve(here, "..");
@@ -71,6 +72,11 @@ function walk(dir: string, exts: string[]): string[] {
     }
   }
   return out;
+}
+
+/** 前端源文件清单（扫描范围 = src/，不含 tests/）。 */
+function frontendSourceFiles(): string[] {
+  return walk(path.join(repoRoot, "src"), [".ts", ".tsx"]);
 }
 
 function toCamel(s: string): string {
@@ -335,13 +341,6 @@ const RESERVED_NOT_WIRED = new Map<string, string>([
       "不该藏在日常工具的菜单里；且 load_connections 已在取不到密钥时显式上报" +
       "「需重新输入密码」，不依赖这个命令也能安全降级。",
   ],
-  [
-    "zbiz_take_pending",
-    "zbiz:// 深链队列的前端消费口。协议与队列在 capability 仓的 cap-hub 里，" +
-      "本仓 Rust 侧已接（box 用 zbiz://db/open?query=… 唤起本仓时靠它入队），" +
-      "但本仓界面的语义层（拿到 query 后干什么）尚未设计 —— aigen 是本轮试点，" +
-      "其余仓铺开时一并接界面并从本清单删除。",
-  ],
 ]);
 
 /* ────────────────────────── 有意省略的可选参数 ────────────────────────── */
@@ -370,7 +369,26 @@ const backend = backendCommands();
 const registered = registeredCommands();
 const structs = backendStructs();
 const calls = frontendInvokes();
-const calledCmds = new Set(calls.map((c) => c.cmd));
+
+/**
+ * 经由**共享层**消费的 Rust 命令。
+ *
+ * 深链接收侧改用共享层（`startDeepLinkReceiver`）后，取队列的 invoke
+ * **发生在共享层内部**，本仓源码里扫不到那个调用点 ⇒ 门禁会误判
+ * 「实现了却没人用」。
+ *
+ * **门禁失灵比测试挂掉更严重**：误报久了大家就会把命令塞进「预留未接线」
+ * 清单，门禁就名存实亡了。
+ *
+ * 判据与清单都在共享层 testkit 里 —— 不在本仓写私有副本（那份会漂移）。
+ * （与 box 仓同一套做法。）
+ */
+const sharedConsumed = collectSharedConsumedCommands(frontendSourceFiles());
+
+const calledCmds = new Set<string>([
+  ...calls.map((c) => c.cmd),
+  ...sharedConsumed,
+]);
 
 test("后端命令清单与注册表都不是空的（量具自身要有效）", () => {
   assert.ok(backend.size >= 40, `后端命令太少，解析器可能坏了: ${backend.size}`);
