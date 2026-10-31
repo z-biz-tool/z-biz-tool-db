@@ -111,11 +111,82 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --all-targets --locked -- -D warnings
 
+  # ─────────────────────────────────────────────────────────────────────
+  # prepare-release：**独占**创建本次 tag 的 Release。
+  #
+  # 为什么必须单独一个 job：tauri-action 的「查不到就建 release」不是原子的。
+  # 四条矩阵腿并发跑时会有两条腿同时「查不到」⇒ 各建一个 Release
+  # （2026-10-31 history v0.1.0 首次发布实测：建出 id 430011860 与 430011862
+  # 两个同 tag 的 Release，资产分散在两边，其中一个还停在 draft）。
+  # 后果是 `releases/tags/$TAG` 只解析到其中一个 ⇒ 另一条腿在自己的 Release 里
+  # 找不到资产却查的是「那个」Release ⇒ 匹配到 0 个 ⇒ 整条腿失败、
+  # latest.json 推不出去（发布静默半残，用户点更新必失败）。
+  #
+  # 成熟仓没踩到，是因为它们的 Release 在**前一次**发版时已经存在，
+  # 四腿直接复用 ⇒ 只有「从零开始的第一次发版」和「删 release 重发」才会撞上。
+  #
+  # 做法：用一个单线程 job 先把 Release 建好（幂等：已存在就复用），
+  # 把 release id 传给四条腿，四腿用 releaseId 上传资产 —— 天然只有一个 Release。
+  prepare-release:
+    name: Prepare release
+    runs-on: ubuntu-22.04
+    outputs:
+      release-id: ${{ steps.rel.outputs.id }}
+    steps:
+      - name: Create or reuse the release for this tag
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          TAG="${{ github.ref_name }}"
+
+          # 找出这个 tag 已有的**正式** release（非 draft）。
+          # 注意：不能用 `releases/tags/$TAG` —— 它对 draft 的处理特殊，
+          # 而且 tag 已被占用时会指向别的 release。
+          EXISTING=$(gh api "repos/$REPO/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\" and .draft == false) | .id" | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            # ⚠️ 变量名后面紧跟中文标点时，bash 在 UTF-8 locale 下会把标点并进变量名
+            # （${EXISTING}（ 会被当成一个不存在的变量），报出看不懂的 unbound variable。
+            # 一律用 ${} 把名字边界写死。
+            echo "复用已有 release id=${EXISTING}（tag ${TAG}）"
+            echo "id=${EXISTING}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 清理这个 tag 下的**残留 draft**（并发竞态的产物）：
+          # 它们占着 tag、又对用户不可见，留着会让后续查询一直指错。
+          STALE=$(gh api "repos/$REPO/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\" and .draft == true) | .id" || true)
+          for id in $STALE; do
+            echo "清理残留 draft release id=${id}"
+            gh api -X DELETE "repos/$REPO/releases/$id" || true
+          done
+
+          # ⚠️ 布尔值必须用 -F（会做类型转换），用 -f 会当成字符串
+          # ⇒ GitHub 返回 422 "For 'properties/draft', \"false\" is not a boolean"。
+          # ⚠️ 续行反斜杠后面**不能跟注释行** —— YAML 会把注释当脚本内容传给 bash，
+          # bash 里 \ + 注释行 ⇒ 续行被截断，后面的参数变成独立命令
+          # ⇒ "command not found"（exit 127）。注释一律写在整条命令之前。
+          NEW_ID=$(gh api -X POST "repos/$REPO/releases" \
+            -f tag_name="$TAG" \
+            -f name="$TAG" \
+            -f body="See the assets below to download this version." \
+            -F draft=false -F prerelease=false \
+            --jq .id)
+          echo "新建 release id=${NEW_ID}（tag ${TAG}）"
+          echo "id=${NEW_ID}" >> "$GITHUB_OUTPUT"
+
   build:
+    # prepare-release 建好 Release（拿 id）；test 过了才值得出包 —— 两个前置都要
+    needs: [test, prepare-release]
     # latest-json 作业据此决定要不要推 manifest（缺签名密钥时整条更新通道静默降级）
     outputs:
       signing-mode: ${{ steps.signing.outputs.mode }}
-    needs: test
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
@@ -206,11 +277,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ steps.signing.outputs.mode == 'signed' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ steps.signing.outputs.mode == 'signed' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: '${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download this version.'
-          releaseDraft: false
-          prerelease: false
+          # 用 prepare-release 建好的 release id 上传，**不要**让 tauri-action 自己
+          # 建 release（它的查-建不是原子的，四腿并发会建出多个，见 prepare-release 注释）。
+          # 给了 releaseId 之后 tagName/releaseName/releaseDraft 都不再被考虑。
+          releaseId: ${{ needs.prepare-release.outputs.release-id }}
           args: ${{ matrix.args }} ${{ steps.signing.outputs.extra-args }}
           # ⚠️ 参数名必须写 includeUpdaterJson —— 写成 uploadUpdaterJson 会被 tauri-action
           # 当未知输入**静默忽略**（只报一条 warning），于是每条矩阵腿都各自生成并上传
@@ -296,12 +366,22 @@ jobs:
           esac
           REPO="${{ github.repository }}"
           TAG="${{ github.ref_name }}"
-          gh api "repos/$REPO/releases/tags/$TAG" --jq '.assets[] | [.id, .name] | @tsv' > /tmp/assets.tsv
+          # ⚠️ 不能用 `gh api repos/$REPO/releases/tags/$TAG` 查资产：
+          # tauri-action 的旧竞态可能留下多个同 tag Release，`releases/tags/` 只解析
+          # 到其中一个 ⇒ 自己的资产可能在另一个里 ⇒ 匹配到 0 个而失败。
+          # 列出该 tag 的**所有** Release，把它们的资产并成一张表再匹配。
+          # （history v0.1.0 首发实测踩到；prepare-release 已根治，此处是兜底。）
+          gh api "repos/$REPO/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .assets[] | [.id, .name] | @tsv" > /tmp/assets.tsv
+          if [ ! -s /tmp/assets.tsv ]; then
+            echo "::error::tag $TAG 下没有任何 Release 资产 —— Release 没建出来？"
+            exit 1
+          fi
           MATCHES=$(awk -F'\t' -v ext="$EXT" -v arch="$ARCH_TOKEN" \
             'index($2, ext) == length($2) - length(ext) + 1 && index($2, arch) > 0 { print }' /tmp/assets.tsv)
           COUNT=$(printf '%s\n' "$MATCHES" | awk 'NF' | wc -l | tr -d ' ')
           if [ "$COUNT" != "1" ]; then
-            echo "::error::在 release $TAG 里按「$EXT + $ARCH_TOKEN」匹配到 $COUNT 个资产（应为 1）："
+            echo "::error::在 tag ${TAG} 的所有 Release 里按「${EXT} + ${ARCH_TOKEN}」匹配到 ${COUNT} 个资产（应为 1）："
             printf '%s\n' "$MATCHES"
             cut -f2 /tmp/assets.tsv
             exit 1
@@ -309,12 +389,12 @@ jobs:
           NAME=$(printf '%s\n' "$MATCHES" | cut -f2)
           SIG_ID=$(awk -F'\t' -v n="$NAME.sig" '$2 == n { print $1 }' /tmp/assets.tsv)
           if [ -z "$SIG_ID" ]; then
-            echo "::error::release 里找不到 $NAME.sig"
+            echo "::error::release 里找不到 ${NAME}.sig"
             exit 1
           fi
           gh api "repos/$REPO/releases/assets/$SIG_ID" -H "Accept: application/octet-stream" > /tmp/remote.sig
           if ! diff -q /tmp/remote.sig "$SIG" > /dev/null; then
-            echo "::error::远端 $NAME.sig 与本地签名不一致 —— 挑错资产了，或者签的不是同一个包"
+            echo "::error::远端 ${NAME}.sig 与本地签名不一致 —— 挑错资产了，或者签的不是同一个包"
             exit 1
           fi
           URL="https://github.com/$REPO/releases/download/$TAG/$NAME"
@@ -338,7 +418,7 @@ jobs:
   # 回滚 = 把 main 上的 latest.json 改回上一版（详见指南「版本号纪律与回滚」）。
   latest-json:
     name: Publish latest.json
-    needs: build
+    needs: [build, prepare-release]
     if: needs.build.outputs.signing-mode == 'signed'
     runs-on: ubuntu-22.04
     steps:
@@ -373,7 +453,10 @@ jobs:
             exit 0
           fi
 
-          NOTES=$(gh release view "$TAG" --json body -q .body 2>/dev/null || echo "Release $TAG")
+          # 用 release **id** 取 notes，不按 tag 取 —— 按 tag 取在「同 tag 多个 Release」时会拿到不确定的那一个。
+          RELEASE_ID="${{ needs.prepare-release.outputs.release-id }}"
+          NOTES=$(gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" --jq .body 2>/dev/null || echo "Release $TAG")
+          NOTES="${NOTES:-Release $TAG}"
           node -e '
             const fs = require("fs");
             const [version, notes] = process.argv.slice(1);
