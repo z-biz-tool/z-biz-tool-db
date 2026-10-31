@@ -724,7 +724,10 @@ pub(crate) fn is_private_endpoint(url: &str) -> bool {
         .map(|p| p.parse::<u8>().ok())
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default();
-    matches!(octets.as_slice(), [127, ..] | [10, ..] | [172, 16..=31, ..] | [192, 168, ..])
+    matches!(
+        octets.as_slice(),
+        [127, ..] | [10, ..] | [172, 16..=31, ..] | [192, 168, ..]
+    )
 }
 
 /// 配置是否足以发请求。**本地/内网地址允许空密钥**（那类服务没有鉴权层）。
