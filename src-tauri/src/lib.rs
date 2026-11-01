@@ -11,6 +11,8 @@ use tauri::Manager;
 mod ai_sql;
 #[path = "db/mod.rs"]
 mod db;
+/// 家族统一 AI 配置落点的接入胶水。
+pub mod llm_shared;
 #[path = "queries.rs"]
 mod queries;
 pub mod report;
@@ -215,13 +217,17 @@ pub struct ConnectionExport {
 }
 
 // ================== AI 配置 ==================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AIConfig {
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-}
+//
+// 原先本仓自己存 `data_local_dir()/z-biz-tool-db/ai_config.json`，
+// 密钥**明文**落盘，且前端把含明文 Key 的 config 塞进每个 `ai_*` 命令。
+//
+// 现在统一走家族唯一落点（`crate::llm_shared`）：
+//
+//     配置（非敏感）：~/.z-biz-tool/llm/config.json
+//     密钥（敏感）：  OS 密钥库 service="z-biz-tool" / account="llm.apikey"
+//
+// 旧的 `AIConfig` 结构体随明文落点一并退役 —— 留着它就等于留着一条
+// 「把明文 Key 塞进 IPC 参数」的旧路。
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AIRequest {
@@ -1201,49 +1207,18 @@ async fn run_dispatch_mode(
 }
 
 // ================== AI 命令 ==================
-
-// 获取 AI 配置
-// S0 修复：data_dir 错误透传；保存 API key 时不再走 get_data_dir 侧路。
-#[command]
-async fn get_ai_config() -> Result<AIConfig, String> {
-    let data_dir = queries::get_data_dir()?;
-    let config_path = data_dir.join("ai_config.json");
-
-    if config_path.exists() {
-        let content =
-            std::fs::read_to_string(&config_path).map_err(|e| format!("读取配置失败: {}", e))?;
-        // S0：不返回 API key 明文回前端，由前端通过专用脱敏通道显示
-        let mut cfg: AIConfig =
-            serde_json::from_str(&content).map_err(|e| format!("解析配置失败: {}", e))?;
-        cfg.api_key.clear();
-        Ok(cfg)
-    } else {
-        Ok(AIConfig {
-            base_url: "".to_string(),
-            api_key: "".to_string(),
-            model: "".to_string(),
-        })
-    }
-}
-
-// 保存 AI 配置
-// S0 修复：使用 atomic_write 落盘，避免写入中断导致配置损坏。
-#[command]
-async fn save_ai_config(config: AIConfig) -> Result<(), String> {
-    let data_dir = queries::get_data_dir()?;
-    let config_path = data_dir.join("ai_config.json");
-
-    let content =
-        serde_json::to_string_pretty(&config).map_err(|e| format!("序列化失败: {}", e))?;
-
-    queries::atomic_write_pub(&config_path, content.as_bytes())?;
-    Ok(())
-}
+//
+// 配置读写已迁到家族统一落点（`crate::llm_shared`）：
+// 配置落 `~/.z-biz-tool/llm/config.json`，密钥落 OS 密钥库。
+// 本仓原来的明文 `ai_config.json` 由启动迁移器搬入并抹掉密钥。
+//
+// **前端不再回传明文 Key** —— 下列命令一律从统一落点取配置。
 
 // 调用 AI 服务
-async fn call_ai_service(config: &AIConfig, prompt: &str) -> Result<String, String> {
-    // 统一走 report::ai::chat：OpenAI 兼容的 messages 结构 + 超时 + 带状态码的报错。
-    report::ai::chat(config, prompt).await
+async fn call_ai_service(prompt: &str) -> Result<String, String> {
+    // 统一走 cap-llm：地址归一、鉴权头、错误脱敏、超时全收口到一层。
+    let cfg = crate::llm_shared::current_cap()?;
+    report::ai::chat(&cfg, prompt).await
 }
 
 // AI 生成 SQL 在 ai_sql 模块：那里的提示词带真实列清单，产出还在本机校验。
@@ -1253,9 +1228,9 @@ async fn call_ai_service(config: &AIConfig, prompt: &str) -> Result<String, Stri
 async fn ai_explain_results(
     sql: String,
     results: Vec<serde_json::Value>,
-    config: AIConfig,
 ) -> Result<String, String> {
-    report::ai::ensure_configured(&config)?;
+    let cfg = crate::llm_shared::current_cap()?;
+    report::ai::ensure_configured(&cfg)?;
 
     let results_str =
         serde_json::to_string_pretty(&results).unwrap_or_else(|_| "无法序列化结果".to_string());
@@ -1272,17 +1247,14 @@ async fn ai_explain_results(
         sql, results_str
     );
 
-    call_ai_service(&config, &prompt).await
+    call_ai_service(&prompt).await
 }
 
 // AI 优化 SQL
 #[command]
-async fn ai_optimize_sql(
-    sql: String,
-    table_schema: Vec<ColumnInfo>,
-    config: AIConfig,
-) -> Result<String, String> {
-    report::ai::ensure_configured(&config)?;
+async fn ai_optimize_sql(sql: String, table_schema: Vec<ColumnInfo>) -> Result<String, String> {
+    let cfg = crate::llm_shared::current_cap()?;
+    report::ai::ensure_configured(&cfg)?;
 
     let schema_str = table_schema
         .iter()
@@ -1316,13 +1288,14 @@ async fn ai_optimize_sql(
         schema_str, sql
     );
 
-    call_ai_service(&config, &prompt).await
+    call_ai_service(&prompt).await
 }
 
 // AI 解释 SQL 执行逻辑
 #[command]
-async fn ai_explain_sql(sql: String, config: AIConfig) -> Result<String, String> {
-    report::ai::ensure_configured(&config)?;
+async fn ai_explain_sql(sql: String) -> Result<String, String> {
+    let cfg = crate::llm_shared::current_cap()?;
+    report::ai::ensure_configured(&cfg)?;
 
     let prompt = format!(
         "你是一个 SQL 教学专家。请详细解释以下 SQL 语句的执行逻辑。\n\n\
@@ -1335,17 +1308,14 @@ async fn ai_explain_sql(sql: String, config: AIConfig) -> Result<String, String>
         sql
     );
 
-    call_ai_service(&config, &prompt).await
+    call_ai_service(&prompt).await
 }
 
 // AI 错误诊断
 #[command]
-async fn ai_diagnose_error(
-    error_message: String,
-    sql: String,
-    config: AIConfig,
-) -> Result<String, String> {
-    report::ai::ensure_configured(&config)?;
+async fn ai_diagnose_error(error_message: String, sql: String) -> Result<String, String> {
+    let cfg = crate::llm_shared::current_cap()?;
+    report::ai::ensure_configured(&cfg)?;
 
     let prompt = format!(
         "你是一个数据库排错专家。请分析以下 SQL 错误。\n\n\
@@ -1358,7 +1328,7 @@ async fn ai_diagnose_error(
         error_message, sql
     );
 
-    call_ai_service(&config, &prompt).await
+    call_ai_service(&prompt).await
 }
 
 // ================== Tauri 命令 ==================
@@ -3516,8 +3486,12 @@ pub fn run() {
             save_query,
             load_saved_queries,
             delete_saved_query,
-            get_ai_config,
-            save_ai_config,
+            llm_shared::get_ai_config,
+            llm_shared::get_ai_config_status,
+            llm_shared::save_ai_config,
+            llm_shared::list_llm_presets,
+            llm_shared::list_llm_models,
+            llm_shared::test_ai_config,
             ai_sql::ai_sql_generate,
             ai_explain_results,
             ai_optimize_sql,
@@ -3544,6 +3518,16 @@ pub fn run() {
         .setup(move |app| {
             // 冷启动时带进来的 zbiz:// 先入队，前端挂上监听后再取走。
             cap_hub::receiver::seed_cold_start(app.handle(), &zbiz_pending);
+            // 迁移一次旧配置（幂等）：本仓原来的明文 ai_config.json 会被搬进
+            // 家族统一落点，密钥转进 OS 密钥库，旧文件里的明文被抹掉。
+            // 失败只记日志、不阻断启动 —— 迁移是锦上添花，挡住用户开应用才是事故。
+            match llm_shared::migrate_legacy() {
+                Ok(Some(from)) => {
+                    tracing::info!(source = %from, "已把旧 AI 配置迁入家族统一落点");
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "旧 AI 配置迁移失败，继续启动"),
+            }
             Ok(())
         })
         .build(tauri::generate_context!())

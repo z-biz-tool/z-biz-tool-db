@@ -36,11 +36,15 @@ export interface BackendConfig {
   database: string;
 }
 
-export interface AIConfig {
-  base_url: string;
-  api_key: string;
-  model: string;
-}
+/**
+ * AI 配置的**前端形状已退役**。
+ *
+ * 原先这里有 `AIConfig { base_url, api_key, model }`，由前端塞进每个
+ * `ai_*` 命令的参数里 —— 明文密钥因此在 Rust → IPC → JS 内存 → 表单 DOM
+ * 全链路可见。现在配置统一落在
+ * `~/.z-biz-tool/llm/config.json`（非敏感）+ OS 密钥库（密钥），
+ * 后端发请求时自己取，前端只负责「有没有」这一个布尔。
+ */
 
 export interface TableSummary {
   name: string;
@@ -61,7 +65,6 @@ export type SchemaStore = Record<string, Record<string, string[]>>;
 export const aiReportDraft = (
   question: string,
   catalog: CatalogTable[],
-  config: AIConfig,
   maxRepairs?: number,
   prior?: PriorReport | null,
   feedback?: string | null
@@ -69,7 +72,6 @@ export const aiReportDraft = (
   invoke<DraftResult>("ai_report_draft", {
     question,
     catalog,
-    config,
     maxRepairs,
     prior: prior ?? null,
     feedback: feedback ?? null,
@@ -83,7 +85,6 @@ export const aiReportDraft = (
 export const aiReportPickTables = (
   question: string,
   candidates: TableCandidate[],
-  config: AIConfig,
   maxRepairs?: number,
   feedback?: string | null,
   priorAnswer?: string | null
@@ -91,7 +92,6 @@ export const aiReportPickTables = (
   invoke<PickResult>("ai_report_pick_tables", {
     question,
     candidates,
-    config,
     maxRepairs,
     feedback: feedback ?? null,
     priorAnswer: priorAnswer ?? null,
@@ -105,7 +105,6 @@ export const aiReportPickTables = (
 export const aiSqlGenerate = (
   question: string,
   catalog: CatalogTable[],
-  config: AIConfig,
   maxRepairs?: number,
   prior?: PriorDraft | null,
   feedback?: string | null
@@ -113,7 +112,6 @@ export const aiSqlGenerate = (
   invoke<SqlDraft>("ai_sql_generate", {
     question,
     catalog,
-    config,
     maxRepairs,
     prior: prior ?? null,
     feedback: feedback ?? null,
@@ -121,8 +119,8 @@ export const aiSqlGenerate = (
 
 /** 把这张报表"讲清是怎么算出来的"：只交结构（各库下推的 SQL、算子链、取数上限、没取到数的集），
  *  行数据留在本机。后端没材料时直接拒，不会白问一次模型。 */
-export const aiReportExplain = (brief: ReportBrief, config: AIConfig): Promise<string> =>
-  invoke<string>("ai_report_explain", { brief, config });
+export const aiReportExplain = (brief: ReportBrief): Promise<string> =>
+  invoke<string>("ai_report_explain", { brief });
 
 export const reportDatasetValidate = (
   spec: DatasetSpec,

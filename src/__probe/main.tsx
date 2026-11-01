@@ -39,14 +39,16 @@ const configs = [
   },
 ];
 
-const aiConfig = { base_url: "https://api.example.com", api_key: "sk-probe", model: "probe-model" };
+// 探针里的 AI 就绪状态：与真界面一致，由后端判（`get_ai_config_status`）。
+// 探针用 stub 拦 invoke，所以这里直接给「已配置」。
+const aiReady = true;
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <div style={{ height: "100vh", overflow: "auto" }}>
       <ReportWorkbench
         configs={configs}
-        aiConfig={aiConfig}
+        aiReady={aiReady}
         onOpenAiSettings={() => {
           (window as any).__PROBE_OPEN_AI = ((window as any).__PROBE_OPEN_AI || 0) + 1;
         }}

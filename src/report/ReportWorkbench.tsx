@@ -51,7 +51,6 @@ import {
   reportViewRender,
   reportViewValidate,
   saveReport,
-  type AIConfig,
   type BackendConfig,
   type TableSummary,
 } from "./api";
@@ -75,7 +74,6 @@ import type {
 } from "./types";
 import { ReportBoard, SqlList } from "./ReportBoard";
 import { describeDiff, diffSpec, type SpecSide } from "./diffSpec";
-import { isAiConfigured } from "./aiNeedsKey";
 
 const { Text, Title } = Typography;
 const { TextArea } = Input;
@@ -161,12 +159,19 @@ const describeMissing = (m: MissingConn[]) =>
 
 export function ReportWorkbench({
   configs,
-  aiConfig,
+  aiReady,
   onOpenAiSettings,
   seed,
 }: {
   configs: BackendConfig[];
-  aiConfig: AIConfig;
+  /**
+   * AI 是否已配置到能发请求。
+   *
+   * **由后端给**（`get_ai_config_status`），不在前端自己判 ——
+   * 前端复刻的那份 `isAiConfigured` 已经和后端 `ensure_configured()`
+   * 漂移过一次。判据只有一份，就是发请求前真正用的那份。
+   */
+  aiReady: boolean;
   onOpenAiSettings: () => void;
   /** 从 SQL 助手那条腿撞进跨库死路时，把用户那句需求带过来（seq 变一次算一次交接，
    *  同一句连着点两次也要生效）：没有它就得用户自己把那句话再抄一遍。
@@ -263,10 +268,8 @@ export function ReportWorkbench({
   // 但别再谎称这份设计是为了那句需求写的。
   const priorRef = useRef<{ question: string; specText: string } | null>(null);
 
-  // 判据与后端 `ensure_configured()` 同口径：
-  // 私网地址允许空密钥（自建服务没有鉴权层）—— 此前一律要 key，
-  // 于是指向 mini 网关的用户在工作台里被直接挡住。
-  const aiReady = isAiConfigured(aiConfig);
+  // 判据由后端给（见 props 的 aiReady 注释）—— 这里不再自己判一份。
+  // 私网地址免密钥那条规则因此天然成立：判据就是发请求前真正跑的那份。
 
   useEffect(() => {
     let cancelled = false;
@@ -586,7 +589,6 @@ export function ReportWorkbench({
       const res: PickResult = await aiReportPickTables(
         asked,
         tableCandidates.candidates,
-        aiConfig,
         undefined,
         fix?.error ?? null,
         fix?.answer ?? null
@@ -749,7 +751,7 @@ export function ReportWorkbench({
             .join("、")}`
         );
       }
-      const d = await aiReportDraft(question, ready, aiConfig, undefined, prior, fix?.error ?? null);
+      const d = await aiReportDraft(question, ready, undefined, prior, fix?.error ?? null);
       if (id !== runId.current) return;
       applyDraft(d, question.trim());
       // "在上一版基础上改"是对模型的请求，本机校验只查引用合法性，模型少写两个组件照样过。
@@ -920,7 +922,7 @@ export function ReportWorkbench({
     setExplainText("");
     setExplainError("");
     try {
-      setExplainText(await aiReportExplain(briefForExplain(), aiConfig));
+      setExplainText(await aiReportExplain(briefForExplain()));
     } catch (e) {
       setExplainError(String(e));
       msgApi.error("这张图没能讲清");

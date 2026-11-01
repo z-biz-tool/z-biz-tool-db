@@ -15,6 +15,13 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # 家族统一深链协议（cap-hub）：zbiz:// 的构造、解析、待处理队列与产品清单。
 cap-hub = { path = "../../z-biz-tool-capability/crates/cap-hub", features = ["tauri"] }
+# 家族统一 AI 接入层（2026-11-01）：本仓 report/ai.rs 里手写的 OpenAI 兼容
+# HTTP、is_private_endpoint 副本，都是 file/terminal/note/kb 里同一件事的
+# 第 N 次重写。协议、鉴权头、错误脱敏全收口到 cap-llm。
+cap-llm = { path = "../../z-biz-tool-capability/crates/cap-llm" }
+# 家族统一 LLM 配置落点：~/.z-biz-tool/llm/config.json + OS 密钥库。
+# 本仓原明文 ai_config.json（api_key 明文落盘）由启动迁移器搬入并抹掉密钥。
+cap-llm-config = { path = "../../z-biz-tool-capability/crates/cap-llm-config" }
 tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"

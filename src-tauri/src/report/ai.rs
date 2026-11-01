@@ -15,7 +15,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -24,7 +23,7 @@ use super::dataset::{DatasetSpec, SchemaCache, SourceRef};
 use super::expr::ALLOWED_FUNCTIONS;
 use super::table::plan_join_columns;
 use super::view::ViewSpec;
-use crate::AIConfig;
+use crate::llm_shared::current_cap;
 
 /// 单次请求超时：桌面端等 5 分钟不如等 60 秒后告诉用户换模型
 pub const REQUEST_TIMEOUT_SECS: u64 = 60;
@@ -697,107 +696,28 @@ fn strip_dead_widgets(
 
 // ==================== 模型调用 ====================
 
-/// 该地址是否指向本机 / 局域网。
+/// 配置是否足以发请求。
 ///
-/// 与 `cap-llm::is_private_endpoint` 同一套判据（本仓未依赖 cap-llm，
-/// 故本地保留一份最小实现）。用途只有一个：私有地址上的 llama.cpp /
-/// Ollama / LM Studio 没有鉴权层，不该逼用户为它们编一个假密钥。
-pub(crate) fn is_private_endpoint(url: &str) -> bool {
-    let rest = match url.find("://") {
-        Some(i) => &url[i + 3..],
-        None => url,
-    };
-    let hostport = rest.split('/').next().unwrap_or("");
-    let host = match hostport.rfind('@') {
-        Some(i) => &hostport[i + 1..],
-        None => hostport,
-    };
-    let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
-        return true;
-    }
-    if host == "host.docker.internal" || host.ends_with(".local") || host.ends_with(".lan") {
-        return true;
-    }
-    let octets: Vec<u8> = host
-        .split('.')
-        .map(|p| p.parse::<u8>().ok())
-        .collect::<Option<Vec<_>>>()
-        .unwrap_or_default();
-    matches!(
-        octets.as_slice(),
-        [127, ..] | [10, ..] | [172, 16..=31, ..] | [192, 168, ..]
-    )
+/// **判据收口在 `cap_llm::LlmConfig::validate`** —— 地址必填；密钥在私网
+/// 地址上可空（那类服务没有鉴权层），公网必填。本仓原来自己抄了一份
+/// `is_private_endpoint`，与 `cap-llm` 的那份各改各的，已经漂移过一次
+/// （前端副本判「model 非空」，后端不判）。
+pub(crate) fn ensure_configured(cfg: &cap_llm::LlmConfig) -> Result<(), String> {
+    cfg.validate().map_err(|e| e.to_string())
 }
 
-/// 配置是否足以发请求。**本地/内网地址允许空密钥**（那类服务没有鉴权层）。
+/// 唯一的大模型出口：走家族统一接入层（cap-llm）。
 ///
-/// 四个 `ai_*` 命令各自抄了一遍 `base_url.is_empty() || api_key.is_empty()`，
-/// 于是「指向 mini 网关」的用户在每个入口都被拦一次。判定收口到这里。
-pub(crate) fn ensure_configured(cfg: &AIConfig) -> Result<(), String> {
-    if cfg.base_url.trim().is_empty() {
-        return Err("请先在设置中配置 AI 参数".to_string());
-    }
-    if cfg.api_key.trim().is_empty() && !is_private_endpoint(cfg.base_url.trim()) {
-        return Err("请先在设置中配置 AI 参数".to_string());
-    }
-    Ok(())
-}
-
-/// 唯一的大模型出口：标准 OpenAI 兼容 chat/completions。
-/// 单条 user 消息即可覆盖本工具的用法，不引入会话状态。
-pub async fn chat(cfg: &AIConfig, prompt: &str) -> Result<String, String> {
-    if cfg.base_url.trim().is_empty() {
-        return Err("请先在设置中配置 AI 服务地址".into());
-    }
-    // 2026-10-31 修：原来密钥为空一律拒，于是指向 mini 本地网关（无鉴权）
-    // 的用户必须填占位串才能用「AI 生成报表」。私有地址放行，公开地址仍拦。
-    let keyless = cfg.api_key.trim().is_empty();
-    if keyless && !is_private_endpoint(cfg.base_url.trim()) {
-        return Err("请先在设置中配置 AI 服务地址与密钥".into());
-    }
-    let base = cfg.base_url.trim().trim_end_matches('/');
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP 客户端构造失败: {}", e))?;
-    let body = serde_json::json!({
-        "model": cfg.model,
-        "messages": [{ "role": "user", "content": prompt }],
-        "temperature": 0,
-        "stream": false,
-    });
-    // 有人会把完整端点直接粘进设置里（…/v1/chat/completions），再拼一次就 404 了
-    let endpoint = if base.ends_with("/chat/completions") {
-        base.to_string()
-    } else {
-        format!("{}/chat/completions", base)
-    };
-    let mut req = client.post(endpoint);
-    // 没有密钥就别发 `Authorization: Bearer `（空值）—— 个别网关会当成
-    // 「给了错误凭据」直接 401，把免鉴权的正常调用打成失败
-    if !keyless {
-        req = req.bearer_auth(cfg.api_key.trim());
-    }
-    let response = req
-        .json(&body)
-        .send()
+/// 本仓原来在这里手写了一份 OpenAI 兼容 HTTP（地址拼接、bearer 头、
+/// 空密钥时是否发 `Authorization`、超时、错误体截断）—— 那是 file /
+/// terminal / note / kb 里同一件事的第五次重写，而且已经漂移过一次
+/// （中文响应体按字节截断会 panic）。
+pub async fn chat(cfg: &cap_llm::LlmConfig, prompt: &str) -> Result<String, String> {
+    let messages = [cap_llm::Message::user(prompt)];
+    let reply = cap_llm::chat(cfg, &messages)
         .await
-        .map_err(|e| format!("AI 服务请求失败: {}", e))?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        let brief: String = text.chars().take(200).collect();
-        return Err(format!("AI 服务返回 {}：{}", status, brief));
-    }
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("解析 AI 响应失败: {}", e))?;
-    json["choices"][0]["message"]["content"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "AI 响应缺少 choices[0].message.content".to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(reply.content)
 }
 
 /// 一次补全。测试用脚本化实现替身，不必真联网。
@@ -808,12 +728,21 @@ pub trait Model: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 }
 
+/// 基于 cap-llm 的真实模型。
 pub struct HttpModel {
-    cfg: AIConfig,
+    cfg: cap_llm::LlmConfig,
 }
 
 impl HttpModel {
-    pub fn new(cfg: AIConfig) -> Result<Self, String> {
+    /// 从**家族统一落点**取配置构造模型。
+    ///
+    /// 前端不再回传明文 Key —— 密钥只在 Rust 侧从 OS 密钥库读一次。
+    pub fn from_shared() -> Result<Self, String> {
+        let cfg = current_cap()?;
+        Ok(Self { cfg })
+    }
+
+    pub fn new(cfg: cap_llm::LlmConfig) -> Result<Self, String> {
         if cfg.model.trim().is_empty() {
             return Err("请先在设置中填写 AI 模型名".into());
         }
@@ -1347,10 +1276,12 @@ pub fn explain_prompt(b: &ReportBrief) -> Result<String, String> {
 }
 
 /// 把这张报表讲一遍。只读材料、不碰库，所以模型再怎么发挥也变不出一次取数。
+///
+/// **配置从家族统一落点取** —— 前端不再回传明文 Key。
 #[tauri::command]
-pub async fn ai_report_explain(brief: ReportBrief, config: AIConfig) -> Result<String, String> {
+pub async fn ai_report_explain(brief: ReportBrief) -> Result<String, String> {
     let prompt = explain_prompt(&brief)?;
-    let model = HttpModel::new(config)?;
+    let model = HttpModel::from_shared()?;
     model.complete(prompt).await.map(|t| t.trim().to_string())
 }
 
@@ -1364,12 +1295,11 @@ pub async fn ai_report_explain(brief: ReportBrief, config: AIConfig) -> Result<S
 pub async fn ai_report_draft(
     question: String,
     catalog: Vec<CatalogTable>,
-    config: AIConfig,
     max_repairs: Option<u8>,
     prior: Option<PriorReport>,
     feedback: Option<String>,
 ) -> Result<DraftResult, Box<DraftReject>> {
-    let model = HttpModel::new(config).map_err(|e| Box::new(DraftReject::of(e)))?;
+    let model = HttpModel::from_shared().map_err(|e| Box::new(DraftReject::of(e)))?;
     draft(
         &model,
         &question,
@@ -1389,12 +1319,11 @@ pub async fn ai_report_draft(
 pub async fn ai_report_pick_tables(
     question: String,
     candidates: Vec<TableCandidate>,
-    config: AIConfig,
     max_repairs: Option<u8>,
     feedback: Option<String>,
     prior_answer: Option<String>,
 ) -> Result<PickResult, PickReject> {
-    let model = HttpModel::new(config).map_err(PickReject::of)?;
+    let model = HttpModel::from_shared().map_err(PickReject::of)?;
     pick(
         &model,
         &question,
@@ -2313,11 +2242,20 @@ mod tests {
         assert!(serde_json::from_str::<PriorReport>(r#"{"question":"按月份"}"#).is_err());
     }
 
-    fn cfg(base_url: &str, key: &str, model: &str) -> AIConfig {
-        AIConfig {
+    /// 造一份 cap-llm 配置。
+    ///
+    /// 本仓原先的 `AIConfig`（base_url / api_key / model 三个裸字段）随明文
+    /// 落点一并退役 —— 协议细节（地址归一、鉴权头、错误脱敏）由 cap-llm 负责。
+    fn cfg(base_url: &str, key: &str, model: &str) -> cap_llm::LlmConfig {
+        cap_llm::LlmConfig {
+            kind: cap_llm::ProviderKind::Custom,
             base_url: base_url.into(),
             api_key: key.into(),
             model: model.into(),
+            timeout: std::time::Duration::from_secs(5),
+            temperature: None,
+            max_tokens: None,
+            preset: None,
         }
     }
 
@@ -2501,11 +2439,15 @@ mod tests {
 
     #[tokio::test]
     async fn chat_needs_url_key_and_model_before_any_request() {
-        // 不传密钥就不该发出任何请求；错误文案要能指到设置页
+        // 不传密钥就不该发出任何请求；错误文案要能指到**具体缺哪一项**
+        //
+        // 文案判据已下沉到 cap-llm（本仓原先自己写「请先在设置中配置 AI 服务地址」，
+        // 各仓各写一份、已经开始漂移）。cap-llm 的说法是「需要显式填写 Base URL」
+        // —— 比「去设置里配」更准：用户一眼知道缺的是地址那一栏。
         assert!(chat(&cfg("", "k", "m"), "hi")
             .await
             .unwrap_err()
-            .contains("设置"));
+            .contains("Base URL"));
         let e = match HttpModel::new(cfg("https://x/", "k", "  ")) {
             Ok(_) => panic!("空模型名不该被接受"),
             Err(e) => e,
@@ -2811,7 +2753,6 @@ mod tests {
 #[cfg(test)]
 mod minimax_live_tests {
     use super::chat;
-    use crate::AIConfig;
 
     /// **真实 API 实测**：用真的 MiniMax 端点跑一遍本仓自己的 `chat`。
     ///
@@ -2827,12 +2768,17 @@ mod minimax_live_tests {
             eprintln!("[LIVE] 跳过 minimax 真实 API 实测：未设置 MINIMAX_API_KEY（这是「没跑」，不是「跑过了」）");
             return;
         };
-        let cfg = AIConfig {
+        let cfg = cap_llm::LlmConfig {
+            kind: cap_llm::ProviderKind::Custom,
             base_url: std::env::var("MINIMAX_BASE_URL")
                 .unwrap_or_else(|_| "https://api.minimaxi.com/v1".to_string()),
             api_key: key,
             model: std::env::var("MINIMAX_MODEL")
                 .unwrap_or_else(|_| "MiniMax-M3.1-Flash".to_string()),
+            timeout: std::time::Duration::from_secs(60),
+            temperature: None,
+            max_tokens: None,
+            preset: None,
         };
         let out = chat(&cfg, "只回两个字：收到")
             .await
@@ -2851,10 +2797,15 @@ mod minimax_live_tests {
             eprintln!("[LIVE] 跳过（未设置 MINIMAX_API_KEY）");
             return;
         };
-        let cfg = AIConfig {
+        let cfg = cap_llm::LlmConfig {
+            kind: cap_llm::ProviderKind::Custom,
             base_url: "https://api.minimaxi.com/v1".to_string(),
             api_key: "sk-cp-definitely-invalid-key".to_string(),
             model: "MiniMax-M3.1-Flash".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            temperature: None,
+            max_tokens: None,
+            preset: None,
         };
         let err = chat(&cfg, "hi").await.expect_err("假 key 必须被拒");
         assert!(
@@ -2867,8 +2818,9 @@ mod minimax_live_tests {
 
     /// 免密钥的私有网关必须能生成报表文本（未设 `ZBIZ_GW` 时静默跳过）。
     ///
-    /// db 不依赖 cap-llm，自带一套 reqwest 调用 —— 它的「必须有 key」校验
-    /// 与 `Authorization: Bearer `（空值）是两个坑，这条用例一起钉住。
+    /// 私有地址免密钥这条判据现在收口在 `cap_llm::LlmConfig::needs_api_key`
+    /// ——本仓原先自己抄了一份 `is_private_endpoint`，与 cap-llm 的那份
+    /// 各改各的，已经漂移过一次。这条用例钉住「免密钥放行 + 公网仍拦」。
     ///
     /// ```sh
     /// ZBIZ_GW=http://192.168.31.249:8200/v1 ZBIZ_MODEL=zBiz-Text-35B \
@@ -2882,10 +2834,15 @@ mod minimax_live_tests {
         let model = std::env::var("ZBIZ_MODEL").unwrap_or_else(|_| "zBiz-Text-35B".to_string());
 
         // ① 私有地址 + 空 key：必须放行
-        let cfg = AIConfig {
+        let cfg = cap_llm::LlmConfig {
+            kind: cap_llm::ProviderKind::Custom,
             base_url: gw.clone(),
             api_key: String::new(),
-            model,
+            model: model.clone(),
+            timeout: std::time::Duration::from_secs(60),
+            temperature: None,
+            max_tokens: None,
+            preset: None,
         };
         let out = chat(&cfg, "用一句话介绍你自己，不超过30字。")
             .await
@@ -2894,10 +2851,15 @@ mod minimax_live_tests {
         println!("[db → {gw}] {}", out.trim());
 
         // ② 公网地址 + 空 key：仍必须拦住 —— 放行等于把配置错误推到 401
-        let cloud = AIConfig {
+        let cloud = cap_llm::LlmConfig {
+            kind: cap_llm::ProviderKind::Custom,
             base_url: "https://api.deepseek.com/v1".to_string(),
             api_key: String::new(),
             model: "deepseek-chat".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            temperature: None,
+            max_tokens: None,
+            preset: None,
         };
         assert!(
             chat(&cloud, "hi").await.is_err(),

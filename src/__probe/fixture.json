@@ -596,11 +596,6 @@
       "database": "crm.db"
     }
   ],
-  "ai_config": {
-    "base_url": "https://api.example.com/v1",
-    "api_key": "sk-probe",
-    "model": "probe-model"
-  },
   "history": [
     {
       "id": "h1",

@@ -98,8 +98,12 @@ const ReportWorkbench = lazy(() =>
 const AgentPanel = lazy(() => import("./agent/AgentPanel"));
 import { csvDoc, downloadCsv, stampName } from "./report/csv";
 import { aiSqlGenerate, catalogColumns, listTables, reportDescribeColumns } from "./report/api";
-import { isAiConfigured, aiNeedsApiKey } from "./report/aiNeedsKey";
 import { aiDiagnoseError, aiExplainResults, aiExplainSql, aiOptimizeSql } from "./ipc/ai";
+import {
+  DbAiSettingsPanel,
+  loadAiConfigView,
+  type DbAiConfigView,
+} from "./components/AiSettingsPanelAdapter";
 import type { BackendConfig, TableSummary } from "./report/api";
 import type { CatalogTable, ChainOutcome, SqlDraft, SqlReject } from "./report/types";
 import type { AgentAskContext, AgentIntent, AgentResponse } from "./agent/types";
@@ -750,14 +754,21 @@ function App() {
     }
   };
 
-  // AI 配置
-  const [aiConfig, setAiConfig] = useState({
-    baseUrl: "",
-    apiKey: "",
-    model: "xop3qwencodernext",
-  });
+  // AI 配置。
+  //
+  // 现在前端**不持有**配置内容，只持有两样东西：
+  // - `aiView`：脱敏视图（apiKey 恒空串，hasApiKey 表达有无）
+  // - `aiReady`：能不能发请求，**由后端判**
+  //
+  // 旧实现把 `{ baseUrl, apiKey, model }` 整份留在 React state 里，
+  // 并把 apiKey 塞进每个 `ai_*` 命令的载荷 ⇒ 明文密钥常驻 JS 内存。
+  const [aiView, setAiView] = useState<DbAiConfigView | null>(null);
+  const [aiReady, setAiReady] = useState(false);
+  // 没配好时的一句人话，**由后端给**。前端不再自己编「先配置 AI 服务地址、
+  // 密钥与模型」这种话 —— 它和后端真正缺的那一项可能对不上（用户明明填了
+  // 密钥、只是模型名空着，却被告知要填密钥）。
+  const [aiReason, setAiReason] = useState("");
   const [showAiConfigModal, setShowAiConfigModal] = useState(false);
-  const [aiForm] = Form.useForm();
 
   // 工作模式：SQL 查询 / AI 报表工作台
   const [mode, setMode] = useState<"sql" | "report">("sql");
@@ -1350,10 +1361,6 @@ function App() {
   // 报表工作台要一次拿到所有连接的凭据（跨库 join 的每个源各自定位连接）。
   // 必须 memo：workbench 以 configs 为依赖去拉表清单，每次渲染换引用就会狂刷库。
   const backendConfigs = useMemo(() => connections.map((c) => toBackendConfig(c)), [connections]);
-  const aiConfigForReport = useMemo(
-    () => ({ base_url: aiConfig.baseUrl, api_key: aiConfig.apiKey, model: aiConfig.model }),
-    [aiConfig]
-  );
 
   // 连接配置落盘。调用方必须等它成功再宣布"已保存"，否则界面在骗人。
   const persistConnections = async (list: DBConnection[]) => {
@@ -1389,22 +1396,34 @@ function App() {
       });
   }, []);
 
-  // 加载 AI 配置
-  useEffect(() => {
-    invoke<any>("get_ai_config")
-      .then((config) => {
-        if (config && config.base_url) {
-          setAiConfig({
-            baseUrl: config.base_url,
-            apiKey: config.api_key,
-            model: config.model || "xop3qwencodernext",
-          });
-        }
-      })
-      .catch((e) => {
-        console.warn("[db] AI 配置没读出来，本次按未配置启动:", e);
-      });
+  // 加载 AI 配置（脱敏视图）+ 就绪状态。
+  //
+  // 两个都读，读不读得到**都不假装「配好了」**：读失败就当未配置，
+  // 让用户去设置窗口看看到底缺什么，而不是等点 AI 时报一句「未配置」。
+  const refreshAiState = useCallback(async () => {
+    try {
+      const view = await loadAiConfigView();
+      setAiView(view);
+    } catch (e) {
+      console.warn("[db] AI 配置没读出来，本次按未配置启动:", e);
+      setAiView(null);
+    }
+    try {
+      const status = await invoke<{ configured: boolean; reason: string }>(
+        "get_ai_config_status"
+      );
+      setAiReady(status?.configured === true);
+      setAiReason(status?.configured === true ? "" : status?.reason || "");
+    } catch (e) {
+      console.warn("[db] AI 就绪状态没读出来:", e);
+      setAiReady(false);
+      setAiReason("");
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshAiState();
+  }, [refreshAiState]);
 
   // 一次问数用的表目录。列清单读不到的表要丢掉：没有列清单，后端的列校验对那张表形同虚设。
   // 「生成 SQL」按钮与 Agent 对话共用这一份，两边给模型的字段必须一模一样。
@@ -1460,7 +1479,6 @@ function App() {
     const draft = await aiSqlGenerate(
       question,
       catalog,
-      aiConfigForReport,
       undefined,
       prior,
       fix?.error ?? null
@@ -1488,8 +1506,8 @@ function App() {
       msgApi.warning("请先连接数据库");
       return;
     }
-    if (!isAiConfigured(aiConfig)) {
-      msgApi.warning("先配置 AI 服务地址、密钥与模型");
+    if (!aiReady) {
+      msgApi.warning(aiReason || "先配置 AI 服务地址、密钥与模型");
       setShowAiConfigModal(true);
       return;
     }
@@ -1622,8 +1640,8 @@ function App() {
   // 四条解说链路（优化/解释/诊断/结果）只回文字，不动数据：
   // 会改库的那两条另有本机校验与审批门禁。
   const runAiText = async (call: () => Promise<string>) => {
-    if (!isAiConfigured(aiConfig)) {
-      msgApi.warning("先配置 AI 服务地址、密钥与模型");
+    if (!aiReady) {
+      msgApi.warning(aiReason || "先配置 AI 服务地址、密钥与模型");
       setShowAiConfigModal(true);
       return;
     }
@@ -1667,7 +1685,7 @@ function App() {
     }
     const schema = await schemaForAi();
     if (!schema.length) msgApi.warning("没带表结构，索引建议只能是泛泛而谈");
-    await runAiText(() => aiOptimizeSql(aiSqlForOptimize, schema, aiConfigForReport));
+    await runAiText(() => aiOptimizeSql(aiSqlForOptimize, schema));
   };
 
   const handleAiExplainSql = async () => {
@@ -1675,7 +1693,7 @@ function App() {
       msgApi.warning("请输入要解释的 SQL");
       return;
     }
-    await runAiText(() => aiExplainSql(aiSqlForExplain, aiConfigForReport));
+    await runAiText(() => aiExplainSql(aiSqlForExplain));
   };
 
   const handleAiDiagnoseError = async () => {
@@ -1683,7 +1701,7 @@ function App() {
       msgApi.warning("请输入错误信息和 SQL");
       return;
     }
-    await runAiText(() => aiDiagnoseError(aiErrorMessage, aiSqlForError, aiConfigForReport));
+    await runAiText(() => aiDiagnoseError(aiErrorMessage, aiSqlForError));
   };
 
   const handleAiExplainResults = async () => {
@@ -1693,7 +1711,7 @@ function App() {
     }
     // T-049：只喂前 100 行样例，不把整张结果表交给模型
     const sample = queryResults.slice(0, 100);
-    await runAiText(() => aiExplainResults(sqlCode, sample, aiConfigForReport));
+    await runAiText(() => aiExplainResults(sqlCode, sample));
   };
 
   // 对话这一轮能用到哪些表：和「生成 SQL」页同一条回退规则，两边不能各说各话
@@ -1712,12 +1730,12 @@ function App() {
     text: string,
     ctx?: AgentAskContext
   ): Promise<AgentResponse> => {
-    if (!isAiConfigured(aiConfig)) {
+    if (!aiReady) {
       setShowAiConfigModal(true);
       return {
         success: false,
         content: "",
-        error: "先配置 AI 服务地址、密钥与模型（配置窗口已打开）",
+        error: `${aiReason || "先配置 AI 服务地址、密钥与模型"}（配置窗口已打开）`,
       };
     }
     if (intent === "report") {
@@ -1761,7 +1779,7 @@ function App() {
             error: "没有可诊断的 SQL：编辑器当前那段和报错那条都是空的",
           };
         }
-        const answer = await aiDiagnoseError(text, target, aiConfigForReport);
+        const answer = await aiDiagnoseError(text, target);
         const note =
           ctx?.sql && ctx.sql.trim() !== sqlCode.trim()
             ? "（问的是报错时那条语句，编辑器现在的内容没参与）\n"
@@ -1871,20 +1889,6 @@ function App() {
       setAiSqlForError((v) => v || cur);
     }
     setShowAiResultModal(true);
-  };
-
-  // 保存 AI 配置
-  const handleSaveAiConfig = async (values: any) => {
-    await invoke("save_ai_config", {
-      config: {
-        base_url: values.baseUrl,
-        api_key: values.apiKey,
-        model: values.model,
-      },
-    });
-    setAiConfig(values);
-    setShowAiConfigModal(false);
-    msgApi.success("AI 配置已保存");
   };
 
   // 复制
@@ -2609,7 +2613,7 @@ function App() {
                   <Suspense fallback={<Spin description="正在装载报表看板…" style={{ padding: 24 }} />}>
                     <ReportWorkbench
                       configs={backendConfigs}
-                      aiConfig={aiConfigForReport}
+                      aiReady={aiReady}
                       onOpenAiSettings={() => setShowAiConfigModal(true)}
                       seed={reportSeed}
                     />
@@ -3469,65 +3473,34 @@ function App() {
       </Modal>
 
       {/* AI 配置弹窗 */}
+      {/*
+        2026-11-01 起：表单换成共享面板 `z-biz-tool-shared/ai/settings`。
+        旧表单的四个问题一并消失：
+        1. **明文密钥回填进表单** —— 旧 `get_ai_config` 把 apiKey 读进
+           React state，密钥在 Rust → IPC → JS 内存 → 表单 DOM 全链路可见；
+        2. **判据是前端自己写的** —— 与后端 `ensure_configured()` 各判一次，
+           已经漂移过一次；现在判据由后端给（`get_ai_config_status`）；
+        3. **没有厂商预设** —— 用户只能手抄地址与模型名；
+        4. **保存按钮只存三项** —— 温度、超时这些字段压根没入口。
+
+        统一面板还带来「本地网关免密钥」的正确行为：密钥框只在真的需要时出现。
+      */}
       <Modal
         title="AI 助手配置"
         open={showAiConfigModal}
-        onCancel={() => {
-          setShowAiConfigModal(false);
-          aiForm.resetFields();
-        }}
+        onCancel={() => setShowAiConfigModal(false)}
         footer={null}
-        width={500}
+        width={560}
+        destroyOnHidden
       >
-        <Form
-          form={aiForm}
-          layout="vertical"
-          onFinish={handleSaveAiConfig}
-          initialValues={aiConfig}
-        >
-          <Alert
-            title="AI 助手功能"
-            description="配置 AI 服务参数后，可使用自然语言生成 SQL、SQL 优化、错误诊断等功能。"
-            type="info"
-            style={{ marginBottom: 16 }}
-          />
-
-          <Form.Item name="baseUrl" label="API 地址" rules={[{ required: true }]}>
-            <Input placeholder="例如：https://maas-coding-api.cn-huabei-1.xf-yun.com/v2" />
-          </Form.Item>
-
-          <Form.Item
-            name="apiKey"
-            label="API Key"
-            rules={[
-              {
-                // 私网地址允许空密钥 —— 自建服务（mini 网关等）没有鉴权层。
-                // 与后端 `ensure_configured()` 同口径：此前一刀切 required，
-                // 于是指向本地网关的用户连保存都保存不了。
-                validator: (_rule, value) => {
-                  const baseUrl = (aiForm.getFieldValue("baseUrl") ?? "").trim();
-                  if (value && value.trim()) return Promise.resolve();
-                  if (baseUrl && !aiNeedsApiKey({ baseUrl, apiKey: "", model: "" })) {
-                    return Promise.resolve();
-                  }
-                  return Promise.reject(new Error("公网 AI 服务需要 API Key"));
-                },
-              },
-            ]}
-          >
-            <Input.Password placeholder="格式：APIKey:APISecret（本地网关可留空）" />
-          </Form.Item>
-
-          <Form.Item name="model" label="模型" rules={[{ required: true }]}>
-            <Input placeholder="例如：xop3qwencodernext" />
-          </Form.Item>
-
-          <Form.Item style={{ textAlign: "right", marginBottom: 0 }}>
-            <Button type="primary" htmlType="submit">
-              保存配置
-            </Button>
-          </Form.Item>
-        </Form>
+        <DbAiSettingsPanel
+          view={aiView}
+          onSaved={() => {
+            void refreshAiState();
+            setShowAiConfigModal(false);
+            msgApi.success("AI 配置已保存");
+          }}
+        />
       </Modal>
 
       {/* AI 结果弹窗 */}

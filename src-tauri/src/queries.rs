@@ -107,11 +107,6 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// 公共入口：供 save_ai_config 等模块复用原子写能力
-pub fn atomic_write_pub(path: &Path, content: &[u8]) -> Result<(), String> {
-    atomic_write(path, content)
-}
-
 /// T-061：升级前自动备份上一版本
 /// 仅在保存时若旧文件存在并能解析为 envelope 且 schema_version 不同则备份。
 /// 备份路径：`{path}.bak.v{prev_schema_version}`；成功完成后才写新文件。

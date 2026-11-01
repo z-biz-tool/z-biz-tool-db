@@ -257,10 +257,18 @@ function invoke(cmd: string, args: any): Promise<any> {
     case "ai_sql_generate": {
       const catalog: any[] = a.catalog || [];
       const question = String(a.question || "");
-      // 镜像 ai_sql_generate → HttpModel::new：模型名空则在发请求之前就拒。
-      // 不补这条，前端"先配置 AI"那道闸在探针里删掉也是绿的。
-      if (!String((a.config || {}).model || "").trim()) {
-        return fail({ error: "请先在设置中填写 AI 模型名", sql: null });
+      // 2026-11-01 起 ai_sql_generate **不再收 config**（配置统一落到
+      // 家族共享落点，后端自己取）。所以这里改成倒退检测：
+      // 调用点还塞着 config ⇒ 明文密钥又被搬回前端了 ⇒ 探针立刻炸。
+      //
+      // 旧版这里校验 `a.config.model` 非空 —— 那个检查已经没有意义
+      // （config 整个字段都不该存在），而且留着它会让「模型名空」这条
+      // 门槛彻底消失：探针绿灯，后端却会拒。
+      if ("config" in a) {
+        return fail({
+          error: "AI 命令不该再收 config（配置已统一落到家族共享落点）",
+          sql: null,
+        });
       }
       // 与 Rust generate() 同序的前置门槛
       if (!question.trim()) return fail({ error: "先描述你想查什么", sql: null });
@@ -342,10 +350,14 @@ function invoke(cmd: string, args: any): Promise<any> {
     }
     case "ai_report_pick_tables": {
       const cands: any[] = a.candidates || [];
-      // 镜像后端 pick()：模型名空、空需求、本机一张表都没读到，都在发请求之前就拒
-      if (!String((a.config || {}).model || "").trim()) {
-        return fail({ error: "请先在设置中填写 AI 模型名", answer: null });
+      // 同 ai_sql_generate：命令不再收 config，塞了就是倒退。
+      if ("config" in a) {
+        return fail({
+          error: "AI 命令不该再收 config（配置已统一落到家族共享落点）",
+          answer: null,
+        });
       }
+      // 镜像后端 pick()：空需求、本机一张表都没读到，都在发请求之前就拒
       if (!String(a.question || "").trim()) {
         return fail({ error: "先描述你想要什么报表，才知道要挑哪些表", answer: null });
       }
@@ -429,8 +441,9 @@ function invoke(cmd: string, args: any): Promise<any> {
       if (!ds.length && !failed.length) {
         return fail("这张报表还没有可解释的材料：先点一次「取数并渲染」");
       }
-      if (!String((a.config || {}).model || "").trim()) {
-        return fail("请先在设置中填写 AI 模型名");
+      // 同上：命令不再收 config。
+      if ("config" in a) {
+        return fail("AI 命令不该再收 config（配置已统一落到家族共享落点）");
       }
       const sqls = ds.flatMap((d: any) => (d.sqls || []).map((q: any) => `${q.connection}:${q.sql}`));
       if (!sqls.length) return fail("材料里没有一条下推 SQL：这样讲出来的口径是编的");
@@ -680,9 +693,62 @@ function invoke(cmd: string, args: any): Promise<any> {
           : (fixture as any).connections
       );
     case "get_ai_config":
+      // 后端现在返回**脱敏视图**（camelCase）：apiKey 恒空串，
+      // hasApiKey 表达「有没有」。探针要镜像这个形状，否则面板拿到的
+      // 字段名对不上，测出来的「能用」是假的。
+      //
       // ?noaicfg=1 当成"还没配过 AI"：没有这条注入，前端那道
       // "先配置 AI 服务地址、密钥与模型"的闸在探针里删掉也量不出来
-      return Promise.resolve(window.__PROBE_FLAG("noaicfg") ? null : (fixture as any).ai_config);
+      return Promise.resolve(
+        window.__PROBE_FLAG("noaicfg")
+          ? null
+          : {
+              provider: "custom",
+              baseUrl: "https://api.example.com/v1",
+              model: "probe-model",
+              temperature: null,
+              maxTokens: null,
+              // 脱敏视图里密钥恒空串 —— 探针也要守住这条
+              apiKey: "",
+              hasApiKey: true,
+            }
+      );
+    case "get_ai_config_status":
+      // 就绪状态由后端判。前端不再自己复刻一份 ⇒ 探针就给后端那个答案。
+      return Promise.resolve(
+        window.__PROBE_FLAG("noaicfg")
+          ? { configured: false, reason: "尚未配置 AI 服务商" }
+          : { configured: true, reason: "" }
+      );
+    case "list_llm_presets":
+      return Promise.resolve([
+        {
+          id: "deepseek",
+          label: "DeepSeek",
+          base_url: "https://api.deepseek.com/v1",
+          category: "domestic",
+          category_label: "国内厂商",
+          requires_api_key: true,
+          aliases: ["深度求索"],
+          verified_on: "2026-10-20",
+        },
+        {
+          id: "ollama",
+          label: "Ollama（本地）",
+          base_url: "http://127.0.0.1:11434/v1",
+          category: "selfHosted",
+          category_label: "自托管 / 本地",
+          requires_api_key: false,
+          aliases: ["本地模型"],
+          verified_on: "2026-10-20",
+        },
+      ]);
+    case "list_llm_models":
+      return Promise.resolve(["gpt-4o", "deepseek-chat", "text-embedding-3-small"]);
+    case "test_ai_config":
+      return Promise.resolve("连接成功（探针桩 · probe-model），耗时 1ms");
+    case "save_ai_config":
+      return Promise.resolve(null);
     case "load_query_history":
       return Promise.resolve((fixture as any).history || []);
     case "load_saved_queries":
@@ -754,11 +820,20 @@ function invoke(cmd: string, args: any): Promise<any> {
     case "ai_explain_sql":
     case "ai_diagnose_error":
     case "ai_explain_results": {
-      // 镜像 lib.rs 里这四条命令共用的第一道门槛：缺地址或密钥就在发请求前拒。
-      // 没有这条，前端"先配置 AI"那道闸删掉探针照样绿。
-      const cfg = a.config || {};
-      if (!cfg.base_url || !cfg.api_key) {
-        return fail("请先在设置中配置 AI 参数");
+      // 2026-11-01 起这四条命令**不再收 config** —— 配置统一落在
+      // `~/.z-biz-tool/llm/config.json` + OS 密钥库，后端发请求时自己取。
+      //
+      // 所以这里改成**倒退检测**：调用点还塞着 config ⇒ 说明有人把
+      // 明文密钥又搬回了前端 ⇒ 探针立刻炸。
+      //
+      // 为什么这道闸要有牙齿：前端少传一个参数不会报错，只会「静默降级」。
+      // 而这次的降级方向特别隐蔽 —— config 传了但后端不认，看起来一切正常，
+      // 密钥却已经躺在 JS 内存里了。
+      if ("config" in a) {
+        return fail(
+          "AI 命令不该再收 config（配置已统一落到家族共享落点）——" +
+            "调用点又把配置（含明文密钥）塞回前端了"
+        );
       }
       if (window.__PROBE_FLAG("aitextfail")) {
         return fail('AI 服务返回 401 Unauthorized：{"error":{"message":"invalid api key"}}');

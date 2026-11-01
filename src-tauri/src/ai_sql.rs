@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use crate::db::sql_classify;
 use crate::report::ai::{column_list, strip_fences, CatalogTable, HttpModel, Model, MAX_REPAIRS};
 use crate::report::view::problem_list;
-use crate::AIConfig;
 
 /// 进提示词的表数上限：SQL 编辑器对着一个连接，几十张表模型也抓不住重点
 pub const MAX_TABLES: usize = 20;
@@ -800,16 +799,17 @@ pub async fn generate(
 
 /// 自然语言 → 一条 SQL（已过本机校验）。执行仍由用户自己点，且写操作走审批门禁。
 /// 没过校验时 reject 出 SqlReject（拒因 + 被挡下的那条 SQL），供 UI 一键回喂。
+///
+/// **配置从家族统一落点取** —— 前端不再回传明文 Key。
 #[tauri::command]
 pub async fn ai_sql_generate(
     question: String,
     catalog: Vec<CatalogTable>,
-    config: AIConfig,
     max_repairs: Option<u8>,
     prior: Option<PriorDraft>,
     feedback: Option<String>,
 ) -> Result<SqlDraft, SqlReject> {
-    let model = HttpModel::new(config).map_err(SqlReject::of)?;
+    let model = HttpModel::from_shared().map_err(SqlReject::of)?;
     generate(
         &model,
         &question,
