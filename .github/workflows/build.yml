@@ -21,6 +21,8 @@ jobs:
 
       # cap-hub 走 ../../z-biz-tool-capability path 依赖：runner 上只有本仓，
       # 先把公共能力仓取到 workspace 内，再链接成 src-tauri 的同级目录。
+      # cap-* 已发布 crates.io（path+version 组合）：本地走 path 拿到最新源码，
+      # 打包发布时 Cargo 剥离 path 自动回落到 registry，所以这一步不能删。
       - name: Checkout capability (path deps)
         uses: actions/checkout@v4
         with:
@@ -211,6 +213,8 @@ jobs:
 
       # cap-hub 走 ../../z-biz-tool-capability path 依赖：runner 上只有本仓，
       # 先把公共能力仓取到 workspace 内，再链接成 src-tauri 的同级目录。
+      # cap-* 已发布 crates.io（path+version 组合）：本地走 path 拿到最新源码，
+      # 打包发布时 Cargo 剥离 path 自动回落到 registry，所以这一步不能删。
       - name: Checkout capability (path deps)
         uses: actions/checkout@v4
         with:
