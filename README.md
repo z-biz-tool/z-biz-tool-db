@@ -1,5 +1,22 @@
 # z-biz-tool-db
 
+> [!IMPORTANT]
+> **本仓已于 2026-11-06 废弃，能力已并入 [z-biz-tool-file](../z-biz-tool-file)。**
+>
+> 数据库管理现在是 z-biz-tool-file 的第四个板块（活动栏里「图书馆」下方那个
+> 数据库图标）。所有能力 —— 连接管理、SQL 编辑器、表树浏览、数据导出、
+> 报表看板、Agent 面板、AI 功能 —— 都搬过去了，**只维护一份**。
+>
+> 独立 app 不再出包、不再单独发版。请直接用 z-biz-tool-file：
+> [../z-biz-tool-file](../z-biz-tool-file)
+>
+> 本仓保留为只读的历史存档，供追溯当时的实现细节（尤其是 SQLx 四驱动、
+> 报表算子链、AI SQL 起草的校验逻辑）。**不要再往这里提交功能代码** ——
+> 要改数据库能力，改 z-biz-tool-file 的 `src/apps/db/` 与
+> `src-tauri/src/db_app/`。
+
+---
+
 > 一款现代化的跨平台数据库管理工具，参考 [Beekeeper Studio](https://www.beekeeperstudio.io/) 和 [DBeaver](https://dbeaver.io/) 的产品形态，基于 Tauri 打造，原生支持 macOS / Windows / Linux。
 
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)
