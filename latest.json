@@ -19,5 +19,6 @@
       "url": "https://github.com/z-biz-tool/z-biz-tool-db/releases/download/v0.2.0/z-biz-tool-db_0.2.0_x64_en-US.msi",
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSdXNzZDVpbWtnK1VUZDJCNzdDLzU3YzBHRzVad25CUDNRNlEyL0ZHQ25qajlySkV2QzBvNk5CRFo3TkZ6WVlkYmw5dUxYRVMxQWo3UGpZOFNFeTNWcUVkZ0JvbldsTXdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjA3MzY0CWZpbGU6ei1iaXotdG9vbC1kYl8wLjIuMF94NjRfZW4tVVMubXNpCkpEdjh6V3dpUUNJT0dsd2JUNkhVMmRjV3lQOFRqMFlHZWMyeldQYmswcnI1SWwzdE1lRXRCVGFPT3ExSnJwV2xPTW51T013L2N4bDdoK25Jd0dDbUJBPT0K"
     }
-  }
+  },
+  "_deprecated": "本仓已于 2026-11-06 废弃，能力并入 z-biz-tool-file（第四个板块「数据库」）。version 刻意停在 0.2.0 不再上调 —— 上调会让已装的旧 db app 收到一条指向已废弃代码的更新。请勿用这个文件发版。"
 }

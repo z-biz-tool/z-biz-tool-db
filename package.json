@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "license": "MIT",
   "description": "数据库管理工具 - 对标Beekeeper Studio/DBeaver",
+  "deprecated": "本仓已于 2026-11-06 废弃，数据库管理能力已并入 z-biz-tool-file。功能改动请去 z-biz-tool-file 的 src/apps/db/ 与 src-tauri/src/db_app/。",
   "type": "module",
   "scripts": {
     "dev": "vite",
